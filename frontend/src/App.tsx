@@ -650,26 +650,46 @@ export default function App() {
     return new Date(value).toLocaleString();
   }
 
+  function formatChatClockTime(value: string | null) {
+    if (!value) {
+      return '--:--';
+    }
+
+    const timestamp = Date.parse(value);
+    if (Number.isNaN(timestamp)) {
+      return '--:--';
+    }
+
+    return new Intl.DateTimeFormat(undefined, {
+      hour: '2-digit',
+      minute: '2-digit'
+    }).format(new Date(timestamp));
+  }
+
   function renderChatMessage(message: ChannelChatMessage) {
     const senderBadges = message.sender.badges || [];
+    const timeLabel = formatChatClockTime(message.createdAt);
+    const timeTitle = formatChatTimestamp(message.createdAt);
 
     return (
       <article className={`chat-message${message.threadParentId ? ' chat-message-reply' : ''}`} key={message.id}>
-        <div className="chat-message-header">
-          <div className="chat-sender-group">
-            <strong className="chat-sender-name" style={message.sender.color ? { color: message.sender.color } : undefined}>
-              {message.sender.username}
-            </strong>
-            {senderBadges.map((badge) => (
-              <span className="chat-badge" key={`${message.id}-${badge.type}-${badge.text}`}>
-                {badge.count ? `${badge.text} ${badge.count}` : badge.text}
-              </span>
-            ))}
-            {message.type !== 'message' ? <span className="chat-type-pill">{message.type}</span> : null}
+        <span className="chat-message-time" title={timeTitle}>{timeLabel}</span>
+        <div className="chat-message-main">
+          <div className="chat-message-header">
+            <div className="chat-sender-group">
+              <strong className="chat-sender-name" style={message.sender.color ? { color: message.sender.color } : undefined}>
+                {message.sender.username}
+              </strong>
+              {senderBadges.map((badge) => (
+                <span className="chat-badge" key={`${message.id}-${badge.type}-${badge.text}`}>
+                  {badge.count ? `${badge.text} ${badge.count}` : badge.text}
+                </span>
+              ))}
+              {message.type !== 'message' ? <span className="chat-type-pill">{message.type}</span> : null}
+            </div>
           </div>
-          <span className="chat-message-time">{formatChatTimestamp(message.createdAt)}</span>
+          <p>{message.content || 'Empty message'}</p>
         </div>
-        <p>{message.content || 'Empty message'}</p>
       </article>
     );
   }
@@ -872,8 +892,8 @@ export default function App() {
             <h2>Channel chat</h2>
             <p className="subtle-copy">
               {selectedChannel
-                ? `Recent Kick chat for ${selectedChannel.displayName}, followed by live messages over websocket.`
-                : 'Click Open chat on any live followed channel to load its snapshot and start realtime updates.'}
+                ? `Read-only Kick-style chat mirror for ${selectedChannel.displayName}, with realtime updates layered over the latest snapshot.`
+                : 'Click Open chat on any live followed channel to load its snapshot and render it in a Kick-style chat shell.'}
             </p>
           </div>
           {selectedChannel ? (
@@ -885,26 +905,40 @@ export default function App() {
         </div>
 
         {selectedChannel ? (
-          <>
+          <div className="chat-shell">
             <div className="chat-summary-card">
-              <div className="channel-identity">
-                <div className="channel-avatar">
-                  {channelChat?.avatarUrl || selectedChannel.thumbnailUrl ? (
-                    <img src={channelChat?.avatarUrl || selectedChannel.thumbnailUrl || ''} alt={selectedChannel.displayName} />
-                  ) : (
-                    <span>{selectedChannel.displayName.slice(0, 1).toUpperCase()}</span>
-                  )}
-                </div>
+              <div className="chat-summary-topline">
+                <span className="chat-kick-mark">Kick chat mirror</span>
+                <span className="chat-transport-pill">
+                  {activeChatroomId !== null ? `chatroom_${activeChatroomId}` : 'snapshot mode'}
+                </span>
+              </div>
+
+              <div className="chat-summary-main">
                 <div>
-                  <h3>{channelChat?.displayName || selectedChannel.displayName}</h3>
-                  <p>
-                    {channelChat?.messages.length ?? 0} messages in the current snapshot
-                    {activeChatroomId !== null ? ` · realtime channel ${activeChatroomId}` : ''}
-                  </p>
+                  <div className="channel-identity">
+                    <div className="channel-avatar">
+                      {channelChat?.avatarUrl || selectedChannel.thumbnailUrl ? (
+                        <img src={channelChat?.avatarUrl || selectedChannel.thumbnailUrl || ''} alt={selectedChannel.displayName} />
+                      ) : (
+                        <span>{selectedChannel.displayName.slice(0, 1).toUpperCase()}</span>
+                      )}
+                    </div>
+                    <div className="chat-summary-copy">
+                      <h3>{channelChat?.displayName || selectedChannel.displayName}</h3>
+                      <p>{selectedChannel.channelSlug}</p>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="chat-summary-stats">
+                  <span>{channelChat?.messages.length ?? 0} messages</span>
+                  <span>Updated {formatChatClockTime(channelChat?.updatedAt ?? null)}</span>
+                  <span>{liveChatState === 'live' ? 'Realtime on' : 'Snapshot sync'}</span>
                 </div>
               </div>
 
-              <div className="channel-actions compact-actions">
+              <div className="channel-actions compact-actions chat-toolbar">
                 <button className="secondary-button" onClick={() => window.open(selectedChannel.channelUrl, '_blank', 'noopener,noreferrer')}>
                   Open channel
                 </button>
@@ -956,7 +990,20 @@ export default function App() {
                 </div>
               )
             ) : null}
-          </>
+
+            <div className="chat-composer-shell">
+              <div className="chat-composer-status">
+                <span className="chat-composer-status-dot" />
+                <span>{liveChatState === 'live' ? 'Live mirror' : 'Read-only sync'}</span>
+              </div>
+              <div className="chat-composer-input">
+                Message sending stays on Kick. Open the channel to join the chat directly.
+              </div>
+              <a className="chat-composer-link" href={selectedChannel.channelUrl} target="_blank" rel="noopener noreferrer">
+                Open Kick chat
+              </a>
+            </div>
+          </div>
         ) : (
           <div className="empty-state">
             <p>No channel chat selected yet.</p>
