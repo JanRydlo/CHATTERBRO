@@ -1,6 +1,6 @@
 import { startTransition, useEffect, useState } from 'react';
-import { fetchLiveFollowedChannels, getBridgeStatus, startBridge } from './api';
-import type { FollowedChannel, KickBridgeStatus } from './types';
+import { fetchChannelChat, fetchLiveFollowedChannels, getBridgeStatus, startBridge } from './api';
+import type { ChannelChat, ChannelChatMessage, FollowedChannel, KickBridgeStatus } from './types';
 
 const FALLBACK_STATUS: KickBridgeStatus = {
   state: 'IDLE',
@@ -22,9 +22,13 @@ const BRIDGE_STATE_LABELS: Record<KickBridgeStatus['state'], string> = {
 export default function App() {
   const [bridgeStatus, setBridgeStatus] = useState<KickBridgeStatus>(FALLBACK_STATUS);
   const [channels, setChannels] = useState<FollowedChannel[]>([]);
+  const [selectedChannel, setSelectedChannel] = useState<FollowedChannel | null>(null);
+  const [channelChat, setChannelChat] = useState<ChannelChat | null>(null);
   const [isStartingBridge, setIsStartingBridge] = useState(false);
   const [isLoadingChannels, setIsLoadingChannels] = useState(false);
+  const [isLoadingChat, setIsLoadingChat] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [chatError, setChatError] = useState<string | null>(null);
   const [activity, setActivity] = useState('Bridge session is idle. Connect Kick once and the app will keep using the saved session until it expires.');
   const [lastLoadedUsername, setLastLoadedUsername] = useState('');
 
@@ -52,6 +56,17 @@ export default function App() {
   const sessionExpiryLabel = bridgeStatus.tokenExpiresAt
     ? new Date(bridgeStatus.tokenExpiresAt).toLocaleString()
     : 'No Kick token stored';
+  const selectedChannelSlug = selectedChannel?.channelSlug || null;
+
+  useEffect(() => {
+    if (isAuthenticated) {
+      return;
+    }
+
+    setSelectedChannel(null);
+    setChannelChat(null);
+    setChatError(null);
+  }, [isAuthenticated]);
 
   async function refreshBridgeStatus() {
     try {
@@ -108,6 +123,66 @@ export default function App() {
     } finally {
       setIsLoadingChannels(false);
     }
+  }
+
+  async function loadChannelChat(channel: FollowedChannel) {
+    if (!isAuthenticated) {
+      setChatError('Connect Kick first so the app can use your saved session.');
+      return;
+    }
+
+    setSelectedChannel(channel);
+    setChatError(null);
+    setIsLoadingChat(true);
+    setChannelChat((currentChat) => currentChat?.channelSlug === channel.channelSlug ? currentChat : null);
+
+    try {
+      const nextChat = await fetchChannelChat(channel.channelSlug);
+      startTransition(() => {
+        setChannelChat(nextChat);
+        setActivity(
+          nextChat.messages.length === 0
+            ? `Loaded chat for ${channel.displayName}, but Kick returned no recent messages.`
+            : `Loaded ${nextChat.messages.length} recent chat messages for ${channel.displayName}.`
+        );
+      });
+    } catch (caughtError) {
+      setChatError(caughtError instanceof Error ? caughtError.message : 'Failed to load the selected channel chat.');
+    } finally {
+      setIsLoadingChat(false);
+    }
+  }
+
+  function formatChatTimestamp(value: string | null) {
+    if (!value) {
+      return 'Unknown time';
+    }
+
+    return new Date(value).toLocaleString();
+  }
+
+  function renderChatMessage(message: ChannelChatMessage) {
+    const senderBadges = message.sender.badges || [];
+
+    return (
+      <article className={`chat-message${message.threadParentId ? ' chat-message-reply' : ''}`} key={message.id}>
+        <div className="chat-message-header">
+          <div className="chat-sender-group">
+            <strong className="chat-sender-name" style={message.sender.color ? { color: message.sender.color } : undefined}>
+              {message.sender.username}
+            </strong>
+            {senderBadges.map((badge) => (
+              <span className="chat-badge" key={`${message.id}-${badge.type}-${badge.text}`}>
+                {badge.count ? `${badge.text} ${badge.count}` : badge.text}
+              </span>
+            ))}
+            {message.type !== 'message' ? <span className="chat-type-pill">{message.type}</span> : null}
+          </div>
+          <span className="chat-message-time">{formatChatTimestamp(message.createdAt)}</span>
+        </div>
+        <p>{message.content || 'Empty message'}</p>
+      </article>
+    );
   }
 
   return (
@@ -259,13 +334,100 @@ export default function App() {
                   </button>
                   <button
                     className="primary-button"
-                    onClick={() => window.open(channel.chatUrl || channel.channelUrl, '_blank', 'noopener,noreferrer')}
+                    onClick={() => {
+                      void loadChannelChat(channel);
+                    }}
+                    disabled={isLoadingChat && selectedChannelSlug === channel.channelSlug}
                   >
-                    Open chat view
+                    {isLoadingChat && selectedChannelSlug === channel.channelSlug ? 'Loading chat...' : 'Open chat'}
                   </button>
                 </div>
               </article>
             ))}
+          </div>
+        )}
+      </section>
+
+      <section className="panel chat-viewer-panel">
+        <div className="panel-header">
+          <div>
+            <h2>Channel chat</h2>
+            <p className="subtle-copy">
+              {selectedChannel
+                ? `Recent chat history for ${selectedChannel.displayName}.`
+                : 'Click Open chat on any live followed channel to load its recent messages.'}
+            </p>
+          </div>
+          {selectedChannel ? <span className="mono-label">{selectedChannel.channelSlug}</span> : null}
+        </div>
+
+        {selectedChannel ? (
+          <>
+            <div className="chat-summary-card">
+              <div className="channel-identity">
+                <div className="channel-avatar">
+                  {channelChat?.avatarUrl || selectedChannel.thumbnailUrl ? (
+                    <img src={channelChat?.avatarUrl || selectedChannel.thumbnailUrl || ''} alt={selectedChannel.displayName} />
+                  ) : (
+                    <span>{selectedChannel.displayName.slice(0, 1).toUpperCase()}</span>
+                  )}
+                </div>
+                <div>
+                  <h3>{channelChat?.displayName || selectedChannel.displayName}</h3>
+                  <p>{channelChat?.messages.length ?? 0} recent messages loaded</p>
+                </div>
+              </div>
+
+              <div className="channel-actions compact-actions">
+                <button className="secondary-button" onClick={() => window.open(selectedChannel.channelUrl, '_blank', 'noopener,noreferrer')}>
+                  Open channel
+                </button>
+                <button className="primary-button" onClick={() => {
+                  void loadChannelChat(selectedChannel);
+                }} disabled={isLoadingChat}>
+                  {isLoadingChat ? 'Refreshing chat...' : 'Refresh chat'}
+                </button>
+              </div>
+            </div>
+
+            {chatError ? (
+              <div className="message-strip error-strip">
+                <strong>Chat error</strong>
+                <p>{chatError}</p>
+              </div>
+            ) : null}
+
+            {!channelChat && isLoadingChat ? (
+              <div className="empty-state">
+                <p>Loading recent chat messages...</p>
+                <span>The app is fetching the selected channel's Kick chat through the browser bridge.</span>
+              </div>
+            ) : null}
+
+            {channelChat?.pinnedMessage ? (
+              <div className="pinned-chat-card">
+                <span className="mono-label">Pinned</span>
+                {renderChatMessage(channelChat.pinnedMessage)}
+              </div>
+            ) : null}
+
+            {channelChat ? (
+              channelChat.messages.length === 0 ? (
+                <div className="empty-state">
+                  <p>No recent chat messages were returned.</p>
+                  <span>Kick may have an empty history for this channel right now.</span>
+                </div>
+              ) : (
+                <div className="chat-feed">
+                  {channelChat.messages.map((message) => renderChatMessage(message))}
+                </div>
+              )
+            ) : null}
+          </>
+        ) : (
+          <div className="empty-state">
+            <p>No channel chat selected yet.</p>
+            <span>After loading your live followings, click Open chat on any online channel to render its recent Kick chat here.</span>
           </div>
         )}
       </section>

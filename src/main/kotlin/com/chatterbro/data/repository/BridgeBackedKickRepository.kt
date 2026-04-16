@@ -1,6 +1,7 @@
 package com.chatterbro.data.repository
 
 import com.chatterbro.data.remote.KickRemoteDataSource
+import com.chatterbro.domain.model.ChannelChat
 import com.chatterbro.domain.model.FollowedChannel
 import com.chatterbro.domain.repository.KickRepository
 
@@ -9,5 +10,9 @@ class BridgeBackedKickRepository(
 ) : KickRepository {
     override suspend fun getLiveFollowedChannels(): List<FollowedChannel> {
         return remoteDataSource.getLiveFollowedChannels()
+    }
+
+    override suspend fun getChannelChat(channelSlug: String): ChannelChat {
+        return remoteDataSource.getChannelChat(channelSlug)
     }
 }

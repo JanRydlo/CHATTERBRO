@@ -1,5 +1,6 @@
 package com.chatterbro.data.bridge
 
+import com.chatterbro.domain.model.ChannelChat
 import com.chatterbro.domain.model.FollowedChannel
 import kotlinx.serialization.json.Json
 import java.util.concurrent.TimeUnit
@@ -124,5 +125,57 @@ class KickBridgeRunner(
         }
 
         return json.decodeFromString(paths.outputFile.readText())
+    }
+
+    fun fetchChannelChat(channelSlug: String): ChannelChat {
+        paths.ensureDirectories()
+
+        if (!paths.scriptFile.exists()) {
+            throw IllegalStateException("Bridge script is missing at ${paths.scriptFile}.")
+        }
+
+        val process = ProcessBuilder(
+            "node",
+            paths.scriptFile.toString(),
+            "fetch-channel-chat",
+            "--status-file",
+            paths.statusFile.toString(),
+            "--cookie-file",
+            paths.cookiesFile.toString(),
+            "--session-file",
+            paths.sessionFile.toString(),
+            "--profile-dir",
+            paths.profileDirectory.toString(),
+            "--meta-file",
+            paths.metadataFile.toString(),
+            "--output-file",
+            paths.chatOutputFile.toString(),
+            "--channel-slug",
+            channelSlug,
+        )
+            .directory(paths.rootDirectory.toFile())
+            .redirectErrorStream(true)
+            .start()
+
+        val output = process.inputStream.bufferedReader().readText().trim()
+        val completed = process.waitFor(90, TimeUnit.SECONDS)
+
+        if (!completed) {
+            process.destroyForcibly()
+            throw IllegalStateException("Kick bridge timed out while loading channel chat.")
+        }
+
+        if (process.exitValue() != 0) {
+            val message = output.ifBlank {
+                "Kick bridge failed with exit code ${process.exitValue()}."
+            }
+            throw IllegalStateException(message)
+        }
+
+        if (!paths.chatOutputFile.exists()) {
+            throw IllegalStateException("Kick bridge did not produce a channel chat output file.")
+        }
+
+        return json.decodeFromString(paths.chatOutputFile.readText())
     }
 }

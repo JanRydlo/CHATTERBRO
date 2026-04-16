@@ -6,6 +6,7 @@ import com.chatterbro.data.bridge.KickBridgeRunner
 import com.chatterbro.data.bridge.KickBridgeStatusStore
 import com.chatterbro.data.remote.PlaywrightKickBridgeDataSource
 import com.chatterbro.data.repository.BridgeBackedKickRepository
+import com.chatterbro.domain.usecase.LoadChannelChatUseCase
 import com.chatterbro.domain.usecase.LoadLiveFollowedChannelsUseCase
 import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
@@ -35,6 +36,7 @@ fun Application.chatterbroModule() {
     val remoteDataSource = PlaywrightKickBridgeDataSource(bridgeRunner, bridgeStatusStore)
     val repository = BridgeBackedKickRepository(remoteDataSource)
     val loadLiveFollowedChannels = LoadLiveFollowedChannelsUseCase(repository)
+    val loadChannelChat = LoadChannelChatUseCase(repository)
     val frontendDistDirectory = rootDirectory.resolve("frontend").resolve("dist").toFile()
     val frontendAssetsDirectory = frontendDistDirectory.resolve("assets")
     val frontendIndexFile = frontendDistDirectory.resolve("index.html")
@@ -75,6 +77,34 @@ fun Application.chatterbroModule() {
                     call.respond(loadLiveFollowedChannels())
                 } catch (exception: IllegalStateException) {
                     val message = exception.message ?: "Kick bridge failed to load channels."
+                    val statusCode = if (
+                        message.contains("sign in", ignoreCase = true) ||
+                        message.contains("expired", ignoreCase = true) ||
+                        message.contains("missing", ignoreCase = true)
+                    ) {
+                        HttpStatusCode.Unauthorized
+                    } else {
+                        HttpStatusCode.BadGateway
+                    }
+
+                    call.respond(
+                        statusCode,
+                        ErrorResponse(message),
+                    )
+                }
+            }
+
+            get("/chat/{channelSlug}") {
+                val channelSlug = call.parameters["channelSlug"]?.trim().orEmpty()
+                if (channelSlug.isBlank()) {
+                    call.respond(HttpStatusCode.BadRequest, ErrorResponse("Channel slug is required."))
+                    return@get
+                }
+
+                try {
+                    call.respond(loadChannelChat(channelSlug))
+                } catch (exception: IllegalStateException) {
+                    val message = exception.message ?: "Kick bridge failed to load channel chat."
                     val statusCode = if (
                         message.contains("sign in", ignoreCase = true) ||
                         message.contains("expired", ignoreCase = true) ||

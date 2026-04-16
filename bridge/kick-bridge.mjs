@@ -10,6 +10,7 @@ const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36';
 
 const KICK_HOME_URL = 'https://kick.com/';
+const KICK_WEB_URL = 'https://web.kick.com';
 const FOLLOWED_CHANNELS_ENDPOINT = '/api/v2/channels/followed';
 const REMOTE_DEBUGGING_HOST = '127.0.0.1';
 const EXISTING_BROWSER_CONNECT_TIMEOUT_MS = 30_000;
@@ -72,6 +73,9 @@ try {
       break;
     case 'fetch-live-following':
       await fetchLiveFollowing(args);
+      break;
+    case 'fetch-channel-chat':
+      await fetchChannelChat(args);
       break;
     default:
       printHelp();
@@ -257,6 +261,70 @@ async function fetchLiveFollowing(cliArgs) {
   }
 }
 
+async function fetchChannelChat(cliArgs) {
+  const statusFile = requireArg(cliArgs, 'status-file');
+  const cookieFile = requireArg(cliArgs, 'cookie-file');
+  const sessionFile = requireArg(cliArgs, 'session-file');
+  const metaFile = requireArg(cliArgs, 'meta-file');
+  const outputFile = requireArg(cliArgs, 'output-file');
+  const profileDir = requireArg(cliArgs, 'profile-dir');
+  const channelSlug = requireArg(cliArgs, 'channel-slug').trim().toLowerCase();
+
+  if (!channelSlug) {
+    throw new Error('Kick channel slug is required.');
+  }
+
+  const metadata = await readJson(metaFile, {});
+  const storedCookies = await readJson(cookieFile, []);
+  const storedSession = await readKickSession(sessionFile);
+
+  if (!hasValidKickSession(storedSession)) {
+    await invalidateSavedSession(sessionFile, cookieFile);
+    await safeUpdateStatus(statusFile, 'IDLE', 'Kick session is missing or expired. Sign in again.', null);
+    throw new Error('Kick session is missing or expired. Sign in again.');
+  }
+
+  let session;
+  try {
+    session = await openExistingBrowserBridge({
+      debuggingPort: metadata.debuggingPort
+    });
+  } catch {
+    session = await openBrowserBridge({
+      preferredBrowserPath: metadata.browserPath || process.env.KICK_BROWSER_PATH,
+      profileDir,
+      startUrl: 'about:blank',
+      startMinimized: true
+    });
+  }
+
+  const { browser, context, page, browserProcess, ownsBrowserProcess } = session;
+
+  try {
+    if (Array.isArray(storedCookies) && storedCookies.length > 0) {
+      await context.addCookies(storedCookies);
+    }
+
+    const chat = await fetchChannelChatFromBrowser(page, channelSlug);
+    await writeJson(outputFile, chat);
+
+    const refreshedCookies = await context.cookies(KICK_HOME_URL).catch(() => []);
+    if (Array.isArray(refreshedCookies) && refreshedCookies.length > 0) {
+      await writeJson(cookieFile, refreshedCookies);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Kick bridge failed to load channel chat.';
+    if (message.toLowerCase().includes('sign in again')) {
+      await invalidateSavedSession(sessionFile, cookieFile);
+      await safeUpdateStatus(statusFile, 'IDLE', message, null);
+    }
+
+    throw error;
+  } finally {
+    await closeBrowserBridge(page, browser, browserProcess, ownsBrowserProcess);
+  }
+}
+
 async function waitForAuthenticatedSession({ context, page, cookieFile, sessionFile }) {
   const deadline = Date.now() + LOGIN_CAPTURE_TIMEOUT_MS;
 
@@ -434,6 +502,186 @@ async function fetchFollowedChannelsFromBrowser(page, authToken) {
   }
 
   return dedupeChannels(normalizeFollowedChannels(result.channels));
+}
+
+async function fetchChannelChatFromBrowser(page, channelSlug) {
+  await page.goto(`https://kick.com/${encodeURIComponent(channelSlug)}`, {
+    waitUntil: 'domcontentloaded',
+    timeout: 60_000
+  }).catch(() => undefined);
+  await page.waitForTimeout(BACKGROUND_FETCH_WARMUP_MS);
+
+  const result = await page.evaluate(async ({ normalizedChannelSlug, kickWebUrl }) => {
+    const jsonHeaders = {
+      accept: 'application/json'
+    };
+
+    const normalizeBadges = (value) => {
+      if (!Array.isArray(value)) {
+        return [];
+      }
+
+      return value
+        .map((badge) => ({
+          type: typeof badge?.type === 'string' ? badge.type : '',
+          text: typeof badge?.text === 'string' ? badge.text : typeof badge?.type === 'string' ? badge.type : '',
+          count: Number.isFinite(Number(badge?.count)) ? Number(badge.count) : null
+        }))
+        .filter((badge) => badge.type || badge.text);
+    };
+
+    const normalizeMessage = (message) => {
+      if (!message || typeof message !== 'object') {
+        return null;
+      }
+
+      return {
+        id: String(message.id || ''),
+        content: typeof message.content === 'string' ? message.content : '',
+        type: typeof message.type === 'string' ? message.type : 'message',
+        createdAt: typeof message.created_at === 'string' ? message.created_at : null,
+        threadParentId: typeof message.thread_parent_id === 'string' ? message.thread_parent_id : null,
+        sender: {
+          id: Number.isFinite(Number(message.sender?.id)) ? Number(message.sender.id) : null,
+          username: typeof message.sender?.username === 'string' ? message.sender.username : 'unknown',
+          slug: typeof message.sender?.slug === 'string'
+            ? message.sender.slug
+            : typeof message.sender?.username === 'string'
+              ? message.sender.username
+              : 'unknown',
+          color: typeof message.sender?.identity?.color === 'string' ? message.sender.identity.color : null,
+          badges: normalizeBadges(message.sender?.identity?.badges)
+        }
+      };
+    };
+
+    const channelResponse = await fetch(`/api/v2/channels/${encodeURIComponent(normalizedChannelSlug)}`, {
+      credentials: 'include',
+      headers: jsonHeaders
+    }).catch(() => null);
+
+    if (!channelResponse) {
+      return {
+        ok: false,
+        status: 0,
+        bodySnippet: 'Background Kick channel request failed.'
+      };
+    }
+
+    const channelPayloadText = await channelResponse.text();
+    if (!channelResponse.ok) {
+      return {
+        ok: false,
+        status: channelResponse.status,
+        bodySnippet: channelPayloadText.slice(0, 500)
+      };
+    }
+
+    let channelPayload;
+    try {
+      channelPayload = JSON.parse(channelPayloadText);
+    } catch {
+      return {
+        ok: false,
+        status: channelResponse.status,
+        bodySnippet: channelPayloadText.slice(0, 500)
+      };
+    }
+
+    const channelId =
+      channelPayload?.id ||
+      channelPayload?.chatroom?.channel_id ||
+      channelPayload?.chatroom?.id ||
+      null;
+
+    if (!channelId) {
+      return {
+        ok: false,
+        status: 500,
+        bodySnippet: `Kick did not return a chat id for ${normalizedChannelSlug}.`
+      };
+    }
+
+    const historyResponse = await fetch(`${kickWebUrl}/api/v1/chat/${encodeURIComponent(String(channelId))}/history`, {
+      credentials: 'include',
+      headers: jsonHeaders
+    }).catch(() => null);
+
+    if (!historyResponse) {
+      return {
+        ok: false,
+        status: 0,
+        bodySnippet: 'Background Kick chat history request failed.'
+      };
+    }
+
+    const historyPayloadText = await historyResponse.text();
+    if (!historyResponse.ok) {
+      return {
+        ok: false,
+        status: historyResponse.status,
+        bodySnippet: historyPayloadText.slice(0, 500)
+      };
+    }
+
+    let historyPayload;
+    try {
+      historyPayload = JSON.parse(historyPayloadText);
+    } catch {
+      return {
+        ok: false,
+        status: historyResponse.status,
+        bodySnippet: historyPayloadText.slice(0, 500)
+      };
+    }
+
+    const historyData = historyPayload?.data && typeof historyPayload.data === 'object'
+      ? historyPayload.data
+      : historyPayload;
+    const messages = Array.isArray(historyData?.messages)
+      ? historyData.messages.map(normalizeMessage).filter(Boolean)
+      : [];
+    const pinnedMessage = normalizeMessage(historyData?.pinned_message?.message || historyPayload?.pinned_message?.message || null);
+    const resolvedChannelSlug = typeof channelPayload?.slug === 'string' ? channelPayload.slug : normalizedChannelSlug;
+
+    return {
+      ok: true,
+      chat: {
+        channelSlug: resolvedChannelSlug,
+        channelId: Number.isFinite(Number(channelId)) ? Number(channelId) : null,
+        displayName: typeof channelPayload?.user?.username === 'string'
+          ? channelPayload.user.username
+          : resolvedChannelSlug,
+        channelUrl: `https://kick.com/${resolvedChannelSlug}`,
+        avatarUrl:
+          channelPayload?.user?.profile_pic ||
+          channelPayload?.user?.profile_picture ||
+          channelPayload?.profile_picture ||
+          null,
+        cursor: typeof historyData?.cursor === 'string' ? historyData.cursor : null,
+        messages,
+        pinnedMessage,
+        updatedAt: new Date().toISOString()
+      }
+    };
+  }, {
+    normalizedChannelSlug: channelSlug,
+    kickWebUrl: KICK_WEB_URL
+  });
+
+  if (!result?.ok) {
+    if (result?.status === 401 || result?.status === 403) {
+      throw new Error('Kick rejected the saved session. Sign in again.');
+    }
+
+    if (result?.status === 404) {
+      throw new Error(`Kick could not find chat for channel ${channelSlug}.`);
+    }
+
+    throw new Error(result?.bodySnippet || `Kick browser request failed while loading chat for ${channelSlug}.`);
+  }
+
+  return result.chat;
 }
 
 async function readKickSession(filePath) {
@@ -890,5 +1138,6 @@ function now() {
 function printHelp() {
   console.log(`Usage:
   node bridge/kick-bridge.mjs login --status-file <file> --cookie-file <file> --session-file <file> --profile-dir <dir> --meta-file <file>
-  node bridge/kick-bridge.mjs fetch-live-following --status-file <file> --cookie-file <file> --session-file <file> --profile-dir <dir> --meta-file <file> --output-file <file>`);
+  node bridge/kick-bridge.mjs fetch-live-following --status-file <file> --cookie-file <file> --session-file <file> --profile-dir <dir> --meta-file <file> --output-file <file>
+  node bridge/kick-bridge.mjs fetch-channel-chat --status-file <file> --cookie-file <file> --session-file <file> --profile-dir <dir> --meta-file <file> --output-file <file> --channel-slug <slug>`);
 }

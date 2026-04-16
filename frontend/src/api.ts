@@ -1,4 +1,4 @@
-import type { FollowedChannel, KickBridgeStatus } from './types';
+import type { ChannelChat, FollowedChannel, KickBridgeStatus } from './types';
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
 
@@ -40,4 +40,8 @@ export function startBridge(): Promise<KickBridgeStatus> {
 
 export function fetchLiveFollowedChannels(): Promise<FollowedChannel[]> {
   return request<FollowedChannel[]>('/api/following/live');
+}
+
+export function fetchChannelChat(channelSlug: string): Promise<ChannelChat> {
+  return request<ChannelChat>(`/api/chat/${encodeURIComponent(channelSlug)}`);
 }

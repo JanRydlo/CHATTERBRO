@@ -3,6 +3,7 @@ package com.chatterbro.data.remote
 import com.chatterbro.data.bridge.KickBridgeRunner
 import com.chatterbro.data.bridge.KickBridgeStatus
 import com.chatterbro.data.bridge.KickBridgeStatusStore
+import com.chatterbro.domain.model.ChannelChat
 import com.chatterbro.domain.model.FollowedChannel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -22,6 +23,12 @@ class PlaywrightKickBridgeDataSource(
     override suspend fun getLiveFollowedChannels(): List<FollowedChannel> {
         return withContext(Dispatchers.IO) {
             bridgeRunner.fetchLiveFollowedChannels()
+        }
+    }
+
+    override suspend fun getChannelChat(channelSlug: String): ChannelChat {
+        return withContext(Dispatchers.IO) {
+            bridgeRunner.fetchChannelChat(channelSlug)
         }
     }
 }

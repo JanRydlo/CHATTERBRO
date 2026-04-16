@@ -25,3 +25,38 @@ export interface FollowedChannel {
   chatUrl: string | null;
   thumbnailUrl: string | null;
 }
+
+export interface ChannelChatBadge {
+  type: string;
+  text: string;
+  count: number | null;
+}
+
+export interface ChannelChatSender {
+  id: number | null;
+  username: string;
+  slug: string;
+  color: string | null;
+  badges: ChannelChatBadge[];
+}
+
+export interface ChannelChatMessage {
+  id: string;
+  content: string;
+  type: string;
+  createdAt: string | null;
+  threadParentId: string | null;
+  sender: ChannelChatSender;
+}
+
+export interface ChannelChat {
+  channelSlug: string;
+  channelId: number | null;
+  displayName: string;
+  channelUrl: string;
+  avatarUrl: string | null;
+  cursor: string | null;
+  messages: ChannelChatMessage[];
+  pinnedMessage: ChannelChatMessage | null;
+  updatedAt: string;
+}

@@ -15,6 +15,7 @@ data class KickBridgePaths(
     val sessionFile: Path = sessionDirectory.resolve("kick-session.json")
     val statusFile: Path = sessionDirectory.resolve("bridge-status.json")
     val outputFile: Path = sessionDirectory.resolve("live-following.json")
+    val chatOutputFile: Path = sessionDirectory.resolve("channel-chat.json")
     val logFile: Path = sessionDirectory.resolve("bridge.log")
 
     fun ensureDirectories() {
