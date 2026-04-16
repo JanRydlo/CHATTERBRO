@@ -36,6 +36,11 @@ const KICK_PUSHER_OPTIONS: PusherOptions = {
   disableStats: true
 };
 
+interface RealtimeChatTarget {
+  channelId: number | null;
+  chatroomId: number | null;
+}
+
 function parseRealtimeJson(value: unknown) {
   if (typeof value !== 'string') {
     return value;
@@ -46,6 +51,37 @@ function parseRealtimeJson(value: unknown) {
   } catch {
     return null;
   }
+}
+
+function unwrapRealtimeRecord(payload: unknown): Record<string, unknown> | null {
+  let candidate = parseRealtimeJson(payload);
+
+  for (let depth = 0; depth < 5; depth += 1) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+      return null;
+    }
+
+    const record = candidate as Record<string, unknown>;
+    const nestedData = parseRealtimeJson(record.data);
+    if (nestedData && typeof nestedData === 'object' && !Array.isArray(nestedData)) {
+      candidate = nestedData;
+      continue;
+    }
+
+    if (record.message && typeof record.message === 'object' && !Array.isArray(record.message)) {
+      candidate = record.message;
+      continue;
+    }
+
+    if (record.chat_message && typeof record.chat_message === 'object' && !Array.isArray(record.chat_message)) {
+      candidate = record.chat_message;
+      continue;
+    }
+
+    return record;
+  }
+
+  return null;
 }
 
 function normalizeRealtimeBadge(value: unknown) {
@@ -70,33 +106,52 @@ function normalizeRealtimeBadge(value: unknown) {
 }
 
 function normalizeRealtimeChatMessage(payload: unknown): ChannelChatMessage | null {
-  let candidate = parseRealtimeJson(payload);
+  const message = unwrapRealtimeRecord(payload);
 
-  if (candidate && typeof candidate === 'object' && 'data' in candidate) {
-    candidate = parseRealtimeJson((candidate as { data: unknown }).data);
-  }
-
-  if (!candidate || typeof candidate !== 'object') {
+  if (!message) {
     return null;
   }
 
-  const message = candidate as Record<string, unknown>;
-  const sender = message.sender;
+  const sender =
+    message.sender && typeof message.sender === 'object'
+      ? message.sender
+      : message.user && typeof message.user === 'object'
+        ? message.user
+        : null;
+
   if (!sender || typeof sender !== 'object') {
     return null;
   }
 
   const senderRecord = sender as Record<string, unknown>;
-  const identity = senderRecord.identity;
+  const identity = senderRecord.identity && typeof senderRecord.identity === 'object'
+    ? senderRecord.identity
+    : message.identity && typeof message.identity === 'object'
+      ? message.identity
+      : null;
   const identityRecord = identity && typeof identity === 'object' ? identity as Record<string, unknown> : null;
-  const messageId = typeof message.id === 'string' ? message.id : '';
-  const username = typeof senderRecord.username === 'string' ? senderRecord.username : '';
+  const rawMessageId = message.id ?? message.message_id ?? message.uuid ?? null;
+  const messageId = typeof rawMessageId === 'string'
+    ? rawMessageId
+    : Number.isFinite(Number(rawMessageId))
+      ? String(rawMessageId)
+      : '';
+  const username = typeof senderRecord.username === 'string'
+    ? senderRecord.username
+    : typeof senderRecord.name === 'string'
+      ? senderRecord.name
+      : typeof senderRecord.slug === 'string'
+        ? senderRecord.slug
+        : '';
   const senderId = Number(senderRecord.id);
-  const badges = Array.isArray(identityRecord?.badges)
+  const rawBadges = Array.isArray(identityRecord?.badges)
     ? identityRecord.badges
+    : Array.isArray(senderRecord.badges)
+      ? senderRecord.badges
+      : [];
+  const badges = rawBadges
       .map((badge) => normalizeRealtimeBadge(badge))
       .filter((badge): badge is NonNullable<ReturnType<typeof normalizeRealtimeBadge>> => badge !== null)
-    : [];
 
   if (!messageId || !username) {
     return null;
@@ -104,26 +159,71 @@ function normalizeRealtimeChatMessage(payload: unknown): ChannelChatMessage | nu
 
   return {
     id: messageId,
-    content: typeof message.content === 'string' ? message.content : '',
+    content: typeof message.content === 'string'
+      ? message.content
+      : typeof message.body === 'string'
+        ? message.body
+        : typeof message.message === 'string'
+          ? message.message
+          : '',
     type: typeof message.type === 'string' ? message.type : 'message',
-    createdAt: typeof message.created_at === 'string' ? message.created_at : null,
+    createdAt: typeof message.created_at === 'string'
+      ? message.created_at
+      : typeof message.createdAt === 'string'
+        ? message.createdAt
+        : typeof message.timestamp === 'string'
+          ? message.timestamp
+          : null,
     threadParentId: typeof message.thread_parent_id === 'string'
       ? message.thread_parent_id
       : Number.isFinite(Number(message.thread_parent_id))
         ? String(message.thread_parent_id)
+        : typeof message.reply_to_message_id === 'string'
+          ? message.reply_to_message_id
+          : Number.isFinite(Number(message.reply_to_message_id))
+            ? String(message.reply_to_message_id)
         : null,
     sender: {
       id: Number.isFinite(senderId) ? senderId : null,
       username,
       slug: typeof senderRecord.slug === 'string' ? senderRecord.slug : username.toLowerCase(),
-      color: typeof identityRecord?.color === 'string' ? identityRecord.color : null,
+      color: typeof identityRecord?.color === 'string'
+        ? identityRecord.color
+        : typeof senderRecord.color === 'string'
+          ? senderRecord.color
+          : null,
       badges
     }
   };
 }
 
-function appendRealtimeChatMessage(currentChat: ChannelChat | null, chatroomId: number, nextMessage: ChannelChatMessage) {
-  if (!currentChat || currentChat.chatroomId !== chatroomId) {
+function getRealtimeChannelNames(target: RealtimeChatTarget): string[] {
+  const channelNames = new Set<string>();
+
+  if (target.chatroomId !== null) {
+    channelNames.add(`chatroom_${target.chatroomId}`);
+    channelNames.add(`chatrooms.${target.chatroomId}.v2`);
+    channelNames.add(`chatrooms.${target.chatroomId}`);
+  }
+
+  if (target.channelId !== null) {
+    channelNames.add(`channel_${target.channelId}`);
+    channelNames.add(`channel.${target.channelId}`);
+  }
+
+  return [...channelNames];
+}
+
+function appendRealtimeChatMessage(currentChat: ChannelChat | null, target: RealtimeChatTarget, nextMessage: ChannelChatMessage) {
+  if (!currentChat) {
+    return currentChat;
+  }
+
+  if (target.chatroomId !== null && currentChat.chatroomId !== target.chatroomId) {
+    return currentChat;
+  }
+
+  if (target.chatroomId === null && target.channelId !== null && currentChat.channelId !== target.channelId) {
     return currentChat;
   }
 
@@ -202,6 +302,7 @@ export default function App() {
   const selectedChannelSlug = selectedChannel?.channelSlug || null;
   const needsBrowserSync = bridgeStatus.oauthEnabled && isAuthenticated && !bridgeStatus.hasBrowserSession;
   const activeChatroomId = channelChat?.chatroomId ?? null;
+  const activeChannelId = channelChat?.channelId ?? null;
   const liveChatStatusLabel = liveChatState === 'live'
     ? 'Live'
     : liveChatState === 'connecting'
@@ -230,32 +331,36 @@ export default function App() {
   }, [isAuthenticated]);
 
   useEffect(() => {
-    if (!channelChat || activeChatroomId === null) {
+    if (!channelChat || (activeChatroomId === null && activeChannelId === null)) {
       setLiveChatState('idle');
       setLiveChatError(null);
       return;
     }
 
+    const realtimeTarget = {
+      chatroomId: activeChatroomId,
+      channelId: activeChannelId
+    };
+    const subscriptionNames = getRealtimeChannelNames(realtimeTarget);
+    if (subscriptionNames.length === 0) {
+      setLiveChatState('error');
+      setLiveChatError('Kick did not expose a realtime subscription target for this channel.');
+      return;
+    }
+
     const pusher = new Pusher(KICK_PUSHER_KEY, KICK_PUSHER_OPTIONS);
-    const subscription = pusher.subscribe(`chatrooms.${activeChatroomId}.v2`);
+    let hasMarkedLive = false;
 
     setLiveChatState('connecting');
     setLiveChatError(null);
 
-    const handleSubscriptionSucceeded = () => {
-      setLiveChatState('live');
-      setActivity(`Live chat connected for ${channelChat.displayName}. New Kick messages will appear automatically.`);
-    };
-
-    const handleChatMessage = (payload: unknown) => {
-      const nextMessage = normalizeRealtimeChatMessage(payload);
-      if (!nextMessage) {
-        return;
+    const markLive = (source: string) => {
+      if (!hasMarkedLive) {
+        hasMarkedLive = true;
+        setActivity(`Live chat connected for ${channelChat.displayName} via ${source}. New Kick messages will appear automatically.`);
       }
 
-      startTransition(() => {
-        setChannelChat((currentChat) => appendRealtimeChatMessage(currentChat, activeChatroomId, nextMessage));
-      });
+      setLiveChatState('live');
     };
 
     const handleConnectionError = () => {
@@ -263,18 +368,74 @@ export default function App() {
       setLiveChatError('Live chat disconnected. You can still refresh chat manually.');
     };
 
-    subscription.bind('pusher:subscription_succeeded', handleSubscriptionSucceeded);
-    subscription.bind('App\\Events\\ChatMessageEvent', handleChatMessage);
+    const subscriptions = subscriptionNames.map((subscriptionName) => {
+      const subscription = pusher.subscribe(subscriptionName);
+
+      const handleSubscriptionSucceeded = () => {
+        markLive(subscriptionName);
+      };
+
+      const handleGlobalEvent = (eventName: string, payload: unknown) => {
+        if (eventName.startsWith('pusher:')) {
+          return;
+        }
+
+        const nextMessage = normalizeRealtimeChatMessage(payload);
+        if (!nextMessage) {
+          return;
+        }
+
+        markLive(`${subscriptionName} · ${eventName}`);
+
+        startTransition(() => {
+          setChannelChat((currentChat) => appendRealtimeChatMessage(currentChat, realtimeTarget, nextMessage));
+        });
+      };
+
+      subscription.bind('pusher:subscription_succeeded', handleSubscriptionSucceeded);
+      subscription.bind_global(handleGlobalEvent);
+
+      return {
+        subscription,
+        subscriptionName,
+        handleSubscriptionSucceeded,
+        handleGlobalEvent
+      };
+    });
+
+    const handleChatMessage = (payload: unknown) => {
+      const nextMessage = normalizeRealtimeChatMessage(payload);
+      if (!nextMessage) {
+        return;
+      }
+
+      markLive(`chatrooms.${activeChatroomId}.v2 · App\\Events\\ChatMessageEvent`);
+
+      startTransition(() => {
+        setChannelChat((currentChat) => appendRealtimeChatMessage(currentChat, realtimeTarget, nextMessage));
+      });
+    };
+
+    for (const { subscription } of subscriptions) {
+      subscription.bind('App\\Events\\ChatMessageEvent', handleChatMessage);
+      subscription.bind('ChatMessageEvent', handleChatMessage);
+    }
+
     pusher.connection.bind('error', handleConnectionError);
 
     return () => {
-      subscription.unbind('pusher:subscription_succeeded', handleSubscriptionSucceeded);
-      subscription.unbind('App\\Events\\ChatMessageEvent', handleChatMessage);
+      for (const { subscription, subscriptionName, handleSubscriptionSucceeded, handleGlobalEvent } of subscriptions) {
+        subscription.unbind('pusher:subscription_succeeded', handleSubscriptionSucceeded);
+        subscription.unbind('App\\Events\\ChatMessageEvent', handleChatMessage);
+        subscription.unbind('ChatMessageEvent', handleChatMessage);
+        subscription.unbind_global(handleGlobalEvent);
+        pusher.unsubscribe(subscriptionName);
+      }
+
       pusher.connection.unbind('error', handleConnectionError);
-      pusher.unsubscribe(`chatrooms.${activeChatroomId}.v2`);
       pusher.disconnect();
     };
-  }, [activeChatroomId, channelChat?.displayName]);
+  }, [activeChannelId, activeChatroomId, channelChat?.displayName]);
 
   async function refreshBridgeStatus() {
     try {
