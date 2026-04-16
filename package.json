@@ -1,0 +1,11 @@
+{
+  "name": "chatterbro-bridge",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bridge:login": "node bridge/kick-bridge.mjs login --status-file ./bridge/session/bridge-status.json --cookie-file ./bridge/session/kick-cookies.json --profile-dir ./bridge/browser-profile-cdp --meta-file ./bridge/session/browser-meta.json"
+  },
+  "dependencies": {
+    "playwright": "1.59.1"
+  }
+}

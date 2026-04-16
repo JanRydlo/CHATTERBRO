@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowSyntheticDefaultImports": true,
+    "noEmit": true,
+    "ignoreDeprecations": "6.0"
+  },
+  "include": ["vite.config.ts"]
+}

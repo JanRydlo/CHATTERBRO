@@ -1,0 +1,16 @@
+.gradle/
+.idea/
+.kotlin/
+build/
+out/
+*.class
+*.log
+*.tsbuildinfo
+node_modules/
+frontend/node_modules/
+frontend/dist/
+bridge/browser-profile/
+bridge/browser-profile-cdp/
+bridge/session/
+
+!gradle/wrapper/gradle-wrapper.jar
