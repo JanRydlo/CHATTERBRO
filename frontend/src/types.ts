@@ -34,6 +34,7 @@ export interface ChannelChatBadge {
   type: string;
   text: string;
   count: number | null;
+  imageUrl: string | null;
 }
 
 export interface ChannelChatSender {
@@ -56,6 +57,7 @@ export interface ChannelChatMessage {
 export interface ChannelChat {
   channelSlug: string;
   channelId: number | null;
+  channelUserId: number | null;
   chatroomId: number | null;
   displayName: string;
   channelUrl: string;
@@ -63,5 +65,21 @@ export interface ChannelChat {
   cursor: string | null;
   messages: ChannelChatMessage[];
   pinnedMessage: ChannelChatMessage | null;
+  updatedAt: string;
+}
+
+export interface ChannelChatEmote {
+  code: string;
+  imageUrl: string;
+  provider: string;
+  animated: boolean;
+  width: number | null;
+  height: number | null;
+}
+
+export interface ChannelChatEmoteCatalog {
+  channelSlug: string;
+  channelUserId: number | null;
+  emotes: ChannelChatEmote[];
   updatedAt: string;
 }

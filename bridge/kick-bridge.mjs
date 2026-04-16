@@ -21,6 +21,7 @@ const REMOTE_DEBUGGING_POLL_INTERVAL_MS = 500;
 const LOGIN_CAPTURE_TIMEOUT_MS = 10 * 60_000;
 const LOGIN_CAPTURE_POLL_INTERVAL_MS = 1_000;
 const BACKGROUND_FETCH_WARMUP_MS = 1_500;
+const CHANNEL_CHAT_DOM_WARMUP_MS = 2_500;
 const MAX_FOLLOWED_CURSOR_PAGES = 25;
 
 const SYSTEM_BROWSER_CANDIDATES = [
@@ -205,35 +206,22 @@ async function fetchLiveFollowing(cliArgs) {
 
   let session;
   try {
-    session = await openExistingBrowserBridge({
-      debuggingPort: metadata.debuggingPort
+    session = await openBackgroundBrowserBridge({
+      preferredBrowserPath: metadata.browserPath || process.env.KICK_BROWSER_PATH
     });
-  } catch (error) {
-    try {
-      session = await openBrowserBridge({
-        preferredBrowserPath: metadata.browserPath || process.env.KICK_BROWSER_PATH,
-        profileDir,
-        startUrl: 'about:blank',
-        startMinimized: true
-      });
-    } catch (launchError) {
-      await safeUpdateStatus(
-        statusFile,
-        'ERROR',
-        'Could not open the background Kick browser profile. Sign in again if the saved session was lost.',
-        storedSession
-      );
-      throw launchError;
-    }
+  } catch (launchError) {
+    await safeUpdateStatus(
+      statusFile,
+      'ERROR',
+      'Could not open the background Kick browser session. Sign in again if the saved session was lost.',
+      storedSession
+    );
+    throw launchError;
   }
 
   const { browser, context, page, browserInfo, browserProcess, ownsBrowserProcess } = session;
 
   try {
-    if (Array.isArray(storedCookies) && storedCookies.length > 0) {
-      await context.addCookies(storedCookies);
-    }
-
     const channels = await fetchFollowedChannelsFromBrowser(page, storedSession.token);
 
     await writeJson(outputFile, channels);
@@ -289,28 +277,14 @@ async function fetchChannelChat(cliArgs) {
     throw new Error('Kick session is missing or expired. Sign in again.');
   }
 
-  let session;
-  try {
-    session = await openExistingBrowserBridge({
-      debuggingPort: metadata.debuggingPort
-    });
-  } catch {
-    session = await openBrowserBridge({
-      preferredBrowserPath: metadata.browserPath || process.env.KICK_BROWSER_PATH,
-      profileDir,
-      startUrl: 'about:blank',
-      startMinimized: true
-    });
-  }
+  const session = await openBackgroundBrowserBridge({
+    preferredBrowserPath: metadata.browserPath || process.env.KICK_BROWSER_PATH
+  });
 
   const { browser, context, page, browserProcess, ownsBrowserProcess } = session;
 
   try {
-    if (Array.isArray(storedCookies) && storedCookies.length > 0) {
-      await context.addCookies(storedCookies);
-    }
-
-    const chat = await fetchChannelChatFromBrowser(page, channelSlug);
+    const chat = await fetchChannelChatFromBrowser(page, channelSlug, storedSession.token);
     await writeJson(outputFile, chat);
 
     const refreshedCookies = await context.cookies(KICK_HOME_URL).catch(() => []);
@@ -347,27 +321,13 @@ async function serveBridge(cliArgs) {
     throw new Error('Kick session is missing or expired. Sign in again.');
   }
 
-  let session;
-  try {
-    session = await openExistingBrowserBridge({
-      debuggingPort: metadata.debuggingPort
-    });
-  } catch {
-    session = await openBrowserBridge({
-      preferredBrowserPath: metadata.browserPath || process.env.KICK_BROWSER_PATH,
-      profileDir,
-      startUrl: 'about:blank',
-      startMinimized: true
-    });
-  }
+  const session = await openBackgroundBrowserBridge({
+    preferredBrowserPath: metadata.browserPath || process.env.KICK_BROWSER_PATH
+  });
 
   const { browser, context, page, browserProcess, ownsBrowserProcess } = session;
 
   try {
-    if (Array.isArray(storedCookies) && storedCookies.length > 0) {
-      await context.addCookies(storedCookies);
-    }
-
     await ensureKickHomePage(page);
     writeProtocolLine({ type: 'ready' });
 
@@ -448,7 +408,7 @@ async function handleServiceRequest(line, state) {
         throw new Error('Kick session is missing or expired. Sign in again.');
       }
 
-      const chat = await fetchChannelChatFromBrowser(state.page, channelSlug);
+      const chat = await fetchChannelChatFromBrowser(state.page, channelSlug, storedSession.token);
       await persistServiceCookies(state.context, state.cookieFile);
       await safeUpdateStatus(
         state.statusFile,
@@ -675,187 +635,654 @@ async function fetchFollowedChannelsFromBrowser(page, authToken) {
   return dedupeChannels(normalizeFollowedChannels(result.channels));
 }
 
-async function fetchChannelChatFromBrowser(page, channelSlug) {
+async function fetchChannelChatFromBrowser(page, channelSlug, authToken) {
+  let pageSnapshot = null;
+  let pageSnapshotError = null;
+
+  try {
+    pageSnapshot = await fetchChannelChatPageSnapshot(page, channelSlug);
+    if (pageSnapshot.messages.length > 0) {
+      return pageSnapshot;
+    }
+  } catch (error) {
+    pageSnapshotError = error;
+  }
+
+  try {
+    const apiSnapshot = await fetchChannelChatFromApi(page, channelSlug, authToken);
+
+    if (!pageSnapshot) {
+      return apiSnapshot;
+    }
+
+    return {
+      ...apiSnapshot,
+      channelId: pageSnapshot.channelId ?? apiSnapshot.channelId,
+      channelUserId: pageSnapshot.channelUserId ?? apiSnapshot.channelUserId,
+      chatroomId: pageSnapshot.chatroomId ?? apiSnapshot.chatroomId,
+      displayName: pageSnapshot.displayName || apiSnapshot.displayName,
+      channelUrl: pageSnapshot.channelUrl || apiSnapshot.channelUrl,
+      avatarUrl: pageSnapshot.avatarUrl || apiSnapshot.avatarUrl,
+      updatedAt: new Date().toISOString()
+    };
+  } catch (error) {
+    if (pageSnapshot) {
+      return pageSnapshot;
+    }
+
+    if (pageSnapshotError instanceof Error && error instanceof Error) {
+      throw new Error(`${pageSnapshotError.message} ${error.message}`.trim());
+    }
+
+    if (pageSnapshotError instanceof Error) {
+      throw pageSnapshotError;
+    }
+
+    throw error;
+  }
+}
+
+async function fetchChannelChatFromApi(page, channelSlug, authToken) {
   await ensureKickHomePage(page);
 
-  const result = await page.evaluate(async ({ normalizedChannelSlug, kickApiBaseUrl, kickWebUrl }) => {
-    const jsonHeaders = {
-      accept: 'application/json'
-    };
+  let lastResult = null;
 
-    const normalizeBadges = (value) => {
-      if (!Array.isArray(value)) {
-        return [];
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const result = await page.evaluate(async ({ normalizedChannelSlug, kickApiBaseUrl, kickWebUrl, token }) => {
+      const jsonHeaders = {
+        accept: 'application/json',
+        authorization: token,
+        'x-app-platform': 'web'
+      };
+
+      const kickPlaceholderPattern = /\[emote:\d+:[^\]]+\]/;
+
+      const resolveBadgeImageUrl = (badge) => {
+        const candidates = [
+          badge?.image,
+          badge?.image_url,
+          badge?.icon,
+          badge?.icon_url,
+          badge?.src,
+          badge?.url,
+          badge?.badge_image,
+          badge?.small_icon_url,
+          badge?.thumbnail
+        ];
+
+        const match = candidates.find((candidate) => typeof candidate === 'string' && candidate.length > 0);
+        return match || null;
+      };
+
+      const normalizeBadge = (badge) => {
+        if (typeof badge === 'string') {
+          const typeMatch = badge.match(/type=([^;}]*)/i);
+          const textMatch = badge.match(/text=([^;}]*)/i);
+          const countMatch = badge.match(/count=([^;}]*)/i);
+          const imageMatch = badge.match(/(?:imageUrl|image_url|icon|icon_url|src|url)=([^;}]*)/i);
+          const parsedCount = Number(countMatch?.[1]);
+          const type = typeMatch?.[1]?.trim() || '';
+          const text = textMatch?.[1]?.trim() || type;
+
+          if (!type && !text) {
+            return null;
+          }
+
+          return {
+            type,
+            text,
+            count: Number.isFinite(parsedCount) ? parsedCount : null,
+            imageUrl: imageMatch?.[1]?.trim() || null
+          };
+        }
+
+        if (!badge || typeof badge !== 'object') {
+          return null;
+        }
+
+        const parsedCount = Number(badge?.count);
+        const type = typeof badge?.type === 'string' ? badge.type : '';
+        const text = typeof badge?.text === 'string' ? badge.text : type;
+
+        if (!type && !text) {
+          return null;
+        }
+
+        return {
+          type,
+          text,
+          count: Number.isFinite(parsedCount) ? parsedCount : null,
+          imageUrl: resolveBadgeImageUrl(badge)
+        };
+      };
+
+      const resolveMessageContent = (message) => {
+        const metadata = message?.metadata && typeof message.metadata === 'object' && !Array.isArray(message.metadata)
+          ? message.metadata
+          : null;
+        const candidates = [
+          typeof message?.content === 'string' ? message.content : '',
+          typeof message?.original_message === 'string' ? message.original_message : '',
+          typeof message?.body === 'string' ? message.body : '',
+          typeof message?.message === 'string' ? message.message : '',
+          typeof message?.text === 'string' ? message.text : '',
+          typeof metadata?.original_message === 'string' ? metadata.original_message : '',
+          typeof metadata?.body === 'string' ? metadata.body : '',
+          typeof metadata?.text === 'string' ? metadata.text : ''
+        ].filter((candidate) => candidate.length > 0);
+
+        const kickPlaceholderCandidate = candidates.find((candidate) => kickPlaceholderPattern.test(candidate));
+        if (kickPlaceholderCandidate) {
+          return kickPlaceholderCandidate;
+        }
+
+        return candidates.sort((left, right) => right.length - left.length)[0] || '';
+      };
+
+      const normalizeBadges = (value) => {
+        if (!Array.isArray(value)) {
+          return [];
+        }
+
+        return value
+          .map((badge) => normalizeBadge(badge))
+          .filter(Boolean);
+      };
+
+      const normalizeMessage = (message) => {
+        if (!message || typeof message !== 'object') {
+          return null;
+        }
+
+        return {
+          id: String(message.id || ''),
+          content: resolveMessageContent(message),
+          type: typeof message.type === 'string' ? message.type : 'message',
+          createdAt: typeof message.created_at === 'string' ? message.created_at : null,
+          threadParentId: typeof message.thread_parent_id === 'string' ? message.thread_parent_id : null,
+          sender: {
+            id: Number.isFinite(Number(message.sender?.id)) ? Number(message.sender.id) : null,
+            username: typeof message.sender?.username === 'string' ? message.sender.username : 'unknown',
+            slug: typeof message.sender?.slug === 'string'
+              ? message.sender.slug
+              : typeof message.sender?.username === 'string'
+                ? message.sender.username
+                : 'unknown',
+            color: typeof message.sender?.identity?.color === 'string' ? message.sender.identity.color : null,
+            badges: normalizeBadges(message.sender?.identity?.badges)
+          }
+        };
+      };
+
+      const channelResponse = await fetch(`${kickApiBaseUrl}/api/v2/channels/${encodeURIComponent(normalizedChannelSlug)}`, {
+        cache: 'no-store',
+        headers: jsonHeaders
+      }).catch(() => null);
+
+      if (!channelResponse) {
+        return {
+          ok: false,
+          status: 0,
+          bodySnippet: 'Background Kick channel request failed.'
+        };
       }
 
-      return value
-        .map((badge) => ({
-          type: typeof badge?.type === 'string' ? badge.type : '',
-          text: typeof badge?.text === 'string' ? badge.text : typeof badge?.type === 'string' ? badge.type : '',
-          count: Number.isFinite(Number(badge?.count)) ? Number(badge.count) : null
-        }))
-        .filter((badge) => badge.type || badge.text);
+      const channelPayloadText = await channelResponse.text();
+      if (!channelResponse.ok) {
+        return {
+          ok: false,
+          status: channelResponse.status,
+          bodySnippet: channelPayloadText.slice(0, 500)
+        };
+      }
+
+      let channelPayload;
+      try {
+        channelPayload = JSON.parse(channelPayloadText);
+      } catch {
+        return {
+          ok: false,
+          status: channelResponse.status,
+          bodySnippet: channelPayloadText.slice(0, 500)
+        };
+      }
+
+      const channelId =
+        channelPayload?.id ||
+        channelPayload?.chatroom?.channel_id ||
+        channelPayload?.chatroom?.id ||
+        null;
+
+      if (!channelId) {
+        return {
+          ok: false,
+          status: 500,
+          bodySnippet: `Kick did not return a chat id for ${normalizedChannelSlug}.`
+        };
+      }
+
+      const historyUrl = new URL(`${kickWebUrl}/api/v1/chat/${encodeURIComponent(String(channelId))}/history`);
+      historyUrl.searchParams.set('_cb', String(Date.now()));
+
+      const historyResponse = await fetch(historyUrl.toString(), {
+        cache: 'no-store',
+        headers: jsonHeaders
+      }).catch(() => null);
+
+      let historyPayload = null;
+      let historyData = null;
+      let messages = [];
+      let pinnedMessage = null;
+      let cursor = null;
+
+      if (historyResponse && historyResponse.ok) {
+        const historyPayloadText = await historyResponse.text();
+
+        try {
+          historyPayload = JSON.parse(historyPayloadText);
+          historyData = historyPayload?.data && typeof historyPayload.data === 'object'
+            ? historyPayload.data
+            : historyPayload;
+          messages = Array.isArray(historyData?.messages)
+            ? historyData.messages.map(normalizeMessage).filter(Boolean)
+            : [];
+          pinnedMessage = normalizeMessage(historyData?.pinned_message?.message || historyPayload?.pinned_message?.message || null);
+          cursor = typeof historyData?.cursor === 'string' ? historyData.cursor : null;
+        } catch {
+          historyPayload = null;
+          historyData = null;
+        }
+      }
+
+      const resolvedChatroomId =
+        historyData?.chatroom_id ||
+        historyPayload?.chatroom_id ||
+        channelPayload?.chatroom?.id ||
+        channelPayload?.livestream?.chatroom_id ||
+        null;
+      const resolvedChannelSlug = typeof channelPayload?.slug === 'string' ? channelPayload.slug : normalizedChannelSlug;
+
+      return {
+        ok: true,
+        chat: {
+          channelSlug: resolvedChannelSlug,
+          channelId: Number(channelId),
+          channelUserId: Number.isFinite(Number(channelPayload?.user?.id)) ? Number(channelPayload.user.id) : null,
+          chatroomId: resolvedChatroomId !== null ? Number(resolvedChatroomId) : null,
+          displayName: typeof channelPayload?.user?.username === 'string' ? channelPayload.user.username : resolvedChannelSlug,
+          channelUrl: `https://kick.com/${resolvedChannelSlug}`,
+          avatarUrl: channelPayload?.user?.profile_pic || channelPayload?.user?.profile_picture || channelPayload?.profile_picture || null,
+          cursor,
+          messages,
+          pinnedMessage,
+          updatedAt: new Date().toISOString()
+        }
+      };
+    }, {
+      normalizedChannelSlug: channelSlug,
+      kickApiBaseUrl: KICK_API_BASE_URL,
+      kickWebUrl: KICK_WEB_URL,
+      token: authToken
+    });
+
+    if (result?.ok) {
+      return result.chat;
+    }
+
+    lastResult = result;
+
+    const securityPolicyBlocked =
+      result?.status === 403 &&
+      String(result?.bodySnippet || '').toLowerCase().includes('security policy');
+
+    if (!securityPolicyBlocked || attempt === 2) {
+      break;
+    }
+
+    await ensureKickHomePage(page);
+    await page.waitForTimeout(BACKGROUND_FETCH_WARMUP_MS * (attempt + 1));
+  }
+
+  if (lastResult?.status === 401 || (lastResult?.status === 403 && !String(lastResult?.bodySnippet || '').toLowerCase().includes('security policy'))) {
+    throw new Error('Kick rejected the saved session. Sign in again.');
+  }
+
+  if (lastResult?.status === 404) {
+    throw new Error(`Kick could not find chat for channel ${channelSlug}.`);
+  }
+
+  throw new Error(lastResult?.bodySnippet || `Kick browser request failed while loading chat for ${channelSlug}.`);
+}
+
+async function fetchChannelChatPageSnapshot(page, channelSlug) {
+  await openKickChannelPage(page, channelSlug);
+
+  const acceptAllButton = page.getByRole('button', { name: /accept all/i });
+  if (await acceptAllButton.isVisible().catch(() => false)) {
+    await acceptAllButton.click().catch(() => undefined);
+  }
+
+  const chatTab = page.getByText(/^Chat$/).last();
+  if (await chatTab.isVisible().catch(() => false)) {
+    await chatTab.click().catch(() => undefined);
+  }
+
+  await page.waitForTimeout(CHANNEL_CHAT_DOM_WARMUP_MS);
+
+  const snapshot = await page.evaluate((normalizedChannelSlug) => {
+    const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const slugPattern = new RegExp(`"slug":"${escapeRegex(normalizedChannelSlug)}"`);
+
+    const decodeNextDataScript = (value) => {
+      if (!value.includes('self.__next_f.push')) {
+        return value;
+      }
+
+      const segments = Array.from(value.matchAll(/push\(\[\d+,"([\s\S]*?)"\]\)/g))
+        .map((match) => match[1]);
+      if (segments.length === 0) {
+        return value;
+      }
+
+      return segments
+        .map((segment) => {
+          try {
+            return JSON.parse(`"${segment}"`);
+          } catch {
+            return '';
+          }
+        })
+        .filter((segment) => segment.length > 0)
+        .join('\n');
     };
 
-    const normalizeMessage = (message) => {
-      if (!message || typeof message !== 'object') {
+    const dataBlob = Array.from(document.querySelectorAll('script'))
+      .map((script) => script.textContent || '')
+      .map((text) => decodeNextDataScript(text))
+      .filter((text) => text.length > 0 && slugPattern.test(text) && text.includes('"chatroom":{"id":'))
+      .sort((left, right) => right.length - left.length)[0] || '';
+
+    const findNumericMatch = (pattern) => {
+      const match = dataBlob.match(pattern);
+      if (!match) {
         return null;
       }
 
+      const parsedValue = Number(match[1]);
+      return Number.isFinite(parsedValue) ? parsedValue : null;
+    };
+
+    const channelId = findNumericMatch(new RegExp(`"id":(\\d+),"slug":"${escapeRegex(normalizedChannelSlug)}"`))
+      ?? findNumericMatch(/"channel_id":(\d+)/);
+    const chatroomId = findNumericMatch(/"chatroom":\{"id":(\d+)\}/);
+    const avatarMatch = dataBlob.match(/"profile_pic":"([^"]+)"/);
+    const titleMatch = document.title.match(/^(.*?)\s+Stream\s+-\s+Watch Live on Kick$/i);
+    const avatarImage = Array.from(document.images)
+      .find((image) => {
+        const imageUrl = image.currentSrc || image.src || '';
+        const alt = normalizeText(image.alt || '');
+        return alt.toLowerCase() === normalizedChannelSlug || /\/images\/user\/\d+\//.test(imageUrl);
+      }) || null;
+    const avatarUrl = avatarMatch?.[1] || avatarImage?.currentSrc || avatarImage?.src || null;
+    const avatarUserIdMatch = avatarUrl?.match(/\/images\/user\/(\d+)\//) || null;
+    const channelUserId = avatarUserIdMatch ? Number(avatarUserIdMatch[1]) : null;
+    const displayName = normalizeText(
+      titleMatch?.[1] ||
+      avatarImage?.getAttribute('alt') ||
+      normalizedChannelSlug
+    ) || normalizedChannelSlug;
+
+    const parseBadgeFromImage = (image) => {
+      const alt = normalizeText(image.getAttribute('alt') || image.getAttribute('title') || '');
+      const imageUrl = image.currentSrc || image.getAttribute('src') || null;
+      const subscriberMatch = alt.match(/(\d+)\s*-\s*Month Subscriber/i);
+
+      if (subscriberMatch) {
+        return {
+          type: 'subscriber',
+          text: 'Subscriber',
+          count: Number(subscriberMatch[1]),
+          imageUrl
+        };
+      }
+
+      if (!alt && !imageUrl) {
+        return null;
+      }
+
+      const normalizedAlt = alt.toLowerCase();
+      let type = normalizedAlt.replace(/\s+/g, '-') || 'badge';
+      if (normalizedAlt.includes('moderator')) {
+        type = 'moderator';
+      } else if (normalizedAlt.includes('verified')) {
+        type = 'verified';
+      } else if (normalizedAlt.includes('vip')) {
+        type = 'vip';
+      } else if (normalizedAlt.includes('founder')) {
+        type = 'founder';
+      } else if (normalizedAlt.includes('subscriber')) {
+        type = 'subscriber';
+      }
+
       return {
-        id: String(message.id || ''),
-        content: typeof message.content === 'string' ? message.content : '',
-        type: typeof message.type === 'string' ? message.type : 'message',
-        createdAt: typeof message.created_at === 'string' ? message.created_at : null,
-        threadParentId: typeof message.thread_parent_id === 'string' ? message.thread_parent_id : null,
-        sender: {
-          id: Number.isFinite(Number(message.sender?.id)) ? Number(message.sender.id) : null,
-          username: typeof message.sender?.username === 'string' ? message.sender.username : 'unknown',
-          slug: typeof message.sender?.slug === 'string'
-            ? message.sender.slug
-            : typeof message.sender?.username === 'string'
-              ? message.sender.username
-              : 'unknown',
-          color: typeof message.sender?.identity?.color === 'string' ? message.sender.identity.color : null,
-          badges: normalizeBadges(message.sender?.identity?.badges)
+        type,
+        text: alt || type,
+        count: null,
+        imageUrl
+      };
+    };
+
+    const parseTimestampToIso = (value) => {
+      const match = normalizeText(value).match(/^(\d{1,2}):(\d{2})\s*([AP]M)?$/i);
+      if (!match) {
+        return null;
+      }
+
+      let hours = Number(match[1]);
+      const minutes = Number(match[2]);
+      const meridiem = match[3]?.toUpperCase() || null;
+
+      if (meridiem === 'PM' && hours < 12) {
+        hours += 12;
+      } else if (meridiem === 'AM' && hours === 12) {
+        hours = 0;
+      }
+
+      const now = new Date();
+      const timestamp = new Date(
+        now.getFullYear(),
+        now.getMonth(),
+        now.getDate(),
+        hours,
+        minutes,
+        0,
+        0
+      );
+
+      if (timestamp.getTime() - now.getTime() > 5 * 60 * 1000) {
+        timestamp.setDate(timestamp.getDate() - 1);
+      }
+
+      return timestamp.toISOString();
+    };
+
+    const serializeMessageBody = (node) => {
+      const segments = [];
+
+      const pushText = (value) => {
+        if (!value) {
+          return;
+        }
+
+        segments.push(value);
+      };
+
+      const walk = (currentNode) => {
+        if (!currentNode) {
+          return;
+        }
+
+        if (currentNode.nodeType === Node.TEXT_NODE) {
+          pushText(currentNode.textContent || '');
+          return;
+        }
+
+        if (!(currentNode instanceof Element)) {
+          return;
+        }
+
+        const emoteId = currentNode.getAttribute('data-emote-id');
+        const emoteName = normalizeText(currentNode.getAttribute('data-emote-name') || '');
+        if (emoteId && emoteName) {
+          segments.push(`[emote:${emoteId}:${emoteName}]`);
+          return;
+        }
+
+        if (currentNode instanceof HTMLImageElement) {
+          const alt = normalizeText(currentNode.alt || currentNode.title || '');
+          const imageUrl = currentNode.currentSrc || currentNode.src || '';
+          const emoteMatch = imageUrl.match(/\/emotes\/(\d+)\//i);
+
+          if (emoteMatch && alt) {
+            segments.push(`[emote:${emoteMatch[1]}:${alt}]`);
+            return;
+          }
+
+          if (alt) {
+            segments.push(alt);
+            return;
+          }
+        }
+
+        for (const childNode of Array.from(currentNode.childNodes)) {
+          walk(childNode);
         }
       };
+
+      walk(node);
+      return normalizeText(segments.join(''));
     };
 
-    const channelResponse = await fetch(`${kickApiBaseUrl}/api/v2/channels/${encodeURIComponent(normalizedChannelSlug)}`, {
-      cache: 'no-store',
-      credentials: 'include',
-      headers: jsonHeaders
-    }).catch(() => null);
+    const messages = [];
+    const seenMessageIds = new Set();
+    const senderButtons = Array.from(document.querySelectorAll('button[data-prevent-expand="true"]'));
 
-    if (!channelResponse) {
-      return {
-        ok: false,
-        status: 0,
-        bodySnippet: 'Background Kick channel request failed.'
-      };
+    for (const senderButton of senderButtons) {
+      if (!(senderButton instanceof HTMLElement)) {
+        continue;
+      }
+
+      const username = normalizeText(senderButton.textContent || '');
+      if (!username) {
+        continue;
+      }
+
+      const messageRoot = senderButton.closest('div[class*="rounded-lg"]') || senderButton.closest('article, li, section, div');
+      if (!(messageRoot instanceof HTMLElement)) {
+        continue;
+      }
+
+      const separator = Array.from(messageRoot.querySelectorAll('span[aria-hidden="true"]'))
+        .find((element) => normalizeText(element.textContent || '').startsWith(':'));
+      const bodyNode = separator?.nextElementSibling;
+      if (!(bodyNode instanceof HTMLElement)) {
+        continue;
+      }
+
+      const content = serializeMessageBody(bodyNode);
+      const timestamp = normalizeText(messageRoot.querySelector('span.text-neutral')?.textContent || '');
+      const senderContainer = senderButton.parentElement;
+      const badges = senderContainer
+        ? Array.from(senderContainer.querySelectorAll('img'))
+          .map((image) => parseBadgeFromImage(image))
+          .filter(Boolean)
+        : [];
+      const senderColor = senderButton.style.color || getComputedStyle(senderButton).color || null;
+      const messageId = `dom:${timestamp}:${username}:${content || 'empty'}`;
+
+      if (seenMessageIds.has(messageId)) {
+        continue;
+      }
+
+      seenMessageIds.add(messageId);
+      messages.push({
+        id: messageId,
+        content,
+        type: 'message',
+        createdAt: parseTimestampToIso(timestamp),
+        threadParentId: null,
+        sender: {
+          id: null,
+          username,
+          slug: username.toLowerCase(),
+          color: senderColor || null,
+          badges
+        }
+      });
     }
-
-    const channelPayloadText = await channelResponse.text();
-    if (!channelResponse.ok) {
-      return {
-        ok: false,
-        status: channelResponse.status,
-        bodySnippet: channelPayloadText.slice(0, 500)
-      };
-    }
-
-    let channelPayload;
-    try {
-      channelPayload = JSON.parse(channelPayloadText);
-    } catch {
-      return {
-        ok: false,
-        status: channelResponse.status,
-        bodySnippet: channelPayloadText.slice(0, 500)
-      };
-    }
-
-    const channelId =
-      channelPayload?.id ||
-      channelPayload?.chatroom?.channel_id ||
-      channelPayload?.chatroom?.id ||
-      null;
-
-    if (!channelId) {
-      return {
-        ok: false,
-        status: 500,
-        bodySnippet: `Kick did not return a chat id for ${normalizedChannelSlug}.`
-      };
-    }
-
-    const historyUrl = new URL(`${kickWebUrl}/api/v1/chat/${encodeURIComponent(String(channelId))}/history`);
-    historyUrl.searchParams.set('_cb', String(Date.now()));
-
-    const historyResponse = await fetch(historyUrl.toString(), {
-      cache: 'no-store',
-      credentials: 'include',
-      headers: jsonHeaders
-    }).catch(() => null);
-
-    if (!historyResponse) {
-      return {
-        ok: false,
-        status: 0,
-        bodySnippet: 'Background Kick chat history request failed.'
-      };
-    }
-
-    const historyPayloadText = await historyResponse.text();
-    if (!historyResponse.ok) {
-      return {
-        ok: false,
-        status: historyResponse.status,
-        bodySnippet: historyPayloadText.slice(0, 500)
-      };
-    }
-
-    let historyPayload;
-    try {
-      historyPayload = JSON.parse(historyPayloadText);
-    } catch {
-      return {
-        ok: false,
-        status: historyResponse.status,
-        bodySnippet: historyPayloadText.slice(0, 500)
-      };
-    }
-
-    const historyData = historyPayload?.data && typeof historyPayload.data === 'object'
-      ? historyPayload.data
-      : historyPayload;
-    const messages = Array.isArray(historyData?.messages)
-      ? historyData.messages.map(normalizeMessage).filter(Boolean)
-      : [];
-    const pinnedMessage = normalizeMessage(historyData?.pinned_message?.message || historyPayload?.pinned_message?.message || null);
-    const resolvedChatroomId =
-      historyData?.chatroom_id ||
-      historyPayload?.chatroom_id ||
-      channelPayload?.chatroom?.id ||
-      channelPayload?.livestream?.chatroom_id ||
-      null;
-    const resolvedChannelSlug = typeof channelPayload?.slug === 'string' ? channelPayload.slug : normalizedChannelSlug;
 
     return {
-      ok: true,
-      chat: {
-        channelSlug: resolvedChannelSlug,
-        channelId: Number(channelId),
-        chatroomId: resolvedChatroomId !== null ? Number(resolvedChatroomId) : null,
-        displayName: typeof channelPayload?.user?.username === 'string' ? channelPayload.user.username : resolvedChannelSlug,
-        channelUrl: `https://kick.com/${resolvedChannelSlug}`,
-        avatarUrl: channelPayload?.user?.profile_pic || channelPayload?.user?.profile_picture || channelPayload?.profile_picture || null,
-        cursor: typeof historyData?.cursor === 'string' ? historyData.cursor : null,
-        messages,
-        pinnedMessage,
-        updatedAt: new Date().toISOString()
-      }
+      ok: channelId !== null || chatroomId !== null || messages.length > 0,
+      channelSlug: normalizedChannelSlug,
+      channelId,
+      channelUserId,
+      chatroomId,
+      displayName,
+      channelUrl: `https://kick.com/${normalizedChannelSlug}`,
+      avatarUrl,
+      cursor: null,
+      messages: messages.slice(-100),
+      pinnedMessage: null,
+      bodySnippet: normalizeText((document.body?.innerText || '').slice(0, 500))
     };
-  }, {
-    normalizedChannelSlug: channelSlug,
-    kickApiBaseUrl: KICK_API_BASE_URL,
-    kickWebUrl: KICK_WEB_URL
-  });
+  }, channelSlug);
 
-  if (!result?.ok) {
-    if (result?.status === 401 || result?.status === 403) {
-      throw new Error('Kick rejected the saved session. Sign in again.');
-    }
-
-    if (result?.status === 404) {
-      throw new Error(`Kick could not find chat for channel ${channelSlug}.`);
-    }
-
-    throw new Error(result?.bodySnippet || `Kick browser request failed while loading chat for ${channelSlug}.`);
+  if (!snapshot?.ok) {
+    throw new Error(snapshot?.bodySnippet || `Kick did not expose chat data for ${channelSlug}.`);
   }
 
-  return result.chat;
+  return {
+    channelSlug: snapshot.channelSlug,
+    channelId: snapshot.channelId,
+    channelUserId: snapshot.channelUserId,
+    chatroomId: snapshot.chatroomId,
+    displayName: snapshot.displayName,
+    channelUrl: snapshot.channelUrl,
+    avatarUrl: snapshot.avatarUrl,
+    cursor: snapshot.cursor,
+    messages: snapshot.messages,
+    pinnedMessage: snapshot.pinnedMessage,
+    updatedAt: new Date().toISOString()
+  };
+}
+
+async function openKickChannelPage(page, channelSlug) {
+  const targetUrl = `https://kick.com/${encodeURIComponent(channelSlug)}`;
+  let lastSnippet = '';
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await page.goto(targetUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: 60_000
+    }).catch(() => undefined);
+    await page.waitForTimeout(BACKGROUND_FETCH_WARMUP_MS);
+
+    const inspection = await page.evaluate(() => ({
+      title: document.title || '',
+      bodySnippet: (document.body?.innerText || '').slice(0, 500)
+    })).catch(() => ({ title: '', bodySnippet: '' }));
+
+    lastSnippet = inspection.bodySnippet || inspection.title || lastSnippet;
+
+    if (!looksSecurityBlocked(lastSnippet)) {
+      return;
+    }
+
+    await ensureKickHomePage(page);
+  }
+
+  throw new Error(lastSnippet || `Kick returned a security policy block while opening ${channelSlug}.`);
 }
 
 async function ensureKickHomePage(page) {
@@ -1123,6 +1550,33 @@ async function openExistingBrowserBridge({ debuggingPort }) {
     browserProcess: null,
     ownsBrowserProcess: false,
     debuggingPort: normalizedPort
+  };
+}
+
+async function openBackgroundBrowserBridge({ preferredBrowserPath }) {
+  const browserInfo = resolveChromiumBrowser(preferredBrowserPath);
+  const browser = await chromium.launch({
+    headless: false,
+    executablePath: browserInfo.executablePath,
+    args: [
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--start-minimized'
+    ]
+  });
+  const context = await browser.newContext({
+    userAgent: DEFAULT_USER_AGENT,
+    viewport: { width: 1440, height: 960 }
+  });
+
+  return {
+    browser,
+    context,
+    page: await context.newPage(),
+    browserInfo,
+    browserProcess: null,
+    ownsBrowserProcess: true,
+    debuggingPort: null
   };
 }
 
