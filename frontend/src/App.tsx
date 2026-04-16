@@ -381,8 +381,8 @@ export default function App() {
 
     setSelectedChannel(channel);
     setChatError(null);
-  setLiveChatState('idle');
-  setLiveChatError(null);
+    setLiveChatState('idle');
+    setLiveChatError(null);
     setIsLoadingChat(true);
     setChannelChat((currentChat) => currentChat?.channelSlug === channel.channelSlug ? currentChat : null);
 

@@ -16,7 +16,11 @@ class PlaywrightKickBridgeDataSource(
 ) : KickRemoteDataSource {
     override fun getBridgeStatus(): KickBridgeStatus {
         oauthService?.refreshStoredSessionIfNeeded()
-        return bridgeStatusStore.readStatus()
+        val status = bridgeStatusStore.readStatus()
+        if (status.hasBrowserSession && status.isAuthenticated) {
+            bridgeRunner.prewarmService()
+        }
+        return status
     }
 
     override fun startBridgeSession(): KickBridgeStatus {

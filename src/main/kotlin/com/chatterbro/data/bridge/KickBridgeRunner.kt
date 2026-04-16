@@ -18,6 +18,7 @@ import java.io.BufferedWriter
 import java.io.Closeable
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import kotlin.io.path.exists
@@ -33,6 +34,7 @@ class KickBridgeRunner(
 
     private val loginProcess = AtomicReference<Process?>(null)
     private val serviceProcess = AtomicReference<Process?>(null)
+    private val serviceWarmupInProgress = AtomicBoolean(false)
     private val serviceLock = Any()
 
     @Volatile
@@ -112,12 +114,57 @@ class KickBridgeRunner(
         )
     }
 
-    fun fetchChannelChat(channelSlug: String): ChannelChat {
+    fun fetchChannelChat(
+        channelSlug: String,
+    ): ChannelChat {
         return invokeServiceCommand(
             command = "fetch-channel-chat",
             payload = mapOf("channelSlug" to JsonPrimitive(channelSlug)),
             deserializer = ChannelChat.serializer(),
         )
+    }
+
+    fun prewarmService() {
+        if (!paths.scriptFile.exists()) {
+            return
+        }
+
+        if (loginProcess.get()?.isAlive == true) {
+            return
+        }
+
+        if (!statusStore.hasValidBrowserSession()) {
+            return
+        }
+
+        val existingProcess = serviceProcess.get()
+        if (existingProcess?.isAlive == true && serviceReader != null && serviceWriter != null) {
+            return
+        }
+
+        if (!serviceWarmupInProgress.compareAndSet(false, true)) {
+            return
+        }
+
+        thread(isDaemon = true, name = "kick-bridge-service-prewarm") {
+            try {
+                synchronized(serviceLock) {
+                    if (loginProcess.get()?.isAlive == true) {
+                        return@synchronized
+                    }
+
+                    if (!statusStore.hasValidBrowserSession()) {
+                        return@synchronized
+                    }
+
+                    ensureServiceProcessLocked()
+                }
+            } catch (_: IllegalStateException) {
+                // Let the bridge lazily recover on demand if background prewarm fails.
+            } finally {
+                serviceWarmupInProgress.set(false)
+            }
+        }
     }
 
     private fun <T> invokeServiceCommand(

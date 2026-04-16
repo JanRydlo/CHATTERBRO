@@ -11,8 +11,9 @@ const DEFAULT_USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36';
 
 const KICK_HOME_URL = 'https://kick.com/';
+const KICK_API_BASE_URL = 'https://kick.com';
 const KICK_WEB_URL = 'https://web.kick.com';
-const FOLLOWED_CHANNELS_ENDPOINT = '/api/v2/channels/followed';
+const FOLLOWED_CHANNELS_ENDPOINT = `${KICK_API_BASE_URL}/api/v2/channels/followed`;
 const REMOTE_DEBUGGING_HOST = '127.0.0.1';
 const EXISTING_BROWSER_CONNECT_TIMEOUT_MS = 5_000;
 const REMOTE_DEBUGGING_STARTUP_TIMEOUT_MS = 30_000;
@@ -539,7 +540,7 @@ async function captureKickSession(context, page) {
 }
 
 async function extractAuthenticatedProfile(page, authToken) {
-  return page.evaluate(async (token) => {
+  return page.evaluate(async ({ token, kickApiBaseUrl }) => {
     const authenticatedKey = Object.keys(localStorage).find((key) => key.includes('"authStatus":"authenticated"') && key.includes('"username":"'));
     if (!authenticatedKey) {
       return null;
@@ -554,7 +555,7 @@ async function extractAuthenticatedProfile(page, authToken) {
       return null;
     }
 
-    const profileResponse = await fetch(`/api/v2/channels/${encodeURIComponent(username)}`, {
+    const profileResponse = await fetch(`${kickApiBaseUrl}/api/v2/channels/${encodeURIComponent(username)}`, {
       headers: {
         authorization: token,
         'x-app-platform': 'web',
@@ -580,7 +581,10 @@ async function extractAuthenticatedProfile(page, authToken) {
       avatarUrl: payload?.user?.profile_pic || payload?.user?.profile_picture || payload?.profile_picture || null,
       channelUrl: `https://kick.com/${slug}`
     };
-  }, authToken);
+  }, {
+    token: authToken,
+    kickApiBaseUrl: KICK_API_BASE_URL
+  });
 }
 
 function parseFollowedChannelsPayload(payloadText) {
@@ -674,7 +678,7 @@ async function fetchFollowedChannelsFromBrowser(page, authToken) {
 async function fetchChannelChatFromBrowser(page, channelSlug) {
   await ensureKickHomePage(page);
 
-  const result = await page.evaluate(async ({ normalizedChannelSlug, kickWebUrl }) => {
+  const result = await page.evaluate(async ({ normalizedChannelSlug, kickApiBaseUrl, kickWebUrl }) => {
     const jsonHeaders = {
       accept: 'application/json'
     };
@@ -718,7 +722,7 @@ async function fetchChannelChatFromBrowser(page, channelSlug) {
       };
     };
 
-    const channelResponse = await fetch(`/api/v2/channels/${encodeURIComponent(normalizedChannelSlug)}`, {
+    const channelResponse = await fetch(`${kickApiBaseUrl}/api/v2/channels/${encodeURIComponent(normalizedChannelSlug)}`, {
       credentials: 'include',
       headers: jsonHeaders
     }).catch(() => null);
@@ -805,23 +809,23 @@ async function fetchChannelChatFromBrowser(page, channelSlug) {
       ? historyData.messages.map(normalizeMessage).filter(Boolean)
       : [];
     const pinnedMessage = normalizeMessage(historyData?.pinned_message?.message || historyPayload?.pinned_message?.message || null);
+    const resolvedChatroomId =
+      historyData?.chatroom_id ||
+      historyPayload?.chatroom_id ||
+      channelPayload?.chatroom?.id ||
+      channelPayload?.livestream?.chatroom_id ||
+      null;
     const resolvedChannelSlug = typeof channelPayload?.slug === 'string' ? channelPayload.slug : normalizedChannelSlug;
 
     return {
       ok: true,
       chat: {
         channelSlug: resolvedChannelSlug,
-        channelId: Number.isFinite(Number(channelId)) ? Number(channelId) : null,
-        chatroomId: Number.isFinite(Number(channelPayload?.chatroom?.id)) ? Number(channelPayload.chatroom.id) : null,
-        displayName: typeof channelPayload?.user?.username === 'string'
-          ? channelPayload.user.username
-          : resolvedChannelSlug,
+        channelId: Number(channelId),
+        chatroomId: resolvedChatroomId !== null ? Number(resolvedChatroomId) : null,
+        displayName: typeof channelPayload?.user?.username === 'string' ? channelPayload.user.username : resolvedChannelSlug,
         channelUrl: `https://kick.com/${resolvedChannelSlug}`,
-        avatarUrl:
-          channelPayload?.user?.profile_pic ||
-          channelPayload?.user?.profile_picture ||
-          channelPayload?.profile_picture ||
-          null,
+        avatarUrl: channelPayload?.user?.profile_pic || channelPayload?.user?.profile_picture || channelPayload?.profile_picture || null,
         cursor: typeof historyData?.cursor === 'string' ? historyData.cursor : null,
         messages,
         pinnedMessage,
@@ -830,6 +834,7 @@ async function fetchChannelChatFromBrowser(page, channelSlug) {
     };
   }, {
     normalizedChannelSlug: channelSlug,
+    kickApiBaseUrl: KICK_API_BASE_URL,
     kickWebUrl: KICK_WEB_URL
   });
 

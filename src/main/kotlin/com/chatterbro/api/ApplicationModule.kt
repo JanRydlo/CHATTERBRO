@@ -39,6 +39,7 @@ fun Application.chatterbroModule() {
     val oauthService = oauthConfig?.let { KickOAuthService(it, bridgePaths, bridgeStatusStore) }
     val bridgeRunner = KickBridgeRunner(bridgePaths, bridgeStatusStore)
     val remoteDataSource = PlaywrightKickBridgeDataSource(bridgeRunner, bridgeStatusStore, oauthService)
+    bridgeRunner.prewarmService()
     val repository = BridgeBackedKickRepository(remoteDataSource)
     val loadLiveFollowedChannels = LoadLiveFollowedChannelsUseCase(repository)
     val loadChannelChat = LoadChannelChatUseCase(repository)
