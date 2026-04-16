@@ -723,6 +723,7 @@ async function fetchChannelChatFromBrowser(page, channelSlug) {
     };
 
     const channelResponse = await fetch(`${kickApiBaseUrl}/api/v2/channels/${encodeURIComponent(normalizedChannelSlug)}`, {
+      cache: 'no-store',
       credentials: 'include',
       headers: jsonHeaders
     }).catch(() => null);
@@ -769,7 +770,11 @@ async function fetchChannelChatFromBrowser(page, channelSlug) {
       };
     }
 
-    const historyResponse = await fetch(`${kickWebUrl}/api/v1/chat/${encodeURIComponent(String(channelId))}/history`, {
+    const historyUrl = new URL(`${kickWebUrl}/api/v1/chat/${encodeURIComponent(String(channelId))}/history`);
+    historyUrl.searchParams.set('_cb', String(Date.now()));
+
+    const historyResponse = await fetch(historyUrl.toString(), {
+      cache: 'no-store',
       credentials: 'include',
       headers: jsonHeaders
     }).catch(() => null);
