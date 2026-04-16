@@ -56,6 +56,7 @@ export interface ChannelChatMessage {
 export interface ChannelChat {
   channelSlug: string;
   channelId: number | null;
+  chatroomId: number | null;
   displayName: string;
   channelUrl: string;
   avatarUrl: string | null;

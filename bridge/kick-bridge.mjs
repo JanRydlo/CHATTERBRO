@@ -4,6 +4,7 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
 import process from 'node:process';
+import readline from 'node:readline';
 import { chromium } from 'playwright';
 
 const DEFAULT_USER_AGENT =
@@ -13,7 +14,7 @@ const KICK_HOME_URL = 'https://kick.com/';
 const KICK_WEB_URL = 'https://web.kick.com';
 const FOLLOWED_CHANNELS_ENDPOINT = '/api/v2/channels/followed';
 const REMOTE_DEBUGGING_HOST = '127.0.0.1';
-const EXISTING_BROWSER_CONNECT_TIMEOUT_MS = 30_000;
+const EXISTING_BROWSER_CONNECT_TIMEOUT_MS = 5_000;
 const REMOTE_DEBUGGING_STARTUP_TIMEOUT_MS = 30_000;
 const REMOTE_DEBUGGING_POLL_INTERVAL_MS = 500;
 const LOGIN_CAPTURE_TIMEOUT_MS = 10 * 60_000;
@@ -70,6 +71,9 @@ try {
   switch (command) {
     case 'login':
       await loginFlow(args);
+      break;
+    case 'serve':
+      await serveBridge(args);
       break;
     case 'fetch-live-following':
       await fetchLiveFollowing(args);
@@ -325,6 +329,173 @@ async function fetchChannelChat(cliArgs) {
   }
 }
 
+async function serveBridge(cliArgs) {
+  const statusFile = requireArg(cliArgs, 'status-file');
+  const cookieFile = requireArg(cliArgs, 'cookie-file');
+  const sessionFile = requireArg(cliArgs, 'session-file');
+  const metaFile = requireArg(cliArgs, 'meta-file');
+  const profileDir = requireArg(cliArgs, 'profile-dir');
+
+  const metadata = await readJson(metaFile, {});
+  const storedCookies = await readJson(cookieFile, []);
+  const storedSession = await readKickSession(sessionFile);
+
+  if (!hasValidKickSession(storedSession)) {
+    await invalidateSavedSession(sessionFile, cookieFile);
+    await safeUpdateStatus(statusFile, 'IDLE', 'Kick session is missing or expired. Sign in again.', null);
+    throw new Error('Kick session is missing or expired. Sign in again.');
+  }
+
+  let session;
+  try {
+    session = await openExistingBrowserBridge({
+      debuggingPort: metadata.debuggingPort
+    });
+  } catch {
+    session = await openBrowserBridge({
+      preferredBrowserPath: metadata.browserPath || process.env.KICK_BROWSER_PATH,
+      profileDir,
+      startUrl: 'about:blank',
+      startMinimized: true
+    });
+  }
+
+  const { browser, context, page, browserProcess, ownsBrowserProcess } = session;
+
+  try {
+    if (Array.isArray(storedCookies) && storedCookies.length > 0) {
+      await context.addCookies(storedCookies);
+    }
+
+    await ensureKickHomePage(page);
+    writeProtocolLine({ type: 'ready' });
+
+    const state = {
+      statusFile,
+      cookieFile,
+      sessionFile,
+      context,
+      page
+    };
+
+    const lineReader = readline.createInterface({
+      input: process.stdin,
+      crlfDelay: Infinity
+    });
+
+    let queue = Promise.resolve();
+    lineReader.on('line', (line) => {
+      queue = queue.then(() => handleServiceRequest(line, state));
+    });
+
+    await new Promise((resolve) => {
+      lineReader.once('close', resolve);
+    });
+
+    await queue.catch(() => undefined);
+  } finally {
+    await closeBrowserBridge(page, browser, browserProcess, ownsBrowserProcess);
+  }
+}
+
+async function handleServiceRequest(line, state) {
+  let requestId = null;
+
+  try {
+    const request = JSON.parse(line);
+    requestId = request?.id ? String(request.id) : null;
+
+    if (request?.command === 'fetch-live-following') {
+      state.page = await ensureServicePage(state);
+      const storedSession = await readKickSession(state.sessionFile);
+      if (!hasValidKickSession(storedSession)) {
+        await invalidateSavedSession(state.sessionFile, state.cookieFile);
+        await safeUpdateStatus(state.statusFile, 'IDLE', 'Kick session is missing or expired. Sign in again.', null);
+        throw new Error('Kick session is missing or expired. Sign in again.');
+      }
+
+      const channels = await fetchFollowedChannelsFromBrowser(state.page, storedSession.token);
+      await persistServiceCookies(state.context, state.cookieFile);
+      await safeUpdateStatus(
+        state.statusFile,
+        'READY',
+        channels.length === 0
+          ? `Connected as ${storedSession.profile.username}, but no live followings were found.`
+          : `Loaded ${channels.length} live following channels for ${storedSession.profile.username}.`,
+        storedSession
+      );
+
+      writeProtocolLine({
+        id: requestId,
+        ok: true,
+        result: channels
+      });
+      return;
+    }
+
+    if (request?.command === 'fetch-channel-chat') {
+      state.page = await ensureServicePage(state);
+      const channelSlug = typeof request.channelSlug === 'string' ? request.channelSlug.trim().toLowerCase() : '';
+      if (!channelSlug) {
+        throw new Error('Kick channel slug is required.');
+      }
+
+      const storedSession = await readKickSession(state.sessionFile);
+      if (!hasValidKickSession(storedSession)) {
+        await invalidateSavedSession(state.sessionFile, state.cookieFile);
+        await safeUpdateStatus(state.statusFile, 'IDLE', 'Kick session is missing or expired. Sign in again.', null);
+        throw new Error('Kick session is missing or expired. Sign in again.');
+      }
+
+      const chat = await fetchChannelChatFromBrowser(state.page, channelSlug);
+      await persistServiceCookies(state.context, state.cookieFile);
+      await safeUpdateStatus(
+        state.statusFile,
+        'READY',
+        chat.messages.length === 0
+          ? `Connected as ${storedSession.profile.username}, but Kick returned no recent chat messages for ${channelSlug}.`
+          : `Loaded ${chat.messages.length} recent chat messages for ${channelSlug}.`,
+        storedSession
+      );
+
+      writeProtocolLine({
+        id: requestId,
+        ok: true,
+        result: chat
+      });
+      return;
+    }
+
+    throw new Error(`Unknown bridge service command: ${request?.command || 'unknown'}`);
+  } catch (error) {
+    writeProtocolLine({
+      id: requestId,
+      ok: false,
+      error: error instanceof Error ? error.message : 'Kick bridge service failed.'
+    });
+  }
+}
+
+async function persistServiceCookies(context, cookieFile) {
+  const refreshedCookies = await context.cookies(KICK_HOME_URL).catch(() => []);
+  if (Array.isArray(refreshedCookies) && refreshedCookies.length > 0) {
+    await writeJson(cookieFile, refreshedCookies);
+  }
+}
+
+function writeProtocolLine(payload) {
+  process.stdout.write(`${JSON.stringify(payload)}\n`);
+}
+
+async function ensureServicePage(state) {
+  if (state.page && !state.page.isClosed()) {
+    return state.page;
+  }
+
+  state.page = await state.context.newPage();
+  return state.page;
+}
+
 async function waitForAuthenticatedSession({ context, page, cookieFile, sessionFile }) {
   const deadline = Date.now() + LOGIN_CAPTURE_TIMEOUT_MS;
 
@@ -421,11 +592,7 @@ function parseFollowedChannelsPayload(payloadText) {
 }
 
 async function fetchFollowedChannelsFromBrowser(page, authToken) {
-  await page.goto(KICK_HOME_URL, {
-    waitUntil: 'domcontentloaded',
-    timeout: 60_000
-  });
-  await page.waitForTimeout(BACKGROUND_FETCH_WARMUP_MS);
+  await ensureKickHomePage(page);
 
   const result = await page.evaluate(async ({ endpoint, token, maxPages }) => {
     const collectedChannels = [];
@@ -505,11 +672,7 @@ async function fetchFollowedChannelsFromBrowser(page, authToken) {
 }
 
 async function fetchChannelChatFromBrowser(page, channelSlug) {
-  await page.goto(`https://kick.com/${encodeURIComponent(channelSlug)}`, {
-    waitUntil: 'domcontentloaded',
-    timeout: 60_000
-  }).catch(() => undefined);
-  await page.waitForTimeout(BACKGROUND_FETCH_WARMUP_MS);
+  await ensureKickHomePage(page);
 
   const result = await page.evaluate(async ({ normalizedChannelSlug, kickWebUrl }) => {
     const jsonHeaders = {
@@ -649,6 +812,7 @@ async function fetchChannelChatFromBrowser(page, channelSlug) {
       chat: {
         channelSlug: resolvedChannelSlug,
         channelId: Number.isFinite(Number(channelId)) ? Number(channelId) : null,
+        chatroomId: Number.isFinite(Number(channelPayload?.chatroom?.id)) ? Number(channelPayload.chatroom.id) : null,
         displayName: typeof channelPayload?.user?.username === 'string'
           ? channelPayload.user.username
           : resolvedChannelSlug,
@@ -682,6 +846,19 @@ async function fetchChannelChatFromBrowser(page, channelSlug) {
   }
 
   return result.chat;
+}
+
+async function ensureKickHomePage(page) {
+  const currentUrl = typeof page.url === 'function' ? page.url() : '';
+  if (currentUrl.startsWith(KICK_HOME_URL)) {
+    return;
+  }
+
+  await page.goto(KICK_HOME_URL, {
+    waitUntil: 'domcontentloaded',
+    timeout: 60_000
+  }).catch(() => undefined);
+  await page.waitForTimeout(BACKGROUND_FETCH_WARMUP_MS);
 }
 
 async function readKickSession(filePath) {
@@ -1138,6 +1315,7 @@ function now() {
 function printHelp() {
   console.log(`Usage:
   node bridge/kick-bridge.mjs login --status-file <file> --cookie-file <file> --session-file <file> --profile-dir <dir> --meta-file <file>
+  node bridge/kick-bridge.mjs serve --status-file <file> --cookie-file <file> --session-file <file> --profile-dir <dir> --meta-file <file>
   node bridge/kick-bridge.mjs fetch-live-following --status-file <file> --cookie-file <file> --session-file <file> --profile-dir <dir> --meta-file <file> --output-file <file>
   node bridge/kick-bridge.mjs fetch-channel-chat --status-file <file> --cookie-file <file> --session-file <file> --profile-dir <dir> --meta-file <file> --output-file <file> --channel-slug <slug>`);
 }
