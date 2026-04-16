@@ -242,6 +242,31 @@ function appendRealtimeChatMessage(currentChat: ChannelChat | null, target: Real
   };
 }
 
+function mergeChannelChat(currentChat: ChannelChat | null, nextChat: ChannelChat): ChannelChat {
+  if (!currentChat || currentChat.channelSlug !== nextChat.channelSlug) {
+    return nextChat;
+  }
+
+  const mergedMessages = [...nextChat.messages];
+  const knownMessageIds = new Set(mergedMessages.map((message) => message.id));
+
+  for (const message of currentChat.messages) {
+    if (knownMessageIds.has(message.id)) {
+      continue;
+    }
+
+    mergedMessages.push(message);
+    knownMessageIds.add(message.id);
+  }
+
+  return {
+    ...currentChat,
+    ...nextChat,
+    pinnedMessage: nextChat.pinnedMessage || currentChat.pinnedMessage,
+    messages: mergedMessages.slice(-200)
+  };
+}
+
 export default function App() {
   const [bridgeStatus, setBridgeStatus] = useState<KickBridgeStatus>(FALLBACK_STATUS);
   const [channels, setChannels] = useState<FollowedChannel[]>([]);
@@ -436,6 +461,50 @@ export default function App() {
       pusher.disconnect();
     };
   }, [activeChannelId, activeChatroomId, channelChat?.displayName]);
+
+  useEffect(() => {
+    if (!isAuthenticated || !selectedChannelSlug || !channelChat || isLoadingChat) {
+      return;
+    }
+
+    let isDisposed = false;
+    let refreshInFlight = false;
+
+    const refreshOpenChat = async () => {
+      if (refreshInFlight) {
+        return;
+      }
+
+      refreshInFlight = true;
+
+      try {
+        const nextChat = await fetchChannelChat(selectedChannelSlug);
+        if (isDisposed) {
+          return;
+        }
+
+        startTransition(() => {
+          setChannelChat((currentChat) => mergeChannelChat(currentChat, nextChat));
+        });
+      } catch {
+        if (!isDisposed && liveChatState !== 'live') {
+          setLiveChatError('Live chat is delayed. Recent messages are still syncing automatically in the background.');
+        }
+      } finally {
+        refreshInFlight = false;
+      }
+    };
+
+    const refreshIntervalMs = liveChatState === 'live' ? 15000 : 5000;
+    const intervalId = window.setInterval(() => {
+      void refreshOpenChat();
+    }, refreshIntervalMs);
+
+    return () => {
+      isDisposed = true;
+      window.clearInterval(intervalId);
+    };
+  }, [channelChat, isAuthenticated, isLoadingChat, liveChatState, selectedChannelSlug]);
 
   async function refreshBridgeStatus() {
     try {
