@@ -1,5 +1,5 @@
 import Pusher, { type Options as PusherOptions } from 'pusher-js';
-import { startTransition, useEffect, useState } from 'react';
+import { startTransition, useEffect, useEffectEvent, useRef, useState } from 'react';
 import { fetchChannelChat, fetchLiveFollowedChannels, getBridgeStatus, getOAuthLoginUrl, startBridge } from './api';
 import type { ChannelChat, ChannelChatMessage, FollowedChannel, KickBridgeStatus } from './types';
 
@@ -281,6 +281,7 @@ export default function App() {
   const [liveChatError, setLiveChatError] = useState<string | null>(null);
   const [activity, setActivity] = useState('Bridge session is idle. Connect Kick once and the app will keep using the saved session until it expires.');
   const [lastLoadedUsername, setLastLoadedUsername] = useState('');
+  const openChatRefreshInFlightRef = useRef(false);
 
   useEffect(() => {
     void refreshBridgeStatus();
@@ -325,6 +326,7 @@ export default function App() {
     ? new Date(bridgeStatus.tokenExpiresAt).toLocaleString()
     : 'No Kick token stored';
   const selectedChannelSlug = selectedChannel?.channelSlug || null;
+  const hasOpenChat = channelChat?.channelSlug === selectedChannelSlug;
   const needsBrowserSync = bridgeStatus.oauthEnabled && isAuthenticated && !bridgeStatus.hasBrowserSession;
   const activeChatroomId = channelChat?.chatroomId ?? null;
   const activeChannelId = channelChat?.channelId ?? null;
@@ -462,49 +464,56 @@ export default function App() {
     };
   }, [activeChannelId, activeChatroomId, channelChat?.displayName]);
 
+  const refreshOpenChat = useEffectEvent(async () => {
+    if (!isAuthenticated || !selectedChannelSlug || !hasOpenChat || isLoadingChat || openChatRefreshInFlightRef.current) {
+      return;
+    }
+
+    openChatRefreshInFlightRef.current = true;
+
+    try {
+      const nextChat = await fetchChannelChat(selectedChannelSlug);
+
+      startTransition(() => {
+        setChannelChat((currentChat) => currentChat?.channelSlug === nextChat.channelSlug
+          ? mergeChannelChat(currentChat, nextChat)
+          : currentChat);
+      });
+    } catch {
+      if (liveChatState !== 'live') {
+        setLiveChatError('Live chat is delayed. Recent messages are still syncing automatically in the background.');
+      }
+    } finally {
+      openChatRefreshInFlightRef.current = false;
+    }
+  });
+
   useEffect(() => {
-    if (!isAuthenticated || !selectedChannelSlug || !channelChat || isLoadingChat) {
+    if (!isAuthenticated || !selectedChannelSlug || !hasOpenChat || isLoadingChat) {
       return;
     }
 
     let isDisposed = false;
-    let refreshInFlight = false;
+    let timeoutId = 0;
+    const refreshIntervalMs = liveChatState === 'live' ? 5000 : 2500;
 
-    const refreshOpenChat = async () => {
-      if (refreshInFlight) {
-        return;
-      }
+    const scheduleNextRefresh = () => {
+      timeoutId = window.setTimeout(async () => {
+        await refreshOpenChat();
 
-      refreshInFlight = true;
-
-      try {
-        const nextChat = await fetchChannelChat(selectedChannelSlug);
-        if (isDisposed) {
-          return;
+        if (!isDisposed) {
+          scheduleNextRefresh();
         }
-
-        startTransition(() => {
-          setChannelChat((currentChat) => mergeChannelChat(currentChat, nextChat));
-        });
-      } catch {
-        if (!isDisposed && liveChatState !== 'live') {
-          setLiveChatError('Live chat is delayed. Recent messages are still syncing automatically in the background.');
-        }
-      } finally {
-        refreshInFlight = false;
-      }
+      }, refreshIntervalMs);
     };
 
-    const refreshIntervalMs = liveChatState === 'live' ? 15000 : 5000;
-    const intervalId = window.setInterval(() => {
-      void refreshOpenChat();
-    }, refreshIntervalMs);
+    scheduleNextRefresh();
 
     return () => {
       isDisposed = true;
-      window.clearInterval(intervalId);
+      window.clearTimeout(timeoutId);
     };
-  }, [channelChat, isAuthenticated, isLoadingChat, liveChatState, selectedChannelSlug]);
+  }, [hasOpenChat, isAuthenticated, isLoadingChat, liveChatState, selectedChannelSlug]);
 
   async function refreshBridgeStatus() {
     try {
