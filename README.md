@@ -4,11 +4,12 @@ Chatterbro is a local dashboard for viewing live followed Kick channels through 
 
 ## What It Does
 
-- Opens a real Kick login flow in Chrome or Edge.
-- Captures and persists the authenticated Kick session locally.
+- Connects a Kick account through official Kick OAuth 2.1.
+- Persists OAuth access and refresh tokens locally for profile-level authentication.
+- Reuses a one-time synced Kick website session only for unsupported read flows.
 - Shows the connected Kick profile in the UI while the token is valid.
 - Loads live followed channels without asking for a username.
-- Uses a background browser context for Kick API calls that are blocked from plain backend HTTP.
+- Displays recent chat history for a selected live channel.
 
 ## Stack
 
@@ -45,6 +46,19 @@ Chatterbro is a local dashboard for viewing live followed Kick channels through 
 - Java 17+
 - Node.js 20+
 - Google Chrome or Microsoft Edge installed locally
+- A Kick developer app if you want to enable official OAuth login
+
+## OAuth Setup
+
+Set these environment variables before starting the backend if you want to use the official Kick OAuth flow:
+
+- `KICK_CLIENT_ID`
+- `KICK_CLIENT_SECRET`
+- `KICK_REDIRECT_URI`
+- `CHATTERBRO_FRONTEND_URL` optional, defaults to `http://localhost:8080`
+- `KICK_OAUTH_SCOPES` optional, defaults to `user:read channel:read`
+
+If OAuth variables are not configured, the app falls back to the existing browser bridge login flow.
 
 ## Local Development
 
@@ -67,20 +81,24 @@ When `frontend/dist` exists, Ktor serves the built React app directly.
 ## Kick Session Flow
 
 1. Click the connect button in the UI.
-2. Sign in through the Kick window opened in a real local browser profile.
-3. Let the bridge capture the session token, expiry, and profile.
-4. Reload live followed channels through the saved authenticated session.
+2. Complete the Kick OAuth 2.1 flow in your browser.
+3. Let the backend store the OAuth access token, refresh token, expiry, and profile.
+4. The first time you need live followings or chat history, run the one-time website session sync.
+5. Reload live followed channels and chat through the saved local session state.
 
-Session and browser artifacts are kept under `bridge/session/` and `bridge/browser-profile-cdp/`, and are intentionally ignored by git.
+OAuth and browser session artifacts are kept under `bridge/session/` and `bridge/browser-profile-cdp/`, and are intentionally ignored by git.
 
 ## API Overview
 
 - `GET /api/bridge/status` returns bridge state, token status, expiry, and connected profile.
 - `POST /api/bridge/start` starts the login bridge.
+- `GET /api/auth/login` starts the official Kick OAuth flow.
+- `GET /api/auth/callback` completes the OAuth callback and persists the local session.
 - `GET /api/following/live` returns the authenticated account's live followed channels.
+- `GET /api/chat/{channelSlug}` returns recent chat history for a selected channel.
 
 ## Notes
 
-Kick blocks some plain server-side requests even with a valid captured token, so the project deliberately performs authenticated follow queries from a background browser context.
+Kick's official Public API now handles authentication and profile reads, but it still does not expose read endpoints for followed channels or recent chat history. Because of that, the project still uses a background browser context for those unsupported reads.
 
 See `docs/kick-integration.md` for the bridge strategy and `docs/mvp-commit-plan.md` for the implementation plan.

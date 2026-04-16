@@ -1,4 +1,5 @@
 export type BridgeState = 'IDLE' | 'RUNNING' | 'READY' | 'ERROR';
+export type KickAuthMode = 'NONE' | 'OAUTH' | 'BROWSER_SESSION';
 
 export interface KickProfile {
   username: string;
@@ -14,6 +15,9 @@ export interface KickBridgeStatus {
   isAuthenticated: boolean;
   tokenExpiresAt: string | null;
   profile: KickProfile | null;
+  oauthEnabled: boolean;
+  hasBrowserSession: boolean;
+  authMode: KickAuthMode;
   updatedAt: string;
 }
 

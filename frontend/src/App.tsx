@@ -1,5 +1,5 @@
 import { startTransition, useEffect, useState } from 'react';
-import { fetchChannelChat, fetchLiveFollowedChannels, getBridgeStatus, startBridge } from './api';
+import { fetchChannelChat, fetchLiveFollowedChannels, getBridgeStatus, getOAuthLoginUrl, startBridge } from './api';
 import type { ChannelChat, ChannelChatMessage, FollowedChannel, KickBridgeStatus } from './types';
 
 const FALLBACK_STATUS: KickBridgeStatus = {
@@ -9,6 +9,9 @@ const FALLBACK_STATUS: KickBridgeStatus = {
   isAuthenticated: false,
   tokenExpiresAt: null,
   profile: null,
+  oauthEnabled: false,
+  hasBrowserSession: false,
+  authMode: 'NONE',
   updatedAt: new Date(0).toISOString()
 };
 
@@ -35,6 +38,24 @@ export default function App() {
   useEffect(() => {
     void refreshBridgeStatus();
 
+    const params = new URLSearchParams(window.location.search);
+    const authResult = params.get('auth');
+    const authMessage = params.get('message');
+    if (authResult === 'success') {
+      setActivity(authMessage || 'Kick OAuth connected successfully. Load followings when you are ready.');
+      params.delete('auth');
+      params.delete('message');
+      const nextQuery = params.toString();
+      window.history.replaceState({}, document.title, `${window.location.pathname}${nextQuery ? `?${nextQuery}` : ''}`);
+      void refreshBridgeStatus();
+    } else if (authResult === 'error') {
+      setError(authMessage || 'Kick OAuth sign-in failed.');
+      params.delete('auth');
+      params.delete('message');
+      const nextQuery = params.toString();
+      window.history.replaceState({}, document.title, `${window.location.pathname}${nextQuery ? `?${nextQuery}` : ''}`);
+    }
+
     const intervalId = window.setInterval(() => {
       void refreshBridgeStatus();
     }, 4000);
@@ -57,6 +78,7 @@ export default function App() {
     ? new Date(bridgeStatus.tokenExpiresAt).toLocaleString()
     : 'No Kick token stored';
   const selectedChannelSlug = selectedChannel?.channelSlug || null;
+  const needsBrowserSync = bridgeStatus.oauthEnabled && isAuthenticated && !bridgeStatus.hasBrowserSession;
 
   useEffect(() => {
     if (isAuthenticated) {
@@ -81,6 +103,11 @@ export default function App() {
   }
 
   async function handleStartBridge() {
+    if (bridgeStatus.oauthEnabled) {
+      window.location.assign(getOAuthLoginUrl());
+      return;
+    }
+
     setIsStartingBridge(true);
     setError(null);
 
@@ -97,9 +124,39 @@ export default function App() {
     }
   }
 
+  async function ensureBrowserSessionForWebsiteData(featureLabel: string) {
+    if (bridgeStatus.hasBrowserSession || !bridgeStatus.oauthEnabled) {
+      return true;
+    }
+
+    setActivity(`Kick OAuth is connected, but ${featureLabel} still need a one-time Kick website session sync. Finish the browser sign-in window and retry.`);
+    await startBrowserSessionSync();
+    return false;
+  }
+
+  async function startBrowserSessionSync() {
+    setIsStartingBridge(true);
+    setError(null);
+
+    try {
+      const nextStatus = await startBridge();
+      startTransition(() => {
+        setBridgeStatus(nextStatus);
+      });
+    } catch (caughtError) {
+      setError(caughtError instanceof Error ? caughtError.message : 'Failed to start the Kick website session sync.');
+    } finally {
+      setIsStartingBridge(false);
+    }
+  }
+
   async function handleLoadChannels() {
     if (!isAuthenticated || !profile) {
       setError('Connect Kick first so the app can use your saved session.');
+      return;
+    }
+
+    if (!(await ensureBrowserSessionForWebsiteData('live followings'))) {
       return;
     }
 
@@ -128,6 +185,11 @@ export default function App() {
   async function loadChannelChat(channel: FollowedChannel) {
     if (!isAuthenticated) {
       setChatError('Connect Kick first so the app can use your saved session.');
+      return;
+    }
+
+    if (!(await ensureBrowserSessionForWebsiteData('chat history'))) {
+      setSelectedChannel(channel);
       return;
     }
 
@@ -192,15 +254,23 @@ export default function App() {
           <p className="eyebrow">Chatterbro</p>
           <h1>React dashboard for a browser-backed Kick bridge.</h1>
           <p className="hero-description">
-            The UI stays in React. Kotlin runs the local API. Playwright handles the real Kick browser session so the app can survive stricter anti-bot checks.
+            The UI stays in React. Kotlin runs the local API. Kick OAuth handles account connection first, while the browser bridge is only kept for the unsupported followings and chat-read flows.
           </p>
         </div>
 
         <div className="hero-metrics">
           <div className="metric-card accent-card">
-            <span className="metric-label">Kick session</span>
+            <span className="metric-label">Kick auth</span>
             <strong>{BRIDGE_STATE_LABELS[bridgeStatus.state]}</strong>
-            <small>{bridgeStatus.hasToken ? 'Token captured' : 'No token yet'}</small>
+            <small>
+              {bridgeStatus.authMode === 'OAUTH'
+                ? 'OAuth connected'
+                : bridgeStatus.authMode === 'BROWSER_SESSION'
+                  ? 'Browser session connected'
+                  : bridgeStatus.hasToken
+                    ? 'Token captured'
+                    : 'No token yet'}
+            </small>
           </div>
           <div className="metric-card">
             <span className="metric-label">Active profile</span>
@@ -245,15 +315,29 @@ export default function App() {
           <div className="action-row">
             {!isAuthenticated ? (
               <button className="primary-button" onClick={handleStartBridge} disabled={isStartingBridge || bridgeStatus.state === 'RUNNING'}>
+                {bridgeStatus.oauthEnabled
+                  ? 'Connect Kick via OAuth'
+                  : isStartingBridge
+                    ? 'Opening Kick login...'
+                    : bridgeStatus.state === 'RUNNING'
+                      ? 'Waiting for Kick sign-in...'
+                      : 'Connect Kick account'}
+              </button>
+            ) : needsBrowserSync ? (
+              <button className="primary-button" onClick={startBrowserSessionSync} disabled={isStartingBridge || bridgeStatus.state === 'RUNNING'}>
                 {isStartingBridge
-                  ? 'Opening Kick login...'
+                  ? 'Opening Kick browser sync...'
                   : bridgeStatus.state === 'RUNNING'
-                    ? 'Waiting for Kick sign-in...'
-                    : 'Connect Kick account'}
+                    ? 'Waiting for website session sync...'
+                    : 'Enable followings and chat sync'}
               </button>
             ) : null}
             <button className="secondary-button" onClick={handleLoadChannels} disabled={isLoadingChannels || !isAuthenticated}>
-              {isLoadingChannels ? 'Loading live followings...' : 'Load live followings'}
+              {isLoadingChannels
+                ? 'Loading live followings...'
+                : needsBrowserSync
+                  ? 'Prepare followings sync'
+                  : 'Load live followings'}
             </button>
           </div>
 
@@ -274,6 +358,13 @@ export default function App() {
             </div>
           ) : null}
 
+          {needsBrowserSync ? (
+            <div className="message-strip subtle-strip">
+              <strong>Website data sync</strong>
+              <p>Kick OAuth is active, but live followings and recent chat still require one browser-based website session sync because those read endpoints are not yet exposed in the official Public API.</p>
+            </div>
+          ) : null}
+
           {error ? (
             <div className="message-strip error-strip">
               <strong>Backend error</strong>
@@ -284,18 +375,18 @@ export default function App() {
 
         <article className="panel guide-panel">
           <div className="panel-header">
-            <h2>Bridge flow</h2>
-            <span className="mono-label">saved Kick session</span>
+            <h2>Auth flow</h2>
+            <span className="mono-label">oauth + website sync</span>
           </div>
 
           <ol className="step-list">
-            <li>Click <strong>Connect Kick account</strong>.</li>
-            <li>Finish the Kick login in the browser window opened by the bridge.</li>
-            <li>Once your profile appears here, load live followings without another popup.</li>
+            <li>Click <strong>Connect Kick via OAuth</strong>.</li>
+            <li>Finish the Kick authorization flow in your browser.</li>
+            <li>If you need live followings or chat history, run the one-time website sync the first time you load them.</li>
           </ol>
 
           <p className="helper-copy">
-            Kick blocks raw backend HTTP even with a token, so the app reuses your saved Kick session through a background browser fetch with no visible follow-up login window.
+            Kick's Public API now covers auth and profile reads cleanly, but followed-channel and chat-history reads still require the browser bridge until official read endpoints exist.
           </p>
         </article>
       </section>

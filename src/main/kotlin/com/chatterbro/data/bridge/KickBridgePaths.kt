@@ -13,6 +13,8 @@ data class KickBridgePaths(
     val cookiesFile: Path = sessionDirectory.resolve("kick-cookies.json")
     val metadataFile: Path = sessionDirectory.resolve("browser-meta.json")
     val sessionFile: Path = sessionDirectory.resolve("kick-session.json")
+    val oauthSessionFile: Path = sessionDirectory.resolve("kick-oauth-session.json")
+    val oauthPendingFile: Path = sessionDirectory.resolve("kick-oauth-pending.json")
     val statusFile: Path = sessionDirectory.resolve("bridge-status.json")
     val outputFile: Path = sessionDirectory.resolve("live-following.json")
     val chatOutputFile: Path = sessionDirectory.resolve("channel-chat.json")

@@ -4,6 +4,8 @@ import com.chatterbro.api.dto.ErrorResponse
 import com.chatterbro.data.bridge.KickBridgePaths
 import com.chatterbro.data.bridge.KickBridgeRunner
 import com.chatterbro.data.bridge.KickBridgeStatusStore
+import com.chatterbro.data.oauth.KickOAuthConfig
+import com.chatterbro.data.oauth.KickOAuthService
 import com.chatterbro.data.remote.PlaywrightKickBridgeDataSource
 import com.chatterbro.data.repository.BridgeBackedKickRepository
 import com.chatterbro.domain.usecase.LoadChannelChatUseCase
@@ -18,6 +20,7 @@ import io.ktor.server.http.content.staticFiles
 import io.ktor.server.plugins.calllogging.CallLogging
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.cors.routing.CORS
+import io.ktor.server.response.respondRedirect
 import io.ktor.server.request.path
 import io.ktor.server.response.respond
 import io.ktor.server.response.respondFile
@@ -31,9 +34,11 @@ import java.nio.file.Paths
 fun Application.chatterbroModule() {
     val rootDirectory = Paths.get("").toAbsolutePath().normalize()
     val bridgePaths = KickBridgePaths(rootDirectory)
-    val bridgeStatusStore = KickBridgeStatusStore(bridgePaths)
+    val oauthConfig = KickOAuthConfig.fromEnvironment()
+    val bridgeStatusStore = KickBridgeStatusStore(bridgePaths, oauthEnabled = oauthConfig != null)
+    val oauthService = oauthConfig?.let { KickOAuthService(it, bridgePaths, bridgeStatusStore) }
     val bridgeRunner = KickBridgeRunner(bridgePaths, bridgeStatusStore)
-    val remoteDataSource = PlaywrightKickBridgeDataSource(bridgeRunner, bridgeStatusStore)
+    val remoteDataSource = PlaywrightKickBridgeDataSource(bridgeRunner, bridgeStatusStore, oauthService)
     val repository = BridgeBackedKickRepository(remoteDataSource)
     val loadLiveFollowedChannels = LoadLiveFollowedChannelsUseCase(repository)
     val loadChannelChat = LoadChannelChatUseCase(repository)
@@ -52,6 +57,7 @@ fun Application.chatterbroModule() {
     install(ContentNegotiation) {
         json(
             Json {
+                encodeDefaults = true
                 prettyPrint = true
                 ignoreUnknownKeys = true
             },
@@ -70,6 +76,45 @@ fun Application.chatterbroModule() {
 
             post("/bridge/start") {
                 call.respond(remoteDataSource.startBridgeSession())
+            }
+
+            get("/auth/login") {
+                val service = oauthService
+                if (service == null) {
+                    call.respondRedirect("/?auth=error&message=Kick%20OAuth%20is%20not%20configured.")
+                    return@get
+                }
+
+                call.respondRedirect(service.beginAuthorization())
+            }
+
+            get("/auth/callback") {
+                val service = oauthService
+                if (service == null) {
+                    call.respondRedirect("/?auth=error&message=Kick%20OAuth%20is%20not%20configured.")
+                    return@get
+                }
+
+                val error = call.parameters["error"]?.trim()
+                if (!error.isNullOrBlank()) {
+                    val description = call.parameters["error_description"]?.trim().orEmpty().ifBlank { error }
+                    call.respondRedirect(service.buildFrontendRedirect(success = false, message = description))
+                    return@get
+                }
+
+                val code = call.parameters["code"]?.trim().orEmpty()
+                val state = call.parameters["state"]?.trim().orEmpty()
+                if (code.isBlank() || state.isBlank()) {
+                    call.respondRedirect(service.buildFrontendRedirect(success = false, message = "Kick OAuth callback is missing code or state."))
+                    return@get
+                }
+
+                try {
+                    service.handleCallback(code, state)
+                    call.respondRedirect(service.buildFrontendRedirect(success = true, message = "Kick OAuth connected successfully."))
+                } catch (exception: IllegalStateException) {
+                    call.respondRedirect(service.buildFrontendRedirect(success = false, message = exception.message ?: "Kick OAuth callback failed."))
+                }
             }
 
             get("/following/live") {
