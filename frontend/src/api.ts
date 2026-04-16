@@ -45,3 +45,7 @@ export function fetchLiveFollowedChannels(): Promise<FollowedChannel[]> {
 export function fetchChannelChat(channelSlug: string): Promise<ChannelChat> {
   return request<ChannelChat>(`/api/chat/${encodeURIComponent(channelSlug)}`);
 }
+
+export function getOAuthLoginUrl(): string {
+  return `${API_BASE_URL}/api/auth/login`;
+}
