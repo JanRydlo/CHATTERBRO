@@ -1,7 +1,7 @@
 import Pusher, { type Options as PusherOptions } from 'pusher-js';
-import { startTransition, useEffect, useEffectEvent, useRef, useState } from 'react';
-import { fetchChannelChat, fetchLiveFollowedChannels, getBridgeStatus, getOAuthLoginUrl, startBridge } from './api';
-import type { ChannelChat, ChannelChatMessage, FollowedChannel, KickBridgeStatus } from './types';
+import { Fragment, type ReactNode, startTransition, useEffect, useEffectEvent, useRef, useState } from 'react';
+import { fetchChannelChat, fetchChannelChatEmotes, fetchGlobalChatEmotes, fetchLiveFollowedChannels, getBridgeStatus, getOAuthLoginUrl, startBridge } from './api';
+import type { ChannelChat, ChannelChatBadge, ChannelChatEmote, ChannelChatEmoteCatalog, ChannelChatMessage, FollowedChannel, KickBridgeStatus } from './types';
 
 const FALLBACK_STATUS: KickBridgeStatus = {
   state: 'IDLE',
@@ -36,9 +36,286 @@ const KICK_PUSHER_OPTIONS: PusherOptions = {
   disableStats: true
 };
 
+const INVISIBLE_EXTERNAL_EMOTE_PATTERN = /[\u200B-\u200D\uFEFF\u00AD\u{E0000}-\u{E007F}]/gu;
+const KICK_PLACEHOLDER_PATTERN = /\[emote:(\d+):([^\]]+)\]/g;
+const KICK_PLACEHOLDER_DETECTION_PATTERN = /\[emote:\d+:[^\]]+\]/;
+
 interface RealtimeChatTarget {
   channelId: number | null;
   chatroomId: number | null;
+}
+
+interface ChannelEmoteCacheEntry {
+  catalog: ChannelChatEmoteCatalog;
+  index: Record<string, ChannelChatEmote>;
+}
+
+interface MatchedInlineEmoteToken {
+  leadingText: string;
+  trailingText: string;
+  emote: ChannelChatEmote;
+}
+
+function getChannelEmoteCacheKey(channelSlug: string, channelUserId: number | null) {
+  return `${channelSlug}:${channelUserId ?? 'none'}`;
+}
+
+function normalizeExternalEmoteCode(value: string) {
+  return value.replace(INVISIBLE_EXTERNAL_EMOTE_PATTERN, '');
+}
+
+function parseSerializedBadge(value: string): ChannelChatBadge | null {
+  const typeMatch = value.match(/type=([^;}]*)/i);
+  const textMatch = value.match(/text=([^;}]*)/i);
+  const countMatch = value.match(/count=([^;}]*)/i);
+  const imageMatch = value.match(/(?:imageUrl|image_url|icon|icon_url|src|url)=([^;}]*)/i);
+  const type = typeMatch?.[1]?.trim() || '';
+  const text = textMatch?.[1]?.trim() || type;
+  const count = Number(countMatch?.[1]);
+
+  if (!type && !text) {
+    return null;
+  }
+
+  return {
+    type,
+    text,
+    count: Number.isFinite(count) ? count : null,
+    imageUrl: imageMatch?.[1]?.trim() || null
+  };
+}
+
+function resolveBadgeImageUrl(value: Record<string, unknown>) {
+  const candidates = [
+    value.image,
+    value.image_url,
+    value.icon,
+    value.icon_url,
+    value.src,
+    value.url,
+    value.badge_image,
+    value.small_icon_url,
+    value.thumbnail
+  ];
+
+  const match = candidates.find((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0);
+  return match ?? null;
+}
+
+function resolvePreferredMessageContent(message: Record<string, unknown>) {
+  const metadata = message.metadata && typeof message.metadata === 'object' && !Array.isArray(message.metadata)
+    ? message.metadata as Record<string, unknown>
+    : null;
+  const candidates = [
+    typeof message.content === 'string' ? message.content : '',
+    typeof message.original_message === 'string' ? message.original_message : '',
+    typeof message.body === 'string' ? message.body : '',
+    typeof message.message === 'string' ? message.message : '',
+    typeof message.text === 'string' ? message.text : '',
+    typeof metadata?.original_message === 'string' ? metadata.original_message : '',
+    typeof metadata?.body === 'string' ? metadata.body : '',
+    typeof metadata?.text === 'string' ? metadata.text : ''
+  ].filter((candidate) => candidate.length > 0);
+
+  const kickPlaceholderCandidate = candidates.find((candidate) => KICK_PLACEHOLDER_DETECTION_PATTERN.test(candidate));
+  if (kickPlaceholderCandidate) {
+    return normalizeExternalEmoteCode(kickPlaceholderCandidate);
+  }
+
+  return normalizeExternalEmoteCode(candidates.sort((left, right) => right.length - left.length)[0] ?? '');
+}
+
+function getBadgeLabel(badge: ChannelChatBadge) {
+  const badgeType = badge.type.toLowerCase();
+
+  switch (badgeType) {
+    case 'moderator':
+      return 'MOD';
+    case 'verified':
+      return 'VER';
+    case 'vip':
+      return 'VIP';
+    case 'founder':
+      return 'F';
+    case 'subscriber':
+      return badge.count ? `S${badge.count}` : 'SUB';
+    case 'sub_gifter':
+      return badge.count ? `G${badge.count}` : 'G';
+    case 'og':
+      return 'OG';
+    default:
+      return (badge.text || badge.type || '?').slice(0, 3).toUpperCase();
+  }
+}
+
+function getBadgeTitle(badge: ChannelChatBadge) {
+  const label = badge.text || badge.type || 'Badge';
+  return badge.count ? `${label} ${badge.count}` : label;
+}
+
+function renderSenderBadge(badge: ChannelChatBadge, key: string) {
+  if (badge.imageUrl) {
+    return <img className="chat-badge-icon chat-badge-image" key={key} src={badge.imageUrl} alt={getBadgeTitle(badge)} title={getBadgeTitle(badge)} loading="lazy" decoding="async" draggable={false} />;
+  }
+
+  return <span className="chat-badge-icon chat-badge-fallback" key={key} title={getBadgeTitle(badge)}>{getBadgeLabel(badge)}</span>;
+}
+
+function buildChannelEmoteIndex(catalog: ChannelChatEmoteCatalog) {
+  const nextIndex: Record<string, ChannelChatEmote> = {};
+
+  for (const emote of catalog.emotes) {
+    const candidateKeys = new Set([emote.code, normalizeExternalEmoteCode(emote.code)]);
+
+    for (const candidateKey of candidateKeys) {
+      if (!candidateKey) {
+        continue;
+      }
+
+      nextIndex[candidateKey] = emote;
+    }
+  }
+
+  return nextIndex;
+}
+
+function matchInlineEmoteToken(token: string, emoteIndex: Record<string, ChannelChatEmote> | null): MatchedInlineEmoteToken | null {
+  if (!emoteIndex) {
+    return null;
+  }
+
+  const exactMatch = emoteIndex[token] ?? emoteIndex[normalizeExternalEmoteCode(token)];
+  if (exactMatch) {
+    return {
+      leadingText: '',
+      trailingText: '',
+      emote: exactMatch
+    };
+  }
+
+  const punctuationMatch = token.match(/^([([{"'“‘]*)(.+?)([)\]}!?,.;:"'”’]*)$/);
+  if (!punctuationMatch) {
+    return null;
+  }
+
+  const [, leadingText, candidateCode, trailingText] = punctuationMatch;
+  if (!leadingText && !trailingText) {
+    return null;
+  }
+
+  const emote = emoteIndex[candidateCode] ?? emoteIndex[normalizeExternalEmoteCode(candidateCode)];
+  if (!emote) {
+    return null;
+  }
+
+  return {
+    leadingText,
+    trailingText,
+    emote
+  };
+}
+
+function getKickPlaceholderEmoteUrl(emoteId: string) {
+  return `https://files.kick.com/emotes/${emoteId}/fullsize`;
+}
+
+function renderTextSegmentWithExternalEmotes(
+  text: string,
+  messageId: string,
+  segmentKey: string,
+  emoteIndex: Record<string, ChannelChatEmote> | null
+) {
+  return text
+    .split(/(\s+)/)
+    .filter((part) => part.length > 0)
+    .map((part, index) => {
+      if (/^\s+$/.test(part)) {
+        return <Fragment key={`${messageId}-${segmentKey}-space-${index}`}>{part}</Fragment>;
+      }
+
+      const matchedEmote = matchInlineEmoteToken(part, emoteIndex);
+      if (!matchedEmote) {
+        return <Fragment key={`${messageId}-${segmentKey}-text-${index}`}>{part}</Fragment>;
+      }
+
+      return (
+        <Fragment key={`${messageId}-${segmentKey}-external-emote-${index}-${matchedEmote.emote.code}`}>
+          {matchedEmote.leadingText}
+          <img
+            className="chat-inline-emote"
+            src={matchedEmote.emote.imageUrl}
+            alt={matchedEmote.emote.code}
+            title={`${matchedEmote.emote.code} · ${matchedEmote.emote.provider}`}
+            loading="lazy"
+            decoding="async"
+            draggable={false}
+          />
+          {matchedEmote.trailingText}
+        </Fragment>
+      );
+    });
+}
+
+function renderMessageContent(
+  content: string,
+  messageId: string,
+  emoteIndex: Record<string, ChannelChatEmote> | null
+) {
+  const normalizedContent = normalizeExternalEmoteCode(content || 'Empty message');
+  const renderedParts: ReactNode[] = [];
+
+  let lastIndex = 0;
+  let match = KICK_PLACEHOLDER_PATTERN.exec(normalizedContent);
+
+  while (match) {
+    const [rawMatch, emoteId, emoteCode] = match;
+
+    if (match.index > lastIndex) {
+      renderedParts.push(
+        ...renderTextSegmentWithExternalEmotes(
+          normalizedContent.slice(lastIndex, match.index),
+          messageId,
+          `segment-${lastIndex}`,
+          emoteIndex
+        )
+      );
+    }
+
+    renderedParts.push(
+      <img
+        className="chat-inline-emote"
+        key={`${messageId}-kick-emote-${emoteId}-${match.index}`}
+        src={getKickPlaceholderEmoteUrl(emoteId)}
+        alt={emoteCode}
+        title={`${emoteCode} · Kick`}
+        loading="lazy"
+        decoding="async"
+        draggable={false}
+      />
+    );
+
+    lastIndex = match.index + rawMatch.length;
+    match = KICK_PLACEHOLDER_PATTERN.exec(normalizedContent);
+  }
+
+  KICK_PLACEHOLDER_PATTERN.lastIndex = 0;
+
+  if (lastIndex < normalizedContent.length) {
+    renderedParts.push(
+      ...renderTextSegmentWithExternalEmotes(
+        normalizedContent.slice(lastIndex),
+        messageId,
+        `segment-${lastIndex}`,
+        emoteIndex
+      )
+    );
+  }
+
+  if (renderedParts.length === 0) {
+    return normalizedContent;
+  }
+
+  return renderedParts;
 }
 
 function parseRealtimeJson(value: unknown) {
@@ -85,11 +362,15 @@ function unwrapRealtimeRecord(payload: unknown): Record<string, unknown> | null 
 }
 
 function normalizeRealtimeBadge(value: unknown) {
+  if (typeof value === 'string') {
+    return parseSerializedBadge(value);
+  }
+
   if (!value || typeof value !== 'object') {
     return null;
   }
 
-  const badge = value as { type?: unknown; text?: unknown; count?: unknown };
+  const badge = value as Record<string, unknown>;
   const type = typeof badge.type === 'string' ? badge.type : '';
   const text = typeof badge.text === 'string' ? badge.text : type;
   const count = Number(badge.count);
@@ -101,7 +382,8 @@ function normalizeRealtimeBadge(value: unknown) {
   return {
     type,
     text,
-    count: Number.isFinite(count) ? count : null
+    count: Number.isFinite(count) ? count : null,
+    imageUrl: resolveBadgeImageUrl(badge)
   };
 }
 
@@ -159,13 +441,7 @@ function normalizeRealtimeChatMessage(payload: unknown): ChannelChatMessage | nu
 
   return {
     id: messageId,
-    content: typeof message.content === 'string'
-      ? message.content
-      : typeof message.body === 'string'
-        ? message.body
-        : typeof message.message === 'string'
-          ? message.message
-          : '',
+    content: resolvePreferredMessageContent(message),
     type: typeof message.type === 'string' ? message.type : 'message',
     createdAt: typeof message.created_at === 'string'
       ? message.created_at
@@ -262,6 +538,7 @@ function mergeChannelChat(currentChat: ChannelChat | null, nextChat: ChannelChat
   return {
     ...currentChat,
     ...nextChat,
+    channelUserId: nextChat.channelUserId ?? currentChat.channelUserId,
     pinnedMessage: nextChat.pinnedMessage || currentChat.pinnedMessage,
     messages: mergedMessages.slice(-200)
   };
@@ -272,6 +549,8 @@ export default function App() {
   const [channels, setChannels] = useState<FollowedChannel[]>([]);
   const [selectedChannel, setSelectedChannel] = useState<FollowedChannel | null>(null);
   const [channelChat, setChannelChat] = useState<ChannelChat | null>(null);
+  const [globalEmoteIndex, setGlobalEmoteIndex] = useState<Record<string, ChannelChatEmote>>({});
+  const [channelEmoteCache, setChannelEmoteCache] = useState<Record<string, ChannelEmoteCacheEntry>>({});
   const [isStartingBridge, setIsStartingBridge] = useState(false);
   const [isLoadingChannels, setIsLoadingChannels] = useState(false);
   const [isLoadingChat, setIsLoadingChat] = useState(false);
@@ -282,9 +561,11 @@ export default function App() {
   const [activity, setActivity] = useState('Bridge session is idle. Connect Kick once and the app will keep using the saved session until it expires.');
   const [lastLoadedUsername, setLastLoadedUsername] = useState('');
   const openChatRefreshInFlightRef = useRef(false);
+  const emoteRequestsInFlightRef = useRef(new Set<string>());
 
   useEffect(() => {
     void refreshBridgeStatus();
+    void preloadGlobalEmotes();
 
     const params = new URLSearchParams(window.location.search);
     const authResult = params.get('auth');
@@ -313,6 +594,17 @@ export default function App() {
     };
   }, []);
 
+  async function preloadGlobalEmotes() {
+    try {
+      const catalog = await fetchGlobalChatEmotes();
+      startTransition(() => {
+        setGlobalEmoteIndex(buildChannelEmoteIndex(catalog));
+      });
+    } catch {
+      // Keep global external emotes best-effort if the catalog is temporarily unavailable.
+    }
+  }
+
   const isAuthenticated = bridgeStatus.isAuthenticated && Boolean(bridgeStatus.profile);
   const profile = bridgeStatus.profile;
   const liveCountLabel = !lastLoadedUsername
@@ -328,6 +620,16 @@ export default function App() {
   const selectedChannelSlug = selectedChannel?.channelSlug || null;
   const hasOpenChat = channelChat?.channelSlug === selectedChannelSlug;
   const needsBrowserSync = bridgeStatus.oauthEnabled && isAuthenticated && !bridgeStatus.hasBrowserSession;
+  const activeEmoteCacheKey = channelChat
+    ? getChannelEmoteCacheKey(channelChat.channelSlug, channelChat.channelUserId)
+    : null;
+  const activeChannelEmoteIndex = activeEmoteCacheKey
+    ? channelEmoteCache[activeEmoteCacheKey]?.index ?? null
+    : null;
+  const activeEmoteIndex = {
+    ...globalEmoteIndex,
+    ...(activeChannelEmoteIndex ?? {})
+  };
   const activeChatroomId = channelChat?.chatroomId ?? null;
   const activeChannelId = channelChat?.channelId ?? null;
   const liveChatStatusLabel = liveChatState === 'live'
@@ -463,6 +765,42 @@ export default function App() {
       pusher.disconnect();
     };
   }, [activeChannelId, activeChatroomId, channelChat?.displayName]);
+
+  useEffect(() => {
+    if (!channelChat?.channelSlug) {
+      return;
+    }
+
+    const cacheKey = getChannelEmoteCacheKey(channelChat.channelSlug, channelChat.channelUserId);
+    if (channelEmoteCache[cacheKey] || emoteRequestsInFlightRef.current.has(cacheKey)) {
+      return;
+    }
+
+    emoteRequestsInFlightRef.current.add(cacheKey);
+
+    void (async () => {
+      try {
+        const nextCatalog = await fetchChannelChatEmotes(channelChat.channelSlug, channelChat.channelUserId);
+        const nextEntry = {
+          catalog: nextCatalog,
+          index: buildChannelEmoteIndex(nextCatalog)
+        };
+
+        startTransition(() => {
+          setChannelEmoteCache((currentCache) => currentCache[cacheKey]
+            ? currentCache
+            : {
+                ...currentCache,
+                [cacheKey]: nextEntry
+              });
+        });
+      } catch {
+        // Fall back to plain text if external emote catalogs are temporarily unavailable.
+      } finally {
+        emoteRequestsInFlightRef.current.delete(cacheKey);
+      }
+    })();
+  }, [channelChat?.channelSlug, channelChat?.channelUserId, channelEmoteCache]);
 
   const refreshOpenChat = useEffectEvent(async () => {
     if (!isAuthenticated || !selectedChannelSlug || !hasOpenChat || isLoadingChat || openChatRefreshInFlightRef.current) {
@@ -670,6 +1008,7 @@ export default function App() {
     const senderBadges = message.sender.badges || [];
     const timeLabel = formatChatClockTime(message.createdAt);
     const timeTitle = formatChatTimestamp(message.createdAt);
+    const renderedMessageContent = renderMessageContent(message.content, message.id, activeEmoteIndex);
 
     return (
       <article className={`chat-message${message.threadParentId ? ' chat-message-reply' : ''}`} key={message.id}>
@@ -677,18 +1016,14 @@ export default function App() {
         <div className="chat-message-main">
           <div className="chat-message-header">
             <div className="chat-sender-group">
+              {senderBadges.length > 0 ? <span className="chat-badge-list">{senderBadges.map((badge, index) => renderSenderBadge(badge, `${message.id}-${badge.type}-${index}`))}</span> : null}
               <strong className="chat-sender-name" style={message.sender.color ? { color: message.sender.color } : undefined}>
                 {message.sender.username}
               </strong>
-              {senderBadges.map((badge) => (
-                <span className="chat-badge" key={`${message.id}-${badge.type}-${badge.text}`}>
-                  {badge.count ? `${badge.text} ${badge.count}` : badge.text}
-                </span>
-              ))}
               {message.type !== 'message' ? <span className="chat-type-pill">{message.type}</span> : null}
             </div>
           </div>
-          <p>{message.content || 'Empty message'}</p>
+          <p className="chat-message-body">{renderedMessageContent}</p>
         </div>
       </article>
     );

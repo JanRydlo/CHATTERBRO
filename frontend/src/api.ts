@@ -1,4 +1,4 @@
-import type { ChannelChat, FollowedChannel, KickBridgeStatus } from './types';
+import type { ChannelChat, ChannelChatEmoteCatalog, FollowedChannel, KickBridgeStatus } from './types';
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
 
@@ -44,6 +44,20 @@ export function fetchLiveFollowedChannels(): Promise<FollowedChannel[]> {
 
 export function fetchChannelChat(channelSlug: string): Promise<ChannelChat> {
   return request<ChannelChat>(`/api/chat/${channelSlug}`);
+}
+
+export function fetchGlobalChatEmotes(): Promise<ChannelChatEmoteCatalog> {
+  return request<ChannelChatEmoteCatalog>('/api/chat/emotes/global');
+}
+
+export function fetchChannelChatEmotes(channelSlug: string, channelUserId: number | null): Promise<ChannelChatEmoteCatalog> {
+  const query = new URLSearchParams();
+  if (channelUserId !== null) {
+    query.set('channelUserId', String(channelUserId));
+  }
+
+  const queryString = query.toString();
+  return request<ChannelChatEmoteCatalog>(`/api/chat/${channelSlug}/emotes${queryString ? `?${queryString}` : ''}`);
 }
 
 export function getOAuthLoginUrl(): string {

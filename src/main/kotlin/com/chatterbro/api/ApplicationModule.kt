@@ -6,6 +6,7 @@ import com.chatterbro.data.bridge.KickBridgeRunner
 import com.chatterbro.data.bridge.KickBridgeStatusStore
 import com.chatterbro.data.oauth.KickOAuthConfig
 import com.chatterbro.data.oauth.KickOAuthService
+import com.chatterbro.data.remote.ChannelChatEmoteService
 import com.chatterbro.data.remote.PlaywrightKickBridgeDataSource
 import com.chatterbro.data.repository.BridgeBackedKickRepository
 import com.chatterbro.domain.usecase.LoadChannelChatUseCase
@@ -43,6 +44,7 @@ fun Application.chatterbroModule() {
     val repository = BridgeBackedKickRepository(remoteDataSource)
     val loadLiveFollowedChannels = LoadLiveFollowedChannelsUseCase(repository)
     val loadChannelChat = LoadChannelChatUseCase(repository)
+    val channelChatEmoteService = ChannelChatEmoteService()
     val frontendDistDirectory = rootDirectory.resolve("frontend").resolve("dist").toFile()
     val frontendAssetsDirectory = frontendDistDirectory.resolve("assets")
     val frontendIndexFile = frontendDistDirectory.resolve("index.html")
@@ -69,6 +71,10 @@ fun Application.chatterbroModule() {
         route("/api") {
             get("/health") {
                 call.respond(mapOf("status" to "ok"))
+            }
+
+            get("/chat/emotes/global") {
+                call.respond(channelChatEmoteService.getGlobalEmotes())
             }
 
             get("/bridge/status") {
@@ -138,6 +144,26 @@ fun Application.chatterbroModule() {
                         ErrorResponse(message),
                     )
                 }
+            }
+
+            get("/chat/{channelSlug}/emotes") {
+                val channelSlug = call.parameters["channelSlug"]?.trim().orEmpty()
+                if (channelSlug.isBlank()) {
+                    call.respond(HttpStatusCode.BadRequest, ErrorResponse("Channel slug is required."))
+                    return@get
+                }
+
+                val rawChannelUserId = call.request.queryParameters["channelUserId"]?.trim()
+                val channelUserId = rawChannelUserId
+                    ?.takeIf { it.isNotBlank() }
+                    ?.toLongOrNull()
+
+                if (!rawChannelUserId.isNullOrBlank() && channelUserId == null) {
+                    call.respond(HttpStatusCode.BadRequest, ErrorResponse("Channel user id must be a number."))
+                    return@get
+                }
+
+                call.respond(channelChatEmoteService.getChannelEmotes(channelSlug, channelUserId))
             }
 
             get("/chat/{channelSlug}") {
