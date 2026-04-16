@@ -1,16 +1,25 @@
 # Chatterbro
 
-React frontend with a local Kotlin backend for managing Kick session bridging and live following data.
+Chatterbro is a local dashboard for viewing live followed Kick channels through a React frontend, a Kotlin/Ktor backend, and a browser-backed Kick bridge.
+
+## What It Does
+
+- Opens a real Kick login flow in Chrome or Edge.
+- Captures and persists the authenticated Kick session locally.
+- Shows the connected Kick profile in the UI while the token is valid.
+- Loads live followed channels without asking for a username.
+- Uses a background browser context for Kick API calls that are blocked from plain backend HTTP.
 
 ## Stack
 
-- Kotlin 2.3.20 backend
-- Ktor 3.4.2 local API server
-- React 19 + Vite 8 frontend
-- Playwright 1.59.1 bridge attached to a local Chrome or Edge session
+- Kotlin 2.3.20
+- Ktor 3.4.2
+- React 19
+- Vite 8
+- Playwright 1.59.1
 - Gradle wrapper 9.4.1
 
-## Structure
+## Project Layout
 
 .
 |- bridge/
@@ -30,26 +39,48 @@ React frontend with a local Kotlin backend for managing Kick session bridging an
 |- package.json
 `- settings.gradle.kts
 
-## Run
+## Prerequisites
 
-1. `npm install`
-2. Ensure Google Chrome or Microsoft Edge is installed locally.
-3. `npm --prefix frontend install`
-4. `./gradlew.bat run`
-5. `npm --prefix frontend run dev`
+- Windows with PowerShell
+- Java 17+
+- Node.js 20+
+- Google Chrome or Microsoft Edge installed locally
 
-The backend runs on `http://localhost:8080` and the Vite frontend runs on `http://localhost:5173`.
+## Local Development
 
-## Production-style preview
+1. Install root dependencies with `npm install`.
+2. Install frontend dependencies with `npm --prefix frontend install`.
+3. Start the backend with `./gradlew.bat run`.
+4. In a second terminal, start the frontend with `npm --prefix frontend run dev`.
+5. Open `http://localhost:5173`.
 
-1. `npm --prefix frontend run build`
-2. `./gradlew.bat run`
+The backend listens on `http://localhost:8080` and the Vite frontend listens on `http://localhost:5173`.
 
-When `frontend/dist` exists, the Kotlin backend serves the built React app directly.
+## Production-Style Preview
+
+1. Build the frontend with `npm --prefix frontend run build`.
+2. Start the backend with `./gradlew.bat run`.
+3. Open `http://localhost:8080`.
+
+When `frontend/dist` exists, Ktor serves the built React app directly.
+
+## Kick Session Flow
+
+1. Click the connect button in the UI.
+2. Sign in through the Kick window opened in a real local browser profile.
+3. Let the bridge capture the session token, expiry, and profile.
+4. Reload live followed channels through the saved authenticated session.
+
+Session and browser artifacts are kept under `bridge/session/` and `bridge/browser-profile-cdp/`, and are intentionally ignored by git.
+
+## API Overview
+
+- `GET /api/bridge/status` returns bridge state, token status, expiry, and connected profile.
+- `POST /api/bridge/start` starts the login bridge.
+- `GET /api/following/live` returns the authenticated account's live followed channels.
 
 ## Notes
 
-The Kick login bridge prefers a normal local Chrome or Edge process over Playwright's bundled Chromium because Kick can block the bundled browser immediately.
-The bridge now uses `bridge/browser-profile-cdp` for its browser profile so it does not reuse the older Playwright Chromium profile.
+Kick blocks some plain server-side requests even with a valid captured token, so the project deliberately performs authenticated follow queries from a background browser context.
 
-See `docs/kick-integration.md` for the bridge strategy and `docs/mvp-commit-plan.md` for the branch and commit plan.
+See `docs/kick-integration.md` for the bridge strategy and `docs/mvp-commit-plan.md` for the implementation plan.
