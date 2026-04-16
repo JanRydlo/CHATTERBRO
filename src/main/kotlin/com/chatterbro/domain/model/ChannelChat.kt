@@ -6,6 +6,7 @@ import kotlinx.serialization.Serializable
 data class ChannelChat(
     val channelSlug: String,
     val channelId: Long? = null,
+    val chatroomId: Long? = null,
     val displayName: String,
     val channelUrl: String,
     val avatarUrl: String? = null,

@@ -4,6 +4,15 @@ plugins {
     kotlin("plugin.serialization") version "2.3.20"
 }
 
+val frontendDirectory = rootDir.resolve("frontend")
+val frontendSourceDirectory = frontendDirectory.resolve("src")
+val frontendDistDirectory = frontendDirectory.resolve("dist")
+val npmExecutable = if (System.getProperty("os.name").startsWith("Windows", ignoreCase = true)) {
+    "npm.cmd"
+} else {
+    "npm"
+}
+
 group = "com.chatterbro"
 version = "0.1.0-SNAPSHOT"
 
@@ -39,7 +48,27 @@ tasks.test {
     useJUnitPlatform()
 }
 
+val buildFrontend by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Builds the React frontend bundle served by Ktor."
+    workingDir = rootDir
+    commandLine(npmExecutable, "--prefix", "frontend", "run", "build")
+
+    inputs.dir(frontendSourceDirectory)
+    inputs.file(frontendDirectory.resolve("package.json"))
+    inputs.file(frontendDirectory.resolve("package-lock.json"))
+    inputs.file(frontendDirectory.resolve("tsconfig.json"))
+    inputs.file(frontendDirectory.resolve("tsconfig.node.json"))
+    inputs.file(frontendDirectory.resolve("vite.config.ts"))
+    outputs.dir(frontendDistDirectory)
+
+    onlyIf {
+        frontendDirectory.exists()
+    }
+}
+
 tasks.named<JavaExec>("run") {
+    dependsOn(buildFrontend)
     workingDir = rootDir
 }
 

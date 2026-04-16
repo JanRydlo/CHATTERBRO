@@ -148,6 +148,14 @@ input {
   margin-bottom: 18px;
 }
 
+.chat-panel-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
 .panel-header h2,
 .channel-card h3 {
   margin: 0;

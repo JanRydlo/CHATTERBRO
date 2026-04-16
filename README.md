@@ -77,6 +77,7 @@ The backend listens on `http://localhost:8080` and the Vite frontend listens on 
 3. Open `http://localhost:8080`.
 
 When `frontend/dist` exists, Ktor serves the built React app directly.
+The Gradle `run` task now rebuilds the frontend bundle first, so backend preview runs do not accidentally serve an outdated `frontend/dist`.
 
 ## Kick Session Flow
 
