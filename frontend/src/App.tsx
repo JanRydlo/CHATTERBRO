@@ -648,6 +648,7 @@ export default function App() {
   const [requiresBrowserReconnect, setRequiresBrowserReconnect] = useState(false);
   const [lastLoadedUsername, setLastLoadedUsername] = useState('');
   const [chatDraft, setChatDraft] = useState('');
+  const chatFeedRef = useRef<HTMLDivElement | null>(null);
   const openChatRefreshInFlightRef = useRef(false);
   const emoteRequestsInFlightRef = useRef(new Set<string>());
 
@@ -745,6 +746,8 @@ export default function App() {
     ...globalEmoteIndex,
     ...(activeChannelEmoteIndex ?? {})
   };
+  const displayedChatMessages = channelChat ? [...channelChat.messages].reverse() : [];
+  const newestVisibleMessageId = displayedChatMessages[0]?.id ?? null;
   const activeChatroomId = channelChat?.chatroomId ?? null;
   const activeChannelId = channelChat?.channelId ?? null;
   const canSendSelectedChannelChat = Boolean(
@@ -1047,6 +1050,18 @@ export default function App() {
       window.clearTimeout(timeoutId);
     };
   }, [browserChatEnabled, hasOpenChat, isAuthenticated, isLoadingChat, liveChatState, selectedChannelSlug]);
+
+  useEffect(() => {
+    const feedElement = chatFeedRef.current;
+    if (!feedElement || !newestVisibleMessageId) {
+      return;
+    }
+
+    feedElement.scrollTo({
+      top: 0,
+      behavior: 'smooth'
+    });
+  }, [newestVisibleMessageId]);
 
   function handleReconnectOAuth() {
     window.location.assign(getOAuthLoginUrl());
@@ -1885,8 +1900,8 @@ export default function App() {
                   <span>{tokenOnlyMode ? browserChatEnabled ? 'If the realtime websocket is connected, new messages will still appear here automatically.' : 'Finish the Kick browser sync first. After that, Chatterbro can load chat history and switch into realtime updates.' : 'Kick may have an empty history for this channel right now. If the live websocket is connected, new messages will still appear here automatically.'}</span>
                 </div>
               ) : (
-                <div className="chat-feed">
-                  {channelChat.messages.map((message) => renderChatMessage(message))}
+                <div className="chat-feed" ref={chatFeedRef}>
+                  {displayedChatMessages.map((message) => renderChatMessage(message))}
                 </div>
               )
             ) : null}
