@@ -21,25 +21,39 @@ class KickBridgeStatusStore(
     }
 
     fun readStatus(): KickBridgeStatus {
+        val now = Instant.now()
         val oauthSession = readOAuthSession()
         val browserSession = readBrowserSession()
+        val storedStatus = readStoredStatus()
+        val validOAuthSession = oauthSession?.takeIf { !it.isExpired(now) }
+        val validBrowserSession = browserSession?.takeIf { !it.isExpired(now) }
+        val hasValidBrowserSession = validBrowserSession != null
+
         val activeSession = when {
-            oauthSession != null && !oauthSession.isExpired() -> ActiveSession(
-                expiresAt = oauthSession.expiresAt,
-                profile = oauthSession.profile,
+            validOAuthSession != null -> ActiveSession(
+                expiresAt = validOAuthSession.expiresAt,
+                profile = validOAuthSession.profile,
                 authMode = KickAuthMode.OAUTH,
+                grantedScopes = validOAuthSession.grantedScopes(),
             )
-            browserSession != null && !browserSession.isExpired() -> ActiveSession(
-                expiresAt = browserSession.expiresAt,
-                profile = browserSession.profile,
+
+            validBrowserSession != null -> ActiveSession(
+                expiresAt = validBrowserSession.expiresAt,
+                profile = validBrowserSession.profile,
                 authMode = KickAuthMode.BROWSER_SESSION,
+                grantedScopes = emptyList(),
             )
+
             else -> null
         }
-        val hasValidBrowserSession = browserSession != null && !browserSession.isExpired()
-        val storedStatus = readStoredStatus()
 
-        if (storedStatus != null && (storedStatus.state == BridgeState.RUNNING || storedStatus.state == BridgeState.ERROR)) {
+        if (storedStatus?.state == BridgeState.RUNNING || storedStatus?.state == BridgeState.ERROR) {
+            if (storedStatus.state == BridgeState.RUNNING && activeSession == null && !hasValidBrowserSession) {
+                val resetStatus = defaultStatus()
+                writeStatus(resetStatus)
+                return resetStatus
+            }
+
             return storedStatus.copy(
                 hasToken = activeSession != null,
                 isAuthenticated = activeSession != null,
@@ -48,18 +62,23 @@ class KickBridgeStatusStore(
                 oauthEnabled = oauthEnabled,
                 hasBrowserSession = hasValidBrowserSession,
                 authMode = activeSession?.authMode ?: KickAuthMode.NONE,
+                grantedScopes = activeSession?.grantedScopes.orEmpty(),
             )
         }
 
         if (activeSession != null) {
             return KickBridgeStatus(
                 state = BridgeState.READY,
-                message = storedStatus?.message?.takeIf {
-                    storedStatus.state == BridgeState.READY && it.isNotBlank()
-                } ?: if (activeSession.authMode == KickAuthMode.OAUTH && !hasValidBrowserSession) {
-                    "Connected as ${activeSession.profile.username} via Kick OAuth. Followings and chat still need a one-time website session sync."
-                } else {
-                    "Connected as ${activeSession.profile.username}."
+                message = when {
+                    storedStatus?.state == BridgeState.READY && storedStatus.message.isNotBlank() -> storedStatus.message
+                    activeSession.authMode == KickAuthMode.OAUTH && hasValidBrowserSession ->
+                        "Connected as ${activeSession.profile.username} via Kick OAuth. Browser sync is ready for live chat."
+
+                    activeSession.authMode == KickAuthMode.OAUTH ->
+                        "Connected as ${activeSession.profile.username} via Kick OAuth."
+
+                    else ->
+                        "Connected as ${activeSession.profile.username} via Kick browser session."
                 },
                 hasToken = true,
                 isAuthenticated = true,
@@ -68,10 +87,11 @@ class KickBridgeStatusStore(
                 oauthEnabled = oauthEnabled,
                 hasBrowserSession = hasValidBrowserSession,
                 authMode = activeSession.authMode,
+                grantedScopes = activeSession.grantedScopes,
             )
         }
 
-        if (oauthSession?.isExpired(Instant.now()) == true) {
+        if (oauthSession?.isExpired(now) == true) {
             return KickBridgeStatus(
                 state = BridgeState.IDLE,
                 message = "Kick OAuth token expired. Connect again.",
@@ -82,13 +102,13 @@ class KickBridgeStatusStore(
             )
         }
 
-        if (browserSession?.isExpired(Instant.now()) == true) {
+        if (browserSession?.isExpired(now) == true) {
             return KickBridgeStatus(
                 state = BridgeState.IDLE,
                 message = if (oauthEnabled) {
-                    "Kick website session expired. Followings and chat need a new browser sync."
+                    "Kick browser sync expired. Reconnect it to restore live chat."
                 } else {
-                    "Kick token expired. Sign in again."
+                    "Kick browser session expired. Connect again."
                 },
                 hasToken = false,
                 isAuthenticated = false,
@@ -139,7 +159,7 @@ class KickBridgeStatusStore(
             message = if (oauthEnabled) {
                 "Kick OAuth has not been started yet."
             } else {
-                "Kick bridge has not been started yet."
+                "Kick OAuth is not configured. Set KICK_CLIENT_ID, KICK_CLIENT_SECRET, and KICK_REDIRECT_URI."
             },
             hasToken = false,
             isAuthenticated = false,
@@ -152,5 +172,6 @@ class KickBridgeStatusStore(
         val expiresAt: String?,
         val profile: KickBridgeProfile,
         val authMode: KickAuthMode,
+        val grantedScopes: List<String>,
     )
 }

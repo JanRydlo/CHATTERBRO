@@ -1,11 +1,11 @@
 import Pusher, { type Options as PusherOptions } from 'pusher-js';
 import { Fragment, type ReactNode, startTransition, useEffect, useEffectEvent, useRef, useState } from 'react';
-import { fetchChannelChat, fetchChannelChatEmotes, fetchGlobalChatEmotes, fetchLiveFollowedChannels, getBridgeStatus, getOAuthLoginUrl, startBridge } from './api';
+import { fetchChannelChat, fetchChannelChatEmotes, fetchGlobalChatEmotes, fetchLiveFollowedChannels, fetchTrackedChannels, getBridgeStatus, getOAuthLoginUrl, sendChannelChatMessage, startBridge } from './api';
 import type { ChannelChat, ChannelChatBadge, ChannelChatEmote, ChannelChatEmoteCatalog, ChannelChatMessage, FollowedChannel, KickBridgeStatus } from './types';
 
 const FALLBACK_STATUS: KickBridgeStatus = {
   state: 'IDLE',
-  message: 'Kick bridge has not been started yet.',
+  message: 'Kick OAuth has not been started yet.',
   hasToken: false,
   isAuthenticated: false,
   tokenExpiresAt: null,
@@ -13,6 +13,7 @@ const FALLBACK_STATUS: KickBridgeStatus = {
   oauthEnabled: false,
   hasBrowserSession: false,
   authMode: 'NONE',
+  grantedScopes: [],
   updatedAt: new Date(0).toISOString()
 };
 
@@ -39,6 +40,11 @@ const KICK_PUSHER_OPTIONS: PusherOptions = {
 const INVISIBLE_EXTERNAL_EMOTE_PATTERN = /[\u200B-\u200D\uFEFF\u00AD\u{E0000}-\u{E007F}]/gu;
 const KICK_PLACEHOLDER_PATTERN = /\[emote:(\d+):([^\]]+)\]/g;
 const KICK_PLACEHOLDER_DETECTION_PATTERN = /\[emote:\d+:[^\]]+\]/;
+const BROWSER_RECONNECT_REQUIRED_PATTERN = /reconnect kick browser|browser sync is not running/i;
+const TOKEN_ONLY_ACTIVITY_MESSAGE = 'Kick OAuth is connected. Token-only mode is active. No Kick browser will be kept running in the background.';
+const TOKEN_ONLY_FOLLOWINGS_MESSAGE = 'Live followings are not available through Kick Public API in OAuth-only mode.';
+const TOKEN_ONLY_CHAT_MESSAGE = 'Chat history is not available through Kick Public API in OAuth-only mode.';
+const TRACKED_CHANNELS_STORAGE_KEY = 'chatterbro:tracked-channel-slugs';
 
 interface RealtimeChatTarget {
   channelId: number | null;
@@ -62,6 +68,82 @@ function getChannelEmoteCacheKey(channelSlug: string, channelUserId: number | nu
 
 function normalizeExternalEmoteCode(value: string) {
   return value.replace(INVISIBLE_EXTERNAL_EMOTE_PATTERN, '');
+}
+
+function isBrowserReconnectRequiredMessage(value: string | null | undefined) {
+  return Boolean(value && BROWSER_RECONNECT_REQUIRED_PATTERN.test(value));
+}
+
+function parseTrackedChannelSlugs(value: string) {
+  return [...new Set(
+    value
+      .split(/[\s,]+/)
+      .map((entry) => entry.trim().toLowerCase())
+      .filter((entry) => entry.length > 0)
+  )];
+}
+
+function serializeTrackedChannelSlugs(channelSlugs: string[]) {
+  return channelSlugs.join(', ');
+}
+
+function buildTokenOnlyChatShell(channel: FollowedChannel): ChannelChat {
+  return {
+    channelSlug: channel.channelSlug,
+    channelId: channel.channelId,
+    channelUserId: channel.broadcasterUserId,
+    chatroomId: null,
+    displayName: channel.displayName,
+    channelUrl: channel.channelUrl,
+    avatarUrl: channel.thumbnailUrl,
+    cursor: null,
+    messages: [],
+    pinnedMessage: null,
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function appendLocalChatMessage(currentChat: ChannelChat | null, nextMessage: ChannelChatMessage) {
+  if (!currentChat) {
+    return currentChat;
+  }
+
+  if (currentChat.messages.some((message) => message.id === nextMessage.id)) {
+    return currentChat;
+  }
+
+  const nextMessages = currentChat.messages.length >= 200
+    ? [...currentChat.messages.slice(-199), nextMessage]
+    : [...currentChat.messages, nextMessage];
+
+  return {
+    ...currentChat,
+    messages: nextMessages,
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function sortTrackedChannels(channels: FollowedChannel[], trackedChannelSlugs: string[]) {
+  const trackedOrder = new Map(trackedChannelSlugs.map((channelSlug, index) => [channelSlug, index]));
+
+  return [...channels].sort((left, right) => {
+    if (left.isLive !== right.isLive) {
+      return left.isLive ? -1 : 1;
+    }
+
+    const viewerDelta = (right.viewerCount ?? -1) - (left.viewerCount ?? -1);
+    if (viewerDelta !== 0) {
+      return viewerDelta;
+    }
+
+    const trackedDelta = (trackedOrder.get(left.channelSlug) ?? Number.MAX_SAFE_INTEGER)
+      - (trackedOrder.get(right.channelSlug) ?? Number.MAX_SAFE_INTEGER);
+    if (trackedDelta !== 0) {
+      return trackedDelta;
+    }
+
+    return left.displayName.localeCompare(right.displayName, undefined, { sensitivity: 'base' });
+  });
 }
 
 function parseSerializedBadge(value: string): ChannelChatBadge | null {
@@ -547,6 +629,8 @@ function mergeChannelChat(currentChat: ChannelChat | null, nextChat: ChannelChat
 export default function App() {
   const [bridgeStatus, setBridgeStatus] = useState<KickBridgeStatus>(FALLBACK_STATUS);
   const [channels, setChannels] = useState<FollowedChannel[]>([]);
+  const [trackedChannelSlugs, setTrackedChannelSlugs] = useState<string[]>([]);
+  const [trackedChannelDraft, setTrackedChannelDraft] = useState('');
   const [selectedChannel, setSelectedChannel] = useState<FollowedChannel | null>(null);
   const [channelChat, setChannelChat] = useState<ChannelChat | null>(null);
   const [globalEmoteIndex, setGlobalEmoteIndex] = useState<Record<string, ChannelChatEmote>>({});
@@ -554,12 +638,16 @@ export default function App() {
   const [isStartingBridge, setIsStartingBridge] = useState(false);
   const [isLoadingChannels, setIsLoadingChannels] = useState(false);
   const [isLoadingChat, setIsLoadingChat] = useState(false);
+  const [isSendingChat, setIsSendingChat] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [chatError, setChatError] = useState<string | null>(null);
+  const [sendChatError, setSendChatError] = useState<string | null>(null);
   const [liveChatState, setLiveChatState] = useState<LiveChatState>('idle');
   const [liveChatError, setLiveChatError] = useState<string | null>(null);
-  const [activity, setActivity] = useState('Bridge session is idle. Connect Kick once and the app will keep using the saved session until it expires.');
+  const [activity, setActivity] = useState('Kick token mode is idle. Connect Kick once and the app will keep using the saved token until it expires.');
+  const [requiresBrowserReconnect, setRequiresBrowserReconnect] = useState(false);
   const [lastLoadedUsername, setLastLoadedUsername] = useState('');
+  const [chatDraft, setChatDraft] = useState('');
   const openChatRefreshInFlightRef = useRef(false);
   const emoteRequestsInFlightRef = useRef(new Set<string>());
 
@@ -570,8 +658,13 @@ export default function App() {
     const params = new URLSearchParams(window.location.search);
     const authResult = params.get('auth');
     const authMessage = params.get('message');
+    const storedTrackedChannels = window.localStorage.getItem(TRACKED_CHANNELS_STORAGE_KEY);
+    if (storedTrackedChannels) {
+      setTrackedChannelSlugs(parseTrackedChannelSlugs(storedTrackedChannels));
+    }
+
     if (authResult === 'success') {
-      setActivity(authMessage || 'Kick OAuth connected successfully. Load followings when you are ready.');
+      setActivity(authMessage || TOKEN_ONLY_ACTIVITY_MESSAGE);
       params.delete('auth');
       params.delete('message');
       const nextQuery = params.toString();
@@ -594,6 +687,15 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (trackedChannelSlugs.length === 0) {
+      window.localStorage.removeItem(TRACKED_CHANNELS_STORAGE_KEY);
+      return;
+    }
+
+    window.localStorage.setItem(TRACKED_CHANNELS_STORAGE_KEY, serializeTrackedChannelSlugs(trackedChannelSlugs));
+  }, [trackedChannelSlugs]);
+
   async function preloadGlobalEmotes() {
     try {
       const catalog = await fetchGlobalChatEmotes();
@@ -607,19 +709,32 @@ export default function App() {
 
   const isAuthenticated = bridgeStatus.isAuthenticated && Boolean(bridgeStatus.profile);
   const profile = bridgeStatus.profile;
-  const liveCountLabel = !lastLoadedUsername
-    ? isAuthenticated && profile
-      ? `No live followings loaded for ${profile.username} yet.`
-      : 'Sign in to load your live followings.'
-    : channels.length === 0
-      ? `No live followings found for ${lastLoadedUsername}.`
-      : `${channels.length} live followings found for ${lastLoadedUsername}.`;
+  const tokenOnlyMode = true;
+  const browserChatEnabled = bridgeStatus.hasBrowserSession;
+  const hasChatWriteScope = bridgeStatus.grantedScopes.includes('chat:write');
+  const liveTrackedChannelsCount = channels.filter((channel) => channel.isLive).length;
+  const liveCountLabel = tokenOnlyMode
+    ? !isAuthenticated || !profile
+      ? 'Sign in to activate Kick token-only mode.'
+      : trackedChannelSlugs.length === 0
+        ? 'Add tracked channel slugs to load live channels without any background browser.'
+        : liveTrackedChannelsCount === 0
+          ? `No tracked channels are live right now across ${trackedChannelSlugs.length} saved slug${trackedChannelSlugs.length === 1 ? '' : 's'}.`
+          : `${liveTrackedChannelsCount} tracked channel${liveTrackedChannelsCount === 1 ? '' : 's'} are live right now.`
+    : !lastLoadedUsername
+      ? isAuthenticated && profile
+        ? `No live followings loaded for ${profile.username} yet.`
+        : 'Sign in to load your live followings.'
+      : channels.length === 0
+        ? `No live followings found for ${lastLoadedUsername}.`
+        : `${channels.length} live followings found for ${lastLoadedUsername}.`;
   const sessionExpiryLabel = bridgeStatus.tokenExpiresAt
     ? new Date(bridgeStatus.tokenExpiresAt).toLocaleString()
     : 'No Kick token stored';
   const selectedChannelSlug = selectedChannel?.channelSlug || null;
   const hasOpenChat = channelChat?.channelSlug === selectedChannelSlug;
-  const needsBrowserSync = bridgeStatus.oauthEnabled && isAuthenticated && !bridgeStatus.hasBrowserSession;
+  const needsBrowserSync = bridgeStatus.oauthEnabled && isAuthenticated && !browserChatEnabled;
+  const showReconnectBrowserAction = isAuthenticated && requiresBrowserReconnect;
   const activeEmoteCacheKey = channelChat
     ? getChannelEmoteCacheKey(channelChat.channelSlug, channelChat.channelUserId)
     : null;
@@ -632,6 +747,11 @@ export default function App() {
   };
   const activeChatroomId = channelChat?.chatroomId ?? null;
   const activeChannelId = channelChat?.channelId ?? null;
+  const canSendSelectedChannelChat = Boolean(
+    selectedChannel?.isLive &&
+    selectedChannel.channelSlug === channelChat?.channelSlug &&
+    channelChat?.channelUserId !== null,
+  );
   const liveChatStatusLabel = liveChatState === 'live'
     ? 'Live'
     : liveChatState === 'connecting'
@@ -648,6 +768,34 @@ export default function App() {
         : 'status-idle';
 
   useEffect(() => {
+    if (!tokenOnlyMode || !isAuthenticated || trackedChannelSlugs.length === 0) {
+      return;
+    }
+
+    void loadTrackedChannels({ silent: channels.length > 0 });
+  }, [channels.length, isAuthenticated, tokenOnlyMode, trackedChannelSlugs]);
+
+  useEffect(() => {
+    if (!tokenOnlyMode || !isAuthenticated || trackedChannelSlugs.length === 0) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      void loadTrackedChannels({ silent: true });
+    }, 30000);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [isAuthenticated, tokenOnlyMode, trackedChannelSlugs]);
+
+  useEffect(() => {
+    setRequiresBrowserReconnect(
+      isBrowserReconnectRequiredMessage(bridgeStatus.message)
+    );
+  }, [bridgeStatus.message]);
+
+  useEffect(() => {
     if (isAuthenticated) {
       return;
     }
@@ -655,11 +803,58 @@ export default function App() {
     setSelectedChannel(null);
     setChannelChat(null);
     setChatError(null);
+    setSendChatError(null);
     setLiveChatState('idle');
     setLiveChatError(null);
+    setChatDraft('');
   }, [isAuthenticated]);
 
   useEffect(() => {
+    if (!selectedChannelSlug) {
+      return;
+    }
+
+    const nextSelectedChannel = channels.find((channel) => channel.channelSlug === selectedChannelSlug) ?? null;
+    if (!nextSelectedChannel) {
+      setSelectedChannel(null);
+      setChannelChat(null);
+      setChatError(null);
+      setSendChatError(null);
+      setLiveChatState('idle');
+      setLiveChatError(null);
+      return;
+    }
+
+    if (nextSelectedChannel !== selectedChannel) {
+      startTransition(() => {
+        setSelectedChannel(nextSelectedChannel);
+      });
+    }
+
+    if (!channelChat || channelChat.channelSlug !== nextSelectedChannel.channelSlug) {
+      return;
+    }
+
+    startTransition(() => {
+      setChannelChat((currentChat) => currentChat && currentChat.channelSlug === nextSelectedChannel.channelSlug
+        ? {
+            ...currentChat,
+            channelId: nextSelectedChannel.channelId ?? currentChat.channelId,
+            channelUserId: nextSelectedChannel.broadcasterUserId ?? currentChat.channelUserId,
+            displayName: nextSelectedChannel.displayName,
+            channelUrl: nextSelectedChannel.channelUrl,
+            avatarUrl: nextSelectedChannel.thumbnailUrl ?? currentChat.avatarUrl
+          }
+        : currentChat);
+    });
+  }, [channelChat, channels, selectedChannel, selectedChannelSlug]);
+
+  useEffect(() => {
+    if (!browserChatEnabled) {
+      setLiveChatState('idle');
+      return;
+    }
+
     if (!channelChat || (activeChatroomId === null && activeChannelId === null)) {
       setLiveChatState('idle');
       setLiveChatError(null);
@@ -764,7 +959,7 @@ export default function App() {
       pusher.connection.unbind('error', handleConnectionError);
       pusher.disconnect();
     };
-  }, [activeChannelId, activeChatroomId, channelChat?.displayName]);
+  }, [activeChannelId, activeChatroomId, browserChatEnabled, channelChat?.displayName]);
 
   useEffect(() => {
     if (!channelChat?.channelSlug) {
@@ -803,7 +998,7 @@ export default function App() {
   }, [channelChat?.channelSlug, channelChat?.channelUserId, channelEmoteCache]);
 
   const refreshOpenChat = useEffectEvent(async () => {
-    if (!isAuthenticated || !selectedChannelSlug || !hasOpenChat || isLoadingChat || openChatRefreshInFlightRef.current) {
+    if (!browserChatEnabled || !isAuthenticated || !selectedChannelSlug || !hasOpenChat || isLoadingChat || openChatRefreshInFlightRef.current) {
       return;
     }
 
@@ -827,7 +1022,7 @@ export default function App() {
   });
 
   useEffect(() => {
-    if (!isAuthenticated || !selectedChannelSlug || !hasOpenChat || isLoadingChat) {
+    if (!browserChatEnabled || !isAuthenticated || !selectedChannelSlug || !hasOpenChat || isLoadingChat) {
       return;
     }
 
@@ -851,7 +1046,11 @@ export default function App() {
       isDisposed = true;
       window.clearTimeout(timeoutId);
     };
-  }, [hasOpenChat, isAuthenticated, isLoadingChat, liveChatState, selectedChannelSlug]);
+  }, [browserChatEnabled, hasOpenChat, isAuthenticated, isLoadingChat, liveChatState, selectedChannelSlug]);
+
+  function handleReconnectOAuth() {
+    window.location.assign(getOAuthLoginUrl());
+  }
 
   async function refreshBridgeStatus() {
     try {
@@ -865,9 +1064,9 @@ export default function App() {
     }
   }
 
-  async function handleStartBridge() {
-    if (bridgeStatus.oauthEnabled) {
-      window.location.assign(getOAuthLoginUrl());
+  async function handleStartBridge(forceReconnect = false) {
+    if (!isAuthenticated) {
+      handleReconnectOAuth();
       return;
     }
 
@@ -875,10 +1074,16 @@ export default function App() {
     setError(null);
 
     try {
-      const nextStatus = await startBridge();
+      const nextStatus = await startBridge(forceReconnect);
       startTransition(() => {
         setBridgeStatus(nextStatus);
-        setActivity('The Kick login browser was opened. Finish login there. As soon as Kick session data is captured, your profile will appear here.');
+        setActivity(
+          forceReconnect
+            ? nextStatus.state === 'READY'
+              ? 'Kick browser session is already connected. Retry followings or chat.'
+              : 'The Kick browser reconnect window was opened. Keep it open, then retry followings or chat.'
+            : 'The Kick browser sync window was opened. Finish the website login there, keep that browser open, then retry chat.'
+        );
       });
     } catch (caughtError) {
       setError(caughtError instanceof Error ? caughtError.message : 'Failed to start the Kick login bridge.');
@@ -913,9 +1118,104 @@ export default function App() {
     }
   }
 
+  function handleAddTrackedChannels() {
+    const nextTrackedChannelSlugs = parseTrackedChannelSlugs(trackedChannelDraft);
+    if (nextTrackedChannelSlugs.length === 0) {
+      return;
+    }
+
+    startTransition(() => {
+      setTrackedChannelSlugs((currentTrackedChannelSlugs) => [...new Set([...currentTrackedChannelSlugs, ...nextTrackedChannelSlugs])]);
+      setTrackedChannelDraft('');
+      setError(null);
+      setActivity(
+        nextTrackedChannelSlugs.length === 1
+          ? `Added ${nextTrackedChannelSlugs[0]} to your local Kick watchlist.`
+          : `Added ${nextTrackedChannelSlugs.length} channel slugs to your local Kick watchlist.`
+      );
+    });
+  }
+
+  function handleRemoveTrackedChannel(channelSlug: string) {
+    startTransition(() => {
+      setTrackedChannelSlugs((currentTrackedChannelSlugs) => currentTrackedChannelSlugs.filter((entry) => entry !== channelSlug));
+      setChannels((currentChannels) => currentChannels.filter((channel) => channel.channelSlug !== channelSlug));
+      setActivity(`Removed ${channelSlug} from your local Kick watchlist.`);
+    });
+
+    if (selectedChannel?.channelSlug === channelSlug) {
+      setSelectedChannel(null);
+      setChannelChat(null);
+      setChatError(null);
+      setSendChatError(null);
+      setLiveChatState('idle');
+      setLiveChatError(null);
+      setChatDraft('');
+    }
+  }
+
+  async function loadTrackedChannels(options: { silent?: boolean } = {}) {
+    const { silent = false } = options;
+
+    if (!isAuthenticated || !profile) {
+      if (!silent) {
+        setError('Connect Kick first so the app can use your saved session.');
+      }
+
+      return;
+    }
+
+    if (trackedChannelSlugs.length === 0) {
+      if (!silent) {
+        setError('Add at least one channel slug to the tracked channels list first.');
+        setActivity('Kick OAuth is connected. Add channel slugs like xqc, shroud, or your own favorites to build a local watchlist without any browser sync.');
+        setChannels([]);
+      }
+
+      return;
+    }
+
+    if (!silent) {
+      setIsLoadingChannels(true);
+      setError(null);
+    }
+
+    try {
+      const loadedChannels = sortTrackedChannels(await fetchTrackedChannels(trackedChannelSlugs), trackedChannelSlugs);
+      const nextLiveTrackedChannelsCount = loadedChannels.filter((channel) => channel.isLive).length;
+
+      startTransition(() => {
+        setChannels(loadedChannels);
+        setLastLoadedUsername(profile.username);
+
+        if (!silent) {
+          setActivity(
+            nextLiveTrackedChannelsCount === 0
+              ? `None of your ${trackedChannelSlugs.length} tracked channels are live right now.`
+              : `Loaded ${nextLiveTrackedChannelsCount} live tracked channel${nextLiveTrackedChannelsCount === 1 ? '' : 's'} from your local watchlist.`
+          );
+        }
+      });
+    } catch (caughtError) {
+      if (!silent) {
+        const message = caughtError instanceof Error ? caughtError.message : 'Failed to load tracked channels.';
+        setError(message);
+      }
+    } finally {
+      if (!silent) {
+        setIsLoadingChannels(false);
+      }
+    }
+  }
+
   async function handleLoadChannels() {
     if (!isAuthenticated || !profile) {
       setError('Connect Kick first so the app can use your saved session.');
+      return;
+    }
+
+    if (tokenOnlyMode) {
+      await loadTrackedChannels();
       return;
     }
 
@@ -939,7 +1239,13 @@ export default function App() {
       });
       await refreshBridgeStatus();
     } catch (caughtError) {
-      setError(caughtError instanceof Error ? caughtError.message : 'Failed to load live followings.');
+      const message = caughtError instanceof Error ? caughtError.message : 'Failed to load live followings.';
+      setError(message);
+      if (isBrowserReconnectRequiredMessage(message)) {
+        setRequiresBrowserReconnect(true);
+        setActivity('Kick browser sync is offline. Click Reconnect Kick browser, leave that window open, then retry followings.');
+        await refreshBridgeStatus();
+      }
     } finally {
       setIsLoadingChannels(false);
     }
@@ -951,7 +1257,32 @@ export default function App() {
       return;
     }
 
-    if (!(await ensureBrowserSessionForWebsiteData('chat history'))) {
+    if (tokenOnlyMode && !channel.isLive) {
+      setSelectedChannel(channel);
+      setChannelChat(buildTokenOnlyChatShell(channel));
+      setChatDraft('');
+      setChatError(null);
+      setSendChatError(null);
+      setLiveChatState('idle');
+      setLiveChatError('This tracked channel is offline right now. The watchlist will refresh it automatically.');
+      setActivity(
+        `${channel.displayName} is offline right now. Chatterbro will keep refreshing the watchlist automatically.`
+      );
+      return;
+    }
+
+    if (tokenOnlyMode && !(await ensureBrowserSessionForWebsiteData('live chat'))) {
+      setSelectedChannel(channel);
+      setChannelChat(buildTokenOnlyChatShell(channel));
+      setChatDraft('');
+      setChatError(null);
+      setSendChatError(null);
+      setLiveChatState('idle');
+      setLiveChatError('Live chat needs the Kick browser sync. Finish that browser window, keep it open, then reopen chat.');
+      return;
+    }
+
+    if (!tokenOnlyMode && !(await ensureBrowserSessionForWebsiteData('chat history'))) {
       setSelectedChannel(channel);
       return;
     }
@@ -974,9 +1305,77 @@ export default function App() {
         );
       });
     } catch (caughtError) {
-      setChatError(caughtError instanceof Error ? caughtError.message : 'Failed to load the selected channel chat.');
+      const message = caughtError instanceof Error ? caughtError.message : 'Failed to load the selected channel chat.';
+      setChatError(message);
+      if (isBrowserReconnectRequiredMessage(message)) {
+        setRequiresBrowserReconnect(true);
+        setActivity('Kick browser sync is offline. Click Reconnect Kick browser, leave that window open, then retry chat.');
+        await refreshBridgeStatus();
+      }
     } finally {
       setIsLoadingChat(false);
+    }
+  }
+
+  async function handleSendChatMessage() {
+    if (!selectedChannel || !channelChat) {
+      setSendChatError('Open a tracked channel first.');
+      return;
+    }
+
+    if (!selectedChannel.isLive) {
+      setSendChatError('This tracked channel is offline right now.');
+      return;
+    }
+
+    if (!hasChatWriteScope) {
+      setSendChatError('Reconnect Kick with the chat:write scope before sending messages from Chatterbro.');
+      return;
+    }
+
+    const content = chatDraft.trim();
+    if (content.length === 0) {
+      setSendChatError('Enter a chat message before sending it.');
+      return;
+    }
+
+    if (channelChat.channelUserId === null) {
+      setSendChatError('Kick did not expose a broadcaster user id for this channel.');
+      return;
+    }
+
+    setIsSendingChat(true);
+    setSendChatError(null);
+
+    try {
+      const response = await sendChannelChatMessage(selectedChannel.channelSlug, {
+        content,
+        broadcasterUserId: channelChat.channelUserId
+      });
+      const optimisticMessage: ChannelChatMessage = {
+        id: response.messageId,
+        content,
+        type: 'message',
+        createdAt: new Date().toISOString(),
+        threadParentId: null,
+        sender: {
+          id: profile?.userId ?? null,
+          username: profile?.username || 'you',
+          slug: (profile?.username || 'you').toLowerCase(),
+          color: null,
+          badges: []
+        }
+      };
+
+      startTransition(() => {
+        setChannelChat((currentChat) => appendLocalChatMessage(currentChat, optimisticMessage));
+        setChatDraft('');
+        setActivity(`Sent a chat message to ${selectedChannel.displayName} through Kick's official API.`);
+      });
+    } catch (caughtError) {
+      setSendChatError(caughtError instanceof Error ? caughtError.message : 'Failed to send the chat message.');
+    } finally {
+      setIsSendingChat(false);
     }
   }
 
@@ -1034,9 +1433,11 @@ export default function App() {
       <section className="hero-panel">
         <div className="hero-copy">
           <p className="eyebrow">Chatterbro</p>
-          <h1>React dashboard for a browser-backed Kick bridge.</h1>
+          <h1>{tokenOnlyMode ? 'React dashboard for tracked channels and live Kick chat.' : 'React dashboard for a browser-backed Kick bridge.'}</h1>
           <p className="hero-description">
-            The UI stays in React. Kotlin runs the local API. Kick OAuth handles account connection first, while the browser bridge is only kept for the unsupported followings and chat-read flows.
+            {tokenOnlyMode
+              ? 'The UI stays in React. Kotlin runs the local API. Tracked channels load through Kick OAuth, while live chat uses an explicit Kick browser sync because Kick still does not expose chatroom ids publicly.'
+              : 'The UI stays in React. Kotlin runs the local API. Kick OAuth handles account connection first, while the browser bridge is only kept for the unsupported followings and chat-read flows.'}
           </p>
         </div>
 
@@ -1094,10 +1495,57 @@ export default function App() {
             </div>
           )}
 
+          {tokenOnlyMode ? (
+            <div className="tracked-channel-manager">
+              <label className="field-label">
+                Add tracked channels
+                <div className="tracked-channel-input-row">
+                  <input
+                    className="text-input"
+                    type="text"
+                    value={trackedChannelDraft}
+                    onChange={(event) => setTrackedChannelDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key !== 'Enter') {
+                        return;
+                      }
+
+                      event.preventDefault();
+                      handleAddTrackedChannels();
+                    }}
+                    placeholder="xqc, shroud, your-channel-slug"
+                    spellCheck={false}
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                  />
+                  <button className="secondary-button" type="button" onClick={handleAddTrackedChannels} disabled={trackedChannelDraft.trim().length === 0}>
+                    Add
+                  </button>
+                </div>
+              </label>
+
+              {trackedChannelSlugs.length > 0 ? (
+                <div className="tracked-chip-list">
+                  {trackedChannelSlugs.map((channelSlug) => (
+                    <button className="tracked-chip" key={channelSlug} type="button" onClick={() => handleRemoveTrackedChannel(channelSlug)} title={`Remove ${channelSlug}`}>
+                      <span>{channelSlug}</span>
+                      <span aria-hidden>×</span>
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <div className="message-strip subtle-strip compact-strip">
+                  <strong>Local watchlist</strong>
+                  <p>Save a few channel slugs here and Chatterbro will keep their live status refreshed locally.</p>
+                </div>
+              )}
+            </div>
+          ) : null}
+
           <div className="action-row">
             {!isAuthenticated ? (
-              <button className="primary-button" onClick={handleStartBridge} disabled={isStartingBridge || bridgeStatus.state === 'RUNNING'}>
-                {bridgeStatus.oauthEnabled
+              <button className="primary-button" onClick={handleReconnectOAuth} disabled={isStartingBridge || bridgeStatus.state === 'RUNNING'}>
+                {tokenOnlyMode
                   ? 'Connect Kick via OAuth'
                   : isStartingBridge
                     ? 'Opening Kick login...'
@@ -1108,18 +1556,38 @@ export default function App() {
             ) : needsBrowserSync ? (
               <button className="primary-button" onClick={startBrowserSessionSync} disabled={isStartingBridge || bridgeStatus.state === 'RUNNING'}>
                 {isStartingBridge
-                  ? 'Opening Kick browser sync...'
+                  ? tokenOnlyMode
+                    ? 'Opening live chat sync...'
+                    : 'Opening Kick browser sync...'
                   : bridgeStatus.state === 'RUNNING'
-                    ? 'Waiting for website session sync...'
-                    : 'Enable followings and chat sync'}
+                    ? tokenOnlyMode
+                      ? 'Waiting for live chat sync...'
+                      : 'Waiting for website session sync...'
+                    : tokenOnlyMode
+                      ? 'Enable live chat sync'
+                      : 'Enable followings and chat sync'}
+              </button>
+            ) : showReconnectBrowserAction ? (
+              <button className="primary-button" onClick={() => void handleStartBridge(true)} disabled={isStartingBridge || bridgeStatus.state === 'RUNNING'}>
+                {isStartingBridge
+                  ? 'Opening Kick browser reconnect...'
+                  : bridgeStatus.state === 'RUNNING'
+                    ? 'Waiting for Kick browser reconnect...'
+                    : 'Reconnect Kick browser'}
               </button>
             ) : null}
-            <button className="secondary-button" onClick={handleLoadChannels} disabled={isLoadingChannels || !isAuthenticated}>
-              {isLoadingChannels
-                ? 'Loading live followings...'
-                : needsBrowserSync
-                  ? 'Prepare followings sync'
-                  : 'Load live followings'}
+            <button className="secondary-button" onClick={handleLoadChannels} disabled={isLoadingChannels || !isAuthenticated || (tokenOnlyMode && trackedChannelSlugs.length === 0)}>
+              {tokenOnlyMode
+                ? isLoadingChannels
+                  ? 'Refreshing watchlist...'
+                  : trackedChannelSlugs.length === 0
+                    ? 'Add tracked channels first'
+                    : 'Refresh watchlist'
+                : isLoadingChannels
+                  ? 'Loading live followings...'
+                  : needsBrowserSync
+                    ? 'Prepare followings sync'
+                    : 'Load live followings'}
             </button>
           </div>
 
@@ -1129,7 +1597,7 @@ export default function App() {
           </div>
 
           <div className="message-strip subtle-strip">
-            <strong>Bridge status</strong>
+            <strong>{tokenOnlyMode ? 'Session status' : 'Bridge status'}</strong>
             <p>{bridgeStatus.message}</p>
           </div>
 
@@ -1140,10 +1608,38 @@ export default function App() {
             </div>
           ) : null}
 
+          {tokenOnlyMode && isAuthenticated ? (
+            <div className="message-strip subtle-strip">
+              <strong>Watchlist mode</strong>
+              <p>Tracked channels load through Kick's official API. Live chat still needs one explicit Kick browser sync because Kick does not expose chatroom ids in the public API.</p>
+            </div>
+          ) : null}
+
+          {tokenOnlyMode && isAuthenticated ? (
+            <div className="message-strip subtle-strip">
+              <strong>Live chat sync</strong>
+              <p>{browserChatEnabled ? 'Browser sync is connected. Open any live tracked channel to load a chat snapshot and then switch into realtime updates.' : 'Click Enable live chat sync once, finish the Kick website login there, keep that browser open, then open chat on any live tracked channel.'}</p>
+            </div>
+          ) : null}
+
+          {tokenOnlyMode && isAuthenticated && !hasChatWriteScope ? (
+            <div className="message-strip subtle-strip">
+              <strong>Chat sending</strong>
+              <p>Your saved token does not include chat:write yet. Reconnect Kick once to grant it, or add chat:write to KICK_OAUTH_SCOPES if you override scopes in .env.</p>
+            </div>
+          ) : null}
+
           {needsBrowserSync ? (
             <div className="message-strip subtle-strip">
               <strong>Website data sync</strong>
               <p>Kick OAuth is active, but live followings and recent chat still require one browser-based website session sync because those read endpoints are not yet exposed in the official Public API.</p>
+            </div>
+          ) : null}
+
+          {showReconnectBrowserAction ? (
+            <div className="message-strip subtle-strip">
+              <strong>Browser reconnect required</strong>
+              <p>Live followings and chat will no longer reopen the Kick browser automatically. Reconnect it explicitly, keep that browser window open, then retry the action you wanted.</p>
             </div>
           ) : null}
 
@@ -1158,17 +1654,19 @@ export default function App() {
         <article className="panel guide-panel">
           <div className="panel-header">
             <h2>Auth flow</h2>
-            <span className="mono-label">oauth + website sync</span>
+            <span className="mono-label">{tokenOnlyMode ? 'oauth 2.1' : 'oauth + website sync'}</span>
           </div>
 
           <ol className="step-list">
             <li>Click <strong>Connect Kick via OAuth</strong>.</li>
             <li>Finish the Kick authorization flow in your browser.</li>
-            <li>If you need live followings or chat history, run the one-time website sync the first time you load them.</li>
+            <li>{tokenOnlyMode ? 'Add a few tracked channel slugs. When you need live chat, run Enable live chat sync once, keep that browser window open, and Chatterbro will read chat through it while still sending through the official API.' : 'If you need live followings or chat history, run the one-time website session sync the first time you load them.'}</li>
           </ol>
 
           <p className="helper-copy">
-            Kick's Public API now covers auth and profile reads cleanly, but followed-channel and chat-history reads still require the browser bridge until official read endpoints exist.
+            {tokenOnlyMode
+              ? 'Tracked channels and chat sending stay on the official API path, but live chat reads need the Kick website session because that is still the only place Chatterbro can reliably resolve the realtime chat target.'
+              : 'Kick\'s Public API now covers auth and profile reads cleanly, but followed-channel and chat-history reads still require the browser bridge until official read endpoints exist.'}
           </p>
         </article>
       </section>
@@ -1176,7 +1674,7 @@ export default function App() {
       <section className="panel channel-panel">
         <div className="panel-header">
           <div>
-            <h2>Live followings</h2>
+            <h2>{tokenOnlyMode ? 'Tracked Watchlist' : 'Live followings'}</h2>
             <p className="subtle-copy">{liveCountLabel}</p>
           </div>
           <span className="mono-label">Kick channels</span>
@@ -1184,22 +1682,40 @@ export default function App() {
 
         {channels.length === 0 ? (
           <div className="empty-state">
-            <p>No live channels are loaded yet.</p>
-            <span>Once your Kick session is connected, this panel will list every live followed channel returned by the backend.</span>
+            <p>No tracked channels are loaded yet.</p>
+            <span>{tokenOnlyMode ? 'Add one or more channel slugs above and Chatterbro will keep a live/offline watchlist here.' : 'Once your Kick session is connected, this panel will list every live followed channel returned by the backend.'}</span>
           </div>
         ) : (
           <div className="channel-grid">
             {channels.map((channel) => (
               <article className="channel-card" key={channel.channelSlug}>
-                <div className="channel-identity">
-                  <div className="channel-avatar">
-                    {channel.thumbnailUrl ? <img src={channel.thumbnailUrl} alt={channel.displayName} /> : <span>{channel.displayName.slice(0, 1).toUpperCase()}</span>}
+                <div className="channel-card-topline">
+                  <div className="channel-identity">
+                    <div className="channel-avatar">
+                      {channel.thumbnailUrl ? <img src={channel.thumbnailUrl} alt={channel.displayName} /> : <span>{channel.displayName.slice(0, 1).toUpperCase()}</span>}
+                    </div>
+                    <div>
+                      <h3>{channel.displayName}</h3>
+                      <p>{channel.channelSlug}</p>
+                    </div>
                   </div>
-                  <div>
-                    <h3>{channel.displayName}</h3>
-                    <p>{channel.channelSlug}</p>
-                  </div>
+                  <span className={`channel-status-pill ${channel.isLive ? 'channel-status-live' : 'channel-status-offline'}`}>
+                    {channel.isLive ? 'Live' : 'Offline'}
+                  </span>
                 </div>
+
+                <div className="channel-meta-list">
+                  <span>{channel.categoryName || 'No category yet'}</span>
+                  <span>{channel.viewerCount === null ? 'Viewer count unavailable' : `${channel.viewerCount} viewer${channel.viewerCount === 1 ? '' : 's'}`}</span>
+                </div>
+
+                <p className="channel-title">{channel.streamTitle || 'No stream title available right now.'}</p>
+
+                {channel.tags.length > 0 ? (
+                  <div className="channel-tag-list">
+                    {channel.tags.slice(0, 4).map((tag) => <span className="channel-tag" key={`${channel.channelSlug}-${tag}`}>{tag}</span>)}
+                  </div>
+                ) : null}
 
                 <div className="channel-actions">
                   <button className="secondary-button" onClick={() => window.open(channel.channelUrl, '_blank', 'noopener,noreferrer')}>
@@ -1210,9 +1726,21 @@ export default function App() {
                     onClick={() => {
                       void loadChannelChat(channel);
                     }}
-                    disabled={isLoadingChat && selectedChannelSlug === channel.channelSlug}
+                    disabled={(!channel.isLive && tokenOnlyMode) || (isLoadingChat && selectedChannelSlug === channel.channelSlug)}
                   >
-                    {isLoadingChat && selectedChannelSlug === channel.channelSlug ? 'Loading chat...' : 'Open chat'}
+                    {tokenOnlyMode
+                      ? channel.isLive
+                        ? selectedChannelSlug === channel.channelSlug
+                          ? browserChatEnabled
+                            ? 'Live chat open'
+                            : 'Chat sync pending'
+                          : browserChatEnabled
+                            ? 'Open live chat'
+                            : 'Enable live chat'
+                        : 'Channel offline'
+                      : isLoadingChat && selectedChannelSlug === channel.channelSlug
+                        ? 'Loading chat...'
+                        : 'Open chat'}
                   </button>
                 </div>
               </article>
@@ -1226,9 +1754,15 @@ export default function App() {
           <div>
             <h2>Channel chat</h2>
             <p className="subtle-copy">
-              {selectedChannel
-                ? `Read-only Kick-style chat mirror for ${selectedChannel.displayName}, with realtime updates layered over the latest snapshot.`
-                : 'Click Open chat on any live followed channel to load its snapshot and render it in a Kick-style chat shell.'}
+              {tokenOnlyMode
+                ? selectedChannel
+                  ? browserChatEnabled
+                    ? `Hybrid chat for ${selectedChannel.displayName}. Chatterbro reads recent and live messages through the Kick browser sync, and can still send through the official chat API.`
+                    : `Live chat for ${selectedChannel.displayName} needs the Kick browser sync before Chatterbro can read messages in realtime.`
+                  : 'Select any live tracked channel. Chatterbro uses the tracked watchlist for discovery and the Kick browser sync for live chat.'
+                : selectedChannel
+                  ? `Read-only Kick-style chat mirror for ${selectedChannel.displayName}, with realtime updates layered over the latest snapshot.`
+                  : 'Click Open chat on any live followed channel to load its snapshot and render it in a Kick-style chat shell.'}
             </p>
           </div>
           {selectedChannel ? (
@@ -1243,9 +1777,19 @@ export default function App() {
           <div className="chat-shell">
             <div className="chat-summary-card">
               <div className="chat-summary-topline">
-                <span className="chat-kick-mark">Kick chat mirror</span>
+                <span className="chat-kick-mark">{tokenOnlyMode ? (browserChatEnabled ? 'Kick live chat' : 'Kick chat tools') : 'Kick chat mirror'}</span>
                 <span className="chat-transport-pill">
-                  {activeChatroomId !== null ? `chatroom_${activeChatroomId}` : 'snapshot mode'}
+                  {tokenOnlyMode
+                    ? browserChatEnabled
+                      ? activeChatroomId !== null
+                        ? `chatroom_${activeChatroomId}`
+                        : 'snapshot sync'
+                      : hasChatWriteScope
+                        ? 'chat:write ready'
+                        : 'reauthorize for chat:write'
+                    : activeChatroomId !== null
+                      ? `chatroom_${activeChatroomId}`
+                      : 'snapshot mode'}
                 </span>
               </div>
 
@@ -1269,7 +1813,7 @@ export default function App() {
                 <div className="chat-summary-stats">
                   <span>{channelChat?.messages.length ?? 0} messages</span>
                   <span>Updated {formatChatClockTime(channelChat?.updatedAt ?? null)}</span>
-                  <span>{liveChatState === 'live' ? 'Realtime on' : 'Snapshot sync'}</span>
+                  <span>{tokenOnlyMode ? browserChatEnabled ? (liveChatState === 'live' ? 'Realtime on' : 'Snapshot sync') : (selectedChannel.isLive ? 'Awaiting sync' : 'Offline') : liveChatState === 'live' ? 'Realtime on' : 'Snapshot sync'}</span>
                 </div>
               </div>
 
@@ -1277,11 +1821,25 @@ export default function App() {
                 <button className="secondary-button" onClick={() => window.open(selectedChannel.channelUrl, '_blank', 'noopener,noreferrer')}>
                   Open channel
                 </button>
-                <button className="primary-button" onClick={() => {
-                  void loadChannelChat(selectedChannel);
-                }} disabled={isLoadingChat}>
-                  {isLoadingChat ? 'Refreshing chat...' : 'Refresh chat'}
-                </button>
+                {tokenOnlyMode ? (
+                  browserChatEnabled ? (
+                    <button className="primary-button" onClick={() => {
+                      void loadChannelChat(selectedChannel);
+                    }} disabled={isLoadingChat}>
+                      {isLoadingChat ? 'Refreshing chat...' : 'Refresh chat'}
+                    </button>
+                  ) : (
+                    <button className="primary-button" onClick={startBrowserSessionSync} disabled={isStartingBridge || bridgeStatus.state === 'RUNNING'}>
+                      {isStartingBridge ? 'Opening live chat sync...' : bridgeStatus.state === 'RUNNING' ? 'Waiting for live chat sync...' : 'Enable live chat sync'}
+                    </button>
+                  )
+                ) : (
+                  <button className="primary-button" onClick={() => {
+                    void loadChannelChat(selectedChannel);
+                  }} disabled={isLoadingChat}>
+                    {isLoadingChat ? 'Refreshing chat...' : 'Refresh chat'}
+                  </button>
+                )}
               </div>
             </div>
 
@@ -1296,6 +1854,13 @@ export default function App() {
               <div className="message-strip error-strip">
                 <strong>Realtime chat</strong>
                 <p>{liveChatError}</p>
+              </div>
+            ) : null}
+
+            {sendChatError ? (
+              <div className="message-strip error-strip">
+                <strong>Send error</strong>
+                <p>{sendChatError}</p>
               </div>
             ) : null}
 
@@ -1316,8 +1881,8 @@ export default function App() {
             {channelChat ? (
               channelChat.messages.length === 0 ? (
                 <div className="empty-state">
-                  <p>No recent chat messages were returned.</p>
-                  <span>Kick may have an empty history for this channel right now. If the live websocket is connected, new messages will still appear here automatically.</span>
+                  <p>{tokenOnlyMode ? browserChatEnabled ? 'No recent chat messages were returned yet.' : 'Live chat sync is not connected yet.' : 'No recent chat messages were returned.'}</p>
+                  <span>{tokenOnlyMode ? browserChatEnabled ? 'If the realtime websocket is connected, new messages will still appear here automatically.' : 'Finish the Kick browser sync first. After that, Chatterbro can load chat history and switch into realtime updates.' : 'Kick may have an empty history for this channel right now. If the live websocket is connected, new messages will still appear here automatically.'}</span>
                 </div>
               ) : (
                 <div className="chat-feed">
@@ -1329,20 +1894,58 @@ export default function App() {
             <div className="chat-composer-shell">
               <div className="chat-composer-status">
                 <span className="chat-composer-status-dot" />
-                <span>{liveChatState === 'live' ? 'Live mirror' : 'Read-only sync'}</span>
+                <span>{tokenOnlyMode ? browserChatEnabled ? hasChatWriteScope ? 'Live mirror + official send' : 'Live mirror + reconnect for chat:write' : hasChatWriteScope ? 'Official send ready' : 'Reconnect for chat:write' : liveChatState === 'live' ? 'Live mirror' : 'Read-only sync'}</span>
               </div>
-              <div className="chat-composer-input">
-                Message sending stays on Kick. Open the channel to join the chat directly.
-              </div>
-              <a className="chat-composer-link" href={selectedChannel.channelUrl} target="_blank" rel="noopener noreferrer">
-                Open Kick chat
-              </a>
+
+              {tokenOnlyMode ? (
+                <div className="chat-composer-form">
+                  <textarea
+                    className="chat-composer-textarea"
+                    value={chatDraft}
+                    onChange={(event) => setChatDraft(event.target.value)}
+                    placeholder={selectedChannel.isLive
+                      ? hasChatWriteScope
+                        ? `Write to ${selectedChannel.displayName}...`
+                        : 'Reconnect Kick once to grant chat:write before sending from Chatterbro.'
+                      : 'This tracked channel is offline right now.'}
+                    disabled={!selectedChannel.isLive || (!hasChatWriteScope && !canSendSelectedChannelChat) || isSendingChat}
+                    maxLength={500}
+                  />
+
+                  <div className="chat-composer-button-row">
+                    <span className="chat-composer-help">{chatDraft.trim().length}/500</span>
+
+                    {!hasChatWriteScope ? (
+                      <button className="primary-button" type="button" onClick={handleReconnectOAuth}>
+                        Grant chat:write
+                      </button>
+                    ) : (
+                      <button className="primary-button" type="button" onClick={() => void handleSendChatMessage()} disabled={!canSendSelectedChannelChat || isSendingChat || chatDraft.trim().length === 0}>
+                        {isSendingChat ? 'Sending...' : 'Send message'}
+                      </button>
+                    )}
+
+                    <a className="chat-composer-link" href={selectedChannel.channelUrl} target="_blank" rel="noopener noreferrer">
+                      Open Kick chat
+                    </a>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="chat-composer-input">
+                    Message sending stays on Kick. Open the channel to join the chat directly.
+                  </div>
+                  <a className="chat-composer-link" href={selectedChannel.channelUrl} target="_blank" rel="noopener noreferrer">
+                    Open Kick chat
+                  </a>
+                </>
+              )}
             </div>
           </div>
         ) : (
           <div className="empty-state">
             <p>No channel chat selected yet.</p>
-            <span>After loading your live followings, click Open chat on any online channel to render its recent Kick chat here and keep it updating in real time.</span>
+            <span>{tokenOnlyMode ? 'After your watchlist loads, enable live chat sync once and then open chat on any live tracked channel to render recent messages and keep them updating in realtime.' : 'After loading your live followings, click Open chat on any online channel to render its recent Kick chat here and keep it updating in real time.'}</span>
           </div>
         )}
       </section>

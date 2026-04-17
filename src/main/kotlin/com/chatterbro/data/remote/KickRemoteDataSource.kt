@@ -7,7 +7,7 @@ import com.chatterbro.domain.model.FollowedChannel
 interface KickRemoteDataSource {
     fun getBridgeStatus(): KickBridgeStatus
 
-    fun startBridgeSession(): KickBridgeStatus
+    fun startBridgeSession(forceReconnect: Boolean = false): KickBridgeStatus
 
     suspend fun getLiveFollowedChannels(): List<FollowedChannel>
 

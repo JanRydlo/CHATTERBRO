@@ -23,6 +23,7 @@ const LOGIN_CAPTURE_POLL_INTERVAL_MS = 1_000;
 const BACKGROUND_FETCH_WARMUP_MS = 1_500;
 const CHANNEL_CHAT_DOM_WARMUP_MS = 2_500;
 const MAX_FOLLOWED_CURSOR_PAGES = 25;
+const BROWSER_RECONNECT_REQUIRED_MESSAGE = 'Kick browser sync is not running. Click Reconnect Kick browser to open it again.';
 
 const SYSTEM_BROWSER_CANDIDATES = [
   {
@@ -182,7 +183,12 @@ async function loginFlow(cliArgs) {
       session
     );
   } finally {
-    await closeBrowserBridge(page, browser, browserProcess, false);
+    await closeBrowserBridge(
+      loginBridge.ownsBrowserProcess ? null : page,
+      browser,
+      browserProcess,
+      false
+    );
   }
 }
 
@@ -204,24 +210,19 @@ async function fetchLiveFollowing(cliArgs) {
     throw new Error('Kick session is missing or expired. Sign in again.');
   }
 
-  let session;
-  try {
-    session = await openBackgroundBrowserBridge({
-      preferredBrowserPath: metadata.browserPath || process.env.KICK_BROWSER_PATH
-    });
-  } catch (launchError) {
-    await safeUpdateStatus(
-      statusFile,
-      'ERROR',
-      'Could not open the background Kick browser session. Sign in again if the saved session was lost.',
-      storedSession
-    );
-    throw launchError;
-  }
+  const session = await openConnectedBrowserBridge({
+    debuggingPort: metadata.debuggingPort,
+    statusFile,
+    storedSession
+  });
 
   const { browser, context, page, browserInfo, browserProcess, ownsBrowserProcess } = session;
 
   try {
+    if (Array.isArray(storedCookies) && storedCookies.length > 0) {
+      await context.addCookies(storedCookies).catch(() => undefined);
+    }
+
     const channels = await fetchFollowedChannelsFromBrowser(page, storedSession.token);
 
     await writeJson(outputFile, channels);
@@ -277,13 +278,19 @@ async function fetchChannelChat(cliArgs) {
     throw new Error('Kick session is missing or expired. Sign in again.');
   }
 
-  const session = await openBackgroundBrowserBridge({
-    preferredBrowserPath: metadata.browserPath || process.env.KICK_BROWSER_PATH
+  const session = await openConnectedBrowserBridge({
+    debuggingPort: metadata.debuggingPort,
+    statusFile,
+    storedSession
   });
 
   const { browser, context, page, browserProcess, ownsBrowserProcess } = session;
 
   try {
+    if (Array.isArray(storedCookies) && storedCookies.length > 0) {
+      await context.addCookies(storedCookies).catch(() => undefined);
+    }
+
     const chat = await fetchChannelChatFromBrowser(page, channelSlug, storedSession.token);
     await writeJson(outputFile, chat);
 
@@ -321,13 +328,19 @@ async function serveBridge(cliArgs) {
     throw new Error('Kick session is missing or expired. Sign in again.');
   }
 
-  const session = await openBackgroundBrowserBridge({
-    preferredBrowserPath: metadata.browserPath || process.env.KICK_BROWSER_PATH
+  const session = await openConnectedBrowserBridge({
+    debuggingPort: metadata.debuggingPort,
+    statusFile,
+    storedSession
   });
 
   const { browser, context, page, browserProcess, ownsBrowserProcess } = session;
 
   try {
+    if (Array.isArray(storedCookies) && storedCookies.length > 0) {
+      await context.addCookies(storedCookies).catch(() => undefined);
+    }
+
     await ensureKickHomePage(page);
     writeProtocolLine({ type: 'ready' });
 
@@ -1553,31 +1566,13 @@ async function openExistingBrowserBridge({ debuggingPort }) {
   };
 }
 
-async function openBackgroundBrowserBridge({ preferredBrowserPath }) {
-  const browserInfo = resolveChromiumBrowser(preferredBrowserPath);
-  const browser = await chromium.launch({
-    headless: false,
-    executablePath: browserInfo.executablePath,
-    args: [
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--start-minimized'
-    ]
-  });
-  const context = await browser.newContext({
-    userAgent: DEFAULT_USER_AGENT,
-    viewport: { width: 1440, height: 960 }
-  });
-
-  return {
-    browser,
-    context,
-    page: await context.newPage(),
-    browserInfo,
-    browserProcess: null,
-    ownsBrowserProcess: true,
-    debuggingPort: null
-  };
+async function openConnectedBrowserBridge({ debuggingPort, statusFile, storedSession }) {
+  try {
+    return await openExistingBrowserBridge({ debuggingPort });
+  } catch {
+    await safeUpdateStatus(statusFile, 'ERROR', BROWSER_RECONNECT_REQUIRED_MESSAGE, storedSession);
+    throw new Error(BROWSER_RECONNECT_REQUIRED_MESSAGE);
+  }
 }
 
 function resolveChromiumBrowser(preferredBrowserPath) {
@@ -1639,11 +1634,11 @@ async function openBrowserBridge({ preferredBrowserPath, profileDir, startUrl, s
 async function closeBrowserBridge(page, browser, browserProcess, ownsBrowserProcess) {
   await page?.close().catch(() => undefined);
 
-  await browser.close().catch(() => undefined);
-
   if (!ownsBrowserProcess) {
     return;
   }
+
+  await browser.close().catch(() => undefined);
 
   if (ownsBrowserProcess && browserProcess && browserProcess.exitCode === null && !browserProcess.killed) {
     browserProcess.kill();

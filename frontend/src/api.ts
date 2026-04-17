@@ -1,15 +1,27 @@
-import type { ChannelChat, ChannelChatEmoteCatalog, FollowedChannel, KickBridgeStatus } from './types';
+import type { ChannelChat, ChannelChatEmoteCatalog, FollowedChannel, KickBridgeStatus, PostedChatMessage } from './types';
 
 const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '');
 
+function getBackendOrigin() {
+  return API_BASE_URL || window.location.origin;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init?.headers || {})
-    }
-  });
+  let response: Response;
+
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      ...init,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(init?.headers || {})
+      }
+    });
+  } catch {
+    throw new Error(
+      `Cannot reach the Chatterbro backend at ${getBackendOrigin()}. If you just changed the app, stop the old server on port 8080 and start the current backend again.`
+    );
+  }
 
   if (!response.ok) {
     const fallbackMessage = `Request failed with status ${response.status}`;
@@ -32,8 +44,10 @@ export function getBridgeStatus(): Promise<KickBridgeStatus> {
   return request<KickBridgeStatus>('/api/bridge/status');
 }
 
-export function startBridge(): Promise<KickBridgeStatus> {
-  return request<KickBridgeStatus>('/api/bridge/start', {
+export function startBridge(forceReconnect = false): Promise<KickBridgeStatus> {
+  const query = forceReconnect ? '?forceReconnect=true' : '';
+
+  return request<KickBridgeStatus>(`/api/bridge/start${query}`, {
     method: 'POST'
   });
 }
@@ -42,8 +56,40 @@ export function fetchLiveFollowedChannels(): Promise<FollowedChannel[]> {
   return request<FollowedChannel[]>('/api/following/live');
 }
 
+export function fetchTrackedLiveChannels(channelSlugs: string[]): Promise<FollowedChannel[]> {
+  const query = new URLSearchParams();
+  for (const channelSlug of channelSlugs) {
+    query.append('slug', channelSlug);
+  }
+
+  return request<FollowedChannel[]>(`/api/channels/live?${query.toString()}`);
+}
+
+export function fetchTrackedChannels(channelSlugs: string[]): Promise<FollowedChannel[]> {
+  const query = new URLSearchParams();
+  for (const channelSlug of channelSlugs) {
+    query.append('slug', channelSlug);
+  }
+
+  return request<FollowedChannel[]>(`/api/channels/tracked?${query.toString()}`);
+}
+
 export function fetchChannelChat(channelSlug: string): Promise<ChannelChat> {
   return request<ChannelChat>(`/api/chat/${channelSlug}`);
+}
+
+export function sendChannelChatMessage(
+  channelSlug: string,
+  payload: {
+    content: string;
+    broadcasterUserId?: number | null;
+    replyToMessageId?: string | null;
+  }
+): Promise<PostedChatMessage> {
+  return request<PostedChatMessage>(`/api/chat/${channelSlug}/messages`, {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  });
 }
 
 export function fetchGlobalChatEmotes(): Promise<ChannelChatEmoteCatalog> {

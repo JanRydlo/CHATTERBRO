@@ -18,6 +18,7 @@ export interface KickBridgeStatus {
   oauthEnabled: boolean;
   hasBrowserSession: boolean;
   authMode: KickAuthMode;
+  grantedScopes: string[];
   updatedAt: string;
 }
 
@@ -28,6 +29,17 @@ export interface FollowedChannel {
   channelUrl: string;
   chatUrl: string | null;
   thumbnailUrl: string | null;
+  broadcasterUserId: number | null;
+  channelId: number | null;
+  viewerCount: number | null;
+  streamTitle: string | null;
+  categoryName: string | null;
+  tags: string[];
+}
+
+export interface PostedChatMessage {
+  isSent: boolean;
+  messageId: string;
 }
 
 export interface ChannelChatBadge {

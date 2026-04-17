@@ -175,6 +175,40 @@ input {
   color: var(--muted);
 }
 
+.tracked-channel-manager {
+  display: grid;
+  gap: 10px;
+}
+
+.tracked-channel-input-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.tracked-channel-input-row .text-input {
+  flex: 1 1 240px;
+}
+
+.tracked-chip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.tracked-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid rgba(21, 34, 23, 0.1);
+  border-radius: 999px;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--text);
+  cursor: pointer;
+}
+
 .text-input {
   width: 100%;
   border: 1px solid rgba(21, 34, 23, 0.14);
@@ -386,10 +420,69 @@ input {
   border: 1px solid rgba(21, 34, 23, 0.08);
 }
 
+.channel-card-topline {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .channel-identity {
   display: flex;
   gap: 14px;
   align-items: center;
+}
+
+.channel-status-pill,
+.channel-meta-list span,
+.channel-tag {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.74rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.channel-status-pill {
+  padding: 6px 10px;
+}
+
+.channel-status-live {
+  background: rgba(10, 143, 100, 0.12);
+  color: var(--accent-deep);
+}
+
+.channel-status-offline {
+  background: rgba(86, 100, 91, 0.1);
+  color: var(--muted);
+}
+
+.channel-meta-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.channel-meta-list span,
+.channel-tag {
+  padding: 5px 9px;
+  background: rgba(21, 34, 23, 0.05);
+  color: var(--muted);
+}
+
+.channel-title {
+  margin: 0;
+  color: var(--text);
+  line-height: 1.45;
+}
+
+.channel-tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .channel-avatar {
@@ -751,6 +844,7 @@ input {
   border-radius: 18px;
   background: rgba(255, 255, 255, 0.05);
   border: 1px solid rgba(255, 255, 255, 0.08);
+  align-items: stretch;
 }
 
 .chat-composer-status {
@@ -780,6 +874,41 @@ input {
   background: rgba(10, 14, 20, 0.9);
   border: 1px solid rgba(255, 255, 255, 0.08);
   color: rgba(243, 247, 253, 0.42);
+}
+
+.chat-composer-form {
+  flex: 1 1 100%;
+  display: grid;
+  gap: 12px;
+}
+
+.chat-composer-textarea {
+  width: 100%;
+  min-height: 120px;
+  resize: vertical;
+  padding: 14px 16px;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(10, 14, 20, 0.9);
+  color: var(--chat-text);
+}
+
+.chat-composer-textarea:disabled {
+  opacity: 0.55;
+}
+
+.chat-composer-button-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+.chat-composer-help {
+  margin-right: auto;
+  color: var(--chat-muted);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.76rem;
 }
 
 .chat-composer-link {
@@ -830,6 +959,12 @@ input {
 
   .chat-summary-main,
   .chat-composer-shell {
+    align-items: stretch;
+  }
+
+  .tracked-channel-input-row,
+  .chat-composer-button-row,
+  .channel-card-topline {
     align-items: stretch;
   }
 

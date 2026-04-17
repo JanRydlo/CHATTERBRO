@@ -23,6 +23,19 @@ data class KickOAuthSession(
         val expiration = expiresAt?.let(Instant::parse) ?: return false
         return !expiration.minusSeconds(skewSeconds).isAfter(now)
     }
+
+    fun grantedScopes(): List<String> {
+        return scope
+            ?.split(' ', ',')
+            ?.map(String::trim)
+            ?.filter(String::isNotBlank)
+            ?.distinct()
+            .orEmpty()
+    }
+
+    fun hasScope(requiredScope: String): Boolean {
+        return grantedScopes().contains(requiredScope)
+    }
 }
 
 @Serializable

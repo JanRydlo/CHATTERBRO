@@ -14,5 +14,6 @@ data class KickBridgeStatus(
     val oauthEnabled: Boolean = false,
     val hasBrowserSession: Boolean = false,
     val authMode: KickAuthMode = KickAuthMode.NONE,
+    val grantedScopes: List<String> = emptyList(),
     val updatedAt: String = Instant.now().toString(),
 )
