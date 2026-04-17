@@ -196,7 +196,7 @@ function parseSerializedBadge(value: string): ChannelChatBadge | null {
   const typeMatch = value.match(/type=([^;}]*)/i);
   const textMatch = value.match(/text=([^;}]*)/i);
   const countMatch = value.match(/count=([^;}]*)/i);
-  const imageMatch = value.match(/(?:imageUrl|image_url|icon|icon_url|src|url)=([^;}]*)/i);
+  const imageMatch = value.match(/(?:imageUrl|image_url|image|iconUrl|icon|icon_url|src|url|badgeImageUrl|badge_image_url|badgeUrl|badge_url)=([^;}]*)/i);
   const type = typeMatch?.[1]?.trim() || '';
   const text = textMatch?.[1]?.trim() || type;
   const count = Number(countMatch?.[1]);
@@ -213,20 +213,68 @@ function parseSerializedBadge(value: string): ChannelChatBadge | null {
   };
 }
 
+function readBadgeUrlCandidate(value: unknown): string | null {
+  if (typeof value === 'string' && value.length > 0) {
+    return value;
+  }
+
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  const nestedCandidates = [
+    record.url,
+    record.src,
+    record.original,
+    record.original_url,
+    record.originalUrl,
+    record.full,
+    record.full_url,
+    record.fullUrl,
+    record.medium,
+    record.medium_url,
+    record.mediumUrl,
+    record.small,
+    record.small_url,
+    record.smallUrl,
+    record.image,
+    record.image_url,
+    record.imageUrl,
+    record.icon,
+    record.icon_url,
+    record.iconUrl,
+    record.thumbnail
+  ];
+
+  return nestedCandidates.find((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0) ?? null;
+}
+
 function resolveBadgeImageUrl(value: Record<string, unknown>) {
   const candidates = [
+    value.imageUrl,
     value.image,
     value.image_url,
+    value.iconUrl,
     value.icon,
     value.icon_url,
     value.src,
     value.url,
+    value.badgeImageUrl,
+    value.badge_image_url,
     value.badge_image,
+    value.badgeUrl,
+    value.badge_url,
+    value.smallIconUrl,
     value.small_icon_url,
-    value.thumbnail
+    value.thumbnail,
+    value.asset,
+    value.badge
   ];
 
-  const match = candidates.find((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0);
+  const match = candidates
+    .map((candidate) => readBadgeUrlCandidate(candidate))
+    .find((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0);
   return match ?? null;
 }
 
@@ -1457,6 +1505,18 @@ export default function App() {
       window.clearTimeout(timeoutId);
     };
   }, [browserChatEnabled, hasOpenChat, isAuthenticated, isLoadingChat, liveChatState, selectedChannelSlug]);
+
+  useEffect(() => {
+    const feedElement = chatFeedRef.current;
+    if (!feedElement || !newestVisibleMessageId) {
+      return;
+    }
+
+    feedElement.scrollTo({
+      top: 0,
+      behavior: 'smooth'
+    });
+  }, [newestVisibleMessageId]);
 
   function handleReconnectOAuth() {
     window.location.assign(getOAuthLoginUrl());
