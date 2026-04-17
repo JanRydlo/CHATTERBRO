@@ -23,7 +23,7 @@ const LOGIN_CAPTURE_POLL_INTERVAL_MS = 1_000;
 const BACKGROUND_FETCH_WARMUP_MS = 1_500;
 const CHANNEL_CHAT_DOM_WARMUP_MS = 2_500;
 const MAX_FOLLOWED_CURSOR_PAGES = 25;
-const BROWSER_RECONNECT_REQUIRED_MESSAGE = 'Kick browser sync is not running. Click Reconnect Kick browser to open it again.';
+const BROWSER_RECONNECT_REQUIRED_MESSAGE = 'Refresh the Kick website session to restore website-only reads.';
 
 const SYSTEM_BROWSER_CANDIDATES = [
   {
@@ -183,12 +183,7 @@ async function loginFlow(cliArgs) {
       session
     );
   } finally {
-    await closeBrowserBridge(
-      loginBridge.ownsBrowserProcess ? null : page,
-      browser,
-      browserProcess,
-      false
-    );
+    await closeBrowserBridge(page, browser, browserProcess, loginBridge.ownsBrowserProcess);
   }
 }
 
@@ -213,7 +208,9 @@ async function fetchLiveFollowing(cliArgs) {
   const session = await openConnectedBrowserBridge({
     debuggingPort: metadata.debuggingPort,
     statusFile,
-    storedSession
+    storedSession,
+    profileDir,
+    preferredBrowserPath: metadata.browserPath || process.env.KICK_BROWSER_PATH
   });
 
   const { browser, context, page, browserInfo, browserProcess, ownsBrowserProcess } = session;
@@ -281,7 +278,9 @@ async function fetchChannelChat(cliArgs) {
   const session = await openConnectedBrowserBridge({
     debuggingPort: metadata.debuggingPort,
     statusFile,
-    storedSession
+    storedSession,
+    profileDir,
+    preferredBrowserPath: metadata.browserPath || process.env.KICK_BROWSER_PATH
   });
 
   const { browser, context, page, browserProcess, ownsBrowserProcess } = session;
@@ -318,8 +317,6 @@ async function serveBridge(cliArgs) {
   const metaFile = requireArg(cliArgs, 'meta-file');
   const profileDir = requireArg(cliArgs, 'profile-dir');
 
-  const metadata = await readJson(metaFile, {});
-  const storedCookies = await readJson(cookieFile, []);
   const storedSession = await readKickSession(sessionFile);
 
   if (!hasValidKickSession(storedSession)) {
@@ -328,48 +325,31 @@ async function serveBridge(cliArgs) {
     throw new Error('Kick session is missing or expired. Sign in again.');
   }
 
-  const session = await openConnectedBrowserBridge({
-    debuggingPort: metadata.debuggingPort,
+  writeProtocolLine({ type: 'ready' });
+
+  const state = {
     statusFile,
-    storedSession
+    cookieFile,
+    sessionFile,
+    metaFile,
+    profileDir
+  };
+
+  const lineReader = readline.createInterface({
+    input: process.stdin,
+    crlfDelay: Infinity
   });
 
-  const { browser, context, page, browserProcess, ownsBrowserProcess } = session;
+  let queue = Promise.resolve();
+  lineReader.on('line', (line) => {
+    queue = queue.then(() => handleServiceRequest(line, state));
+  });
 
-  try {
-    if (Array.isArray(storedCookies) && storedCookies.length > 0) {
-      await context.addCookies(storedCookies).catch(() => undefined);
-    }
+  await new Promise((resolve) => {
+    lineReader.once('close', resolve);
+  });
 
-    await ensureKickHomePage(page);
-    writeProtocolLine({ type: 'ready' });
-
-    const state = {
-      statusFile,
-      cookieFile,
-      sessionFile,
-      context,
-      page
-    };
-
-    const lineReader = readline.createInterface({
-      input: process.stdin,
-      crlfDelay: Infinity
-    });
-
-    let queue = Promise.resolve();
-    lineReader.on('line', (line) => {
-      queue = queue.then(() => handleServiceRequest(line, state));
-    });
-
-    await new Promise((resolve) => {
-      lineReader.once('close', resolve);
-    });
-
-    await queue.catch(() => undefined);
-  } finally {
-    await closeBrowserBridge(page, browser, browserProcess, ownsBrowserProcess);
-  }
+  await queue.catch(() => undefined);
 }
 
 async function handleServiceRequest(line, state) {
@@ -380,7 +360,6 @@ async function handleServiceRequest(line, state) {
     requestId = request?.id ? String(request.id) : null;
 
     if (request?.command === 'fetch-live-following') {
-      state.page = await ensureServicePage(state);
       const storedSession = await readKickSession(state.sessionFile);
       if (!hasValidKickSession(storedSession)) {
         await invalidateSavedSession(state.sessionFile, state.cookieFile);
@@ -388,27 +367,33 @@ async function handleServiceRequest(line, state) {
         throw new Error('Kick session is missing or expired. Sign in again.');
       }
 
-      const channels = await fetchFollowedChannelsFromBrowser(state.page, storedSession.token);
-      await persistServiceCookies(state.context, state.cookieFile);
-      await safeUpdateStatus(
-        state.statusFile,
-        'READY',
-        channels.length === 0
-          ? `Connected as ${storedSession.profile.username}, but no live followings were found.`
-          : `Loaded ${channels.length} live following channels for ${storedSession.profile.username}.`,
-        storedSession
-      );
+      const session = await openServiceBridge(state, storedSession);
+      const { browser, context, page, browserProcess, ownsBrowserProcess } = session;
 
-      writeProtocolLine({
-        id: requestId,
-        ok: true,
-        result: channels
-      });
+      try {
+        const channels = await fetchFollowedChannelsFromBrowser(page, storedSession.token);
+        await persistServiceCookies(context, state.cookieFile);
+        await safeUpdateStatus(
+          state.statusFile,
+          'READY',
+          channels.length === 0
+            ? `Connected as ${storedSession.profile.username}, but no live followings were found.`
+            : `Loaded ${channels.length} live following channels for ${storedSession.profile.username}.`,
+          storedSession
+        );
+
+        writeProtocolLine({
+          id: requestId,
+          ok: true,
+          result: channels
+        });
+      } finally {
+        await closeBrowserBridge(page, browser, browserProcess, ownsBrowserProcess);
+      }
       return;
     }
 
     if (request?.command === 'fetch-channel-chat') {
-      state.page = await ensureServicePage(state);
       const channelSlug = typeof request.channelSlug === 'string' ? request.channelSlug.trim().toLowerCase() : '';
       if (!channelSlug) {
         throw new Error('Kick channel slug is required.');
@@ -421,22 +406,29 @@ async function handleServiceRequest(line, state) {
         throw new Error('Kick session is missing or expired. Sign in again.');
       }
 
-      const chat = await fetchChannelChatFromBrowser(state.page, channelSlug, storedSession.token);
-      await persistServiceCookies(state.context, state.cookieFile);
-      await safeUpdateStatus(
-        state.statusFile,
-        'READY',
-        chat.messages.length === 0
-          ? `Connected as ${storedSession.profile.username}, but Kick returned no recent chat messages for ${channelSlug}.`
-          : `Loaded ${chat.messages.length} recent chat messages for ${channelSlug}.`,
-        storedSession
-      );
+      const session = await openServiceBridge(state, storedSession);
+      const { browser, context, page, browserProcess, ownsBrowserProcess } = session;
 
-      writeProtocolLine({
-        id: requestId,
-        ok: true,
-        result: chat
-      });
+      try {
+        const chat = await fetchChannelChatFromBrowser(page, channelSlug, storedSession.token);
+        await persistServiceCookies(context, state.cookieFile);
+        await safeUpdateStatus(
+          state.statusFile,
+          'READY',
+          chat.messages.length === 0
+            ? `Connected as ${storedSession.profile.username}, but Kick returned no recent chat messages for ${channelSlug}.`
+            : `Loaded ${chat.messages.length} recent chat messages for ${channelSlug}.`,
+          storedSession
+        );
+
+        writeProtocolLine({
+          id: requestId,
+          ok: true,
+          result: chat
+        });
+      } finally {
+        await closeBrowserBridge(page, browser, browserProcess, ownsBrowserProcess);
+      }
       return;
     }
 
@@ -457,17 +449,26 @@ async function persistServiceCookies(context, cookieFile) {
   }
 }
 
-function writeProtocolLine(payload) {
-  process.stdout.write(`${JSON.stringify(payload)}\n`);
-}
+async function openServiceBridge(state, storedSession) {
+  const metadata = await readJson(state.metaFile, {});
+  const storedCookies = await readJson(state.cookieFile, []);
+  const session = await openConnectedBrowserBridge({
+    debuggingPort: metadata.debuggingPort,
+    statusFile: state.statusFile,
+    storedSession,
+    profileDir: state.profileDir,
+    preferredBrowserPath: metadata.browserPath || process.env.KICK_BROWSER_PATH
+  });
 
-async function ensureServicePage(state) {
-  if (state.page && !state.page.isClosed()) {
-    return state.page;
+  if (Array.isArray(storedCookies) && storedCookies.length > 0) {
+    await session.context.addCookies(storedCookies).catch(() => undefined);
   }
 
-  state.page = await state.context.newPage();
-  return state.page;
+  return session;
+}
+
+function writeProtocolLine(payload) {
+  process.stdout.write(`${JSON.stringify(payload)}\n`);
 }
 
 async function waitForAuthenticatedSession({ context, page, cookieFile, sessionFile }) {
@@ -779,7 +780,7 @@ async function fetchChannelChatFromApi(page, channelSlug, authToken) {
           const typeMatch = badge.match(/type=([^;}]*)/i);
           const textMatch = badge.match(/text=([^;}]*)/i);
           const countMatch = badge.match(/count=([^;}]*)/i);
-          const imageMatch = badge.match(/(?:imageUrl|image_url|icon|icon_url|src|url)=([^;}]*)/i);
+          const imageMatch = badge.match(/(?:imageUrl|image_url|image|iconUrl|icon|icon_url|src|url|badgeImageUrl|badge_image_url|badgeUrl|badge_url)=([^;}]*)/i);
           const parsedCount = Number(countMatch?.[1]);
           const type = typeMatch?.[1]?.trim() || '';
           const text = textMatch?.[1]?.trim() || type;
@@ -1093,44 +1094,151 @@ async function fetchChannelChatPageSnapshot(page, channelSlug) {
       normalizedChannelSlug
     ) || normalizedChannelSlug;
 
-    const parseBadgeFromImage = (image) => {
-      const alt = normalizeText(image.getAttribute('alt') || image.getAttribute('title') || '');
-      const imageUrl = image.currentSrc || image.getAttribute('src') || null;
-      const subscriberMatch = alt.match(/(\d+)\s*-\s*Month Subscriber/i);
+    const resolveBadgeType = (...candidates) => {
+      const normalizedCandidate = candidates
+        .map((candidate) => normalizeText(candidate).toLowerCase())
+        .find((candidate) => candidate.length > 0) || '';
 
-      if (subscriberMatch) {
-        return {
-          type: 'subscriber',
-          text: 'Subscriber',
-          count: Number(subscriberMatch[1]),
-          imageUrl
-        };
+      if (normalizedCandidate.includes('moderator')) {
+        return 'moderator';
       }
 
-      if (!alt && !imageUrl) {
+      if (normalizedCandidate.includes('verified')) {
+        return 'verified';
+      }
+
+      if (normalizedCandidate.includes('vip')) {
+        return 'vip';
+      }
+
+      if (normalizedCandidate.includes('founder')) {
+        return 'founder';
+      }
+
+      if (normalizedCandidate.includes('subscriber')) {
+        return 'subscriber';
+      }
+
+      if (normalizedCandidate.includes('gift')) {
+        return 'sub_gifter';
+      }
+
+      if (normalizedCandidate.includes('og')) {
+        return 'og';
+      }
+
+      return normalizedCandidate.replace(/\s+/g, '-') || 'badge';
+    };
+
+    const readBadgeCount = (value) => {
+      const subscriberMatch = normalizeText(value).match(/(\d+)\s*-\s*Month Subscriber/i);
+      if (!subscriberMatch) {
         return null;
       }
 
-      const normalizedAlt = alt.toLowerCase();
-      let type = normalizedAlt.replace(/\s+/g, '-') || 'badge';
-      if (normalizedAlt.includes('moderator')) {
-        type = 'moderator';
-      } else if (normalizedAlt.includes('verified')) {
-        type = 'verified';
-      } else if (normalizedAlt.includes('vip')) {
-        type = 'vip';
-      } else if (normalizedAlt.includes('founder')) {
-        type = 'founder';
-      } else if (normalizedAlt.includes('subscriber')) {
-        type = 'subscriber';
+      const parsedCount = Number(subscriberMatch[1]);
+      return Number.isFinite(parsedCount) ? parsedCount : null;
+    };
+
+    const extractElementLabel = (element) => normalizeText(
+      element.getAttribute('aria-label') ||
+      element.getAttribute('title') ||
+      element.querySelector('title')?.textContent ||
+      element.closest('[aria-label]')?.getAttribute('aria-label') ||
+      element.closest('[title]')?.getAttribute('title') ||
+      element.parentElement?.getAttribute('aria-label') ||
+      element.parentElement?.getAttribute('title') ||
+      ''
+    );
+
+    const extractStyleImageUrl = (element) => {
+      const styleValues = [];
+      if (element instanceof HTMLElement) {
+        styleValues.push(element.style.backgroundImage, element.style.maskImage, element.style.webkitMaskImage);
       }
+
+      const computedStyle = getComputedStyle(element);
+      styleValues.push(computedStyle.backgroundImage, computedStyle.maskImage, computedStyle.webkitMaskImage);
+
+      for (const styleValue of styleValues) {
+        const urlMatch = String(styleValue || '').match(/url\(["']?([^"')]+)["']?\)/i);
+        if (urlMatch?.[1]) {
+          return urlMatch[1];
+        }
+      }
+
+      return null;
+    };
+
+    const createSvgDataUrl = (svgElement) => {
+      const outerMarkup = svgElement.outerHTML || '';
+      if (!outerMarkup) {
+        return null;
+      }
+
+      const svgMarkup = outerMarkup.includes('xmlns=')
+        ? outerMarkup
+        : outerMarkup.replace('<svg', '<svg xmlns="http://www.w3.org/2000/svg"');
+      return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svgMarkup)}`;
+    };
+
+    const parseBadgeElement = (element) => {
+      const label = extractElementLabel(element);
+      const count = readBadgeCount(label);
+      const className = typeof element.getAttribute('class') === 'string' ? element.getAttribute('class') : '';
+
+      let imageUrl = null;
+      if (element instanceof HTMLImageElement) {
+        imageUrl = element.currentSrc || element.getAttribute('src') || null;
+      } else if (element instanceof SVGElement) {
+        imageUrl = createSvgDataUrl(element);
+      } else {
+        imageUrl = extractStyleImageUrl(element);
+      }
+
+      if (!label && !imageUrl) {
+        return null;
+      }
+
+      const type = count !== null ? 'subscriber' : resolveBadgeType(label, className);
+      const text = label || type;
 
       return {
         type,
-        text: alt || type,
-        count: null,
+        text,
+        count,
         imageUrl
       };
+    };
+
+    const collectBadgeElements = (senderContainer, senderButton) => {
+      if (!senderContainer) {
+        return [];
+      }
+
+      const badgeElements = [];
+      const seenBadgeElements = new Set();
+
+      const pushBadgeElement = (element) => {
+        if (!(element instanceof Element) || senderButton.contains(element) || seenBadgeElements.has(element)) {
+          return;
+        }
+
+        seenBadgeElements.add(element);
+        badgeElements.push(element);
+      };
+
+      for (const candidate of Array.from(senderContainer.querySelectorAll('img, svg'))) {
+        pushBadgeElement(candidate);
+      }
+
+      for (const candidate of Array.from(senderContainer.querySelectorAll('*'))) {
+        if (candidate instanceof Element && extractStyleImageUrl(candidate)) {
+          pushBadgeElement(candidate);
+        }
+      }
+
+      return badgeElements;
     };
 
     const parseTimestampToIso = (value) => {
@@ -1254,8 +1362,8 @@ async function fetchChannelChatPageSnapshot(page, channelSlug) {
       const timestamp = normalizeText(messageRoot.querySelector('span.text-neutral')?.textContent || '');
       const senderContainer = senderButton.parentElement;
       const badges = senderContainer
-        ? Array.from(senderContainer.querySelectorAll('img'))
-          .map((image) => parseBadgeFromImage(image))
+        ? collectBadgeElements(senderContainer, senderButton)
+          .map((element) => parseBadgeElement(element))
           .filter(Boolean)
         : [];
       const senderColor = senderButton.style.color || getComputedStyle(senderButton).color || null;
@@ -1613,12 +1721,26 @@ async function openExistingBrowserBridge({ debuggingPort }) {
   };
 }
 
-async function openConnectedBrowserBridge({ debuggingPort, statusFile, storedSession }) {
+async function openConnectedBrowserBridge({ debuggingPort, statusFile, storedSession, profileDir, preferredBrowserPath }) {
+  if (debuggingPort) {
+    try {
+      return await openExistingBrowserBridge({ debuggingPort });
+    } catch {
+      // Fall back to a temporary minimized browser when the saved bridge window is no longer running.
+    }
+  }
+
   try {
-    return await openExistingBrowserBridge({ debuggingPort });
-  } catch {
-    await safeUpdateStatus(statusFile, 'ERROR', BROWSER_RECONNECT_REQUIRED_MESSAGE, storedSession);
-    throw new Error(BROWSER_RECONNECT_REQUIRED_MESSAGE);
+    return await openBrowserBridge({
+      preferredBrowserPath,
+      profileDir,
+      startUrl: KICK_HOME_URL,
+      startMinimized: true
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : BROWSER_RECONNECT_REQUIRED_MESSAGE;
+    await safeUpdateStatus(statusFile, 'ERROR', message, storedSession);
+    throw error;
   }
 }
 
@@ -1682,10 +1804,19 @@ async function closeBrowserBridge(page, browser, browserProcess, ownsBrowserProc
   await page?.close().catch(() => undefined);
 
   if (!ownsBrowserProcess) {
+    if (browser && typeof browser.newBrowserCDPSession === 'function') {
+      const browserSession = await browser.newBrowserCDPSession().catch(() => null);
+      if (browserSession) {
+        await browserSession.send('Browser.close').catch(() => undefined);
+        await browserSession.detach().catch(() => undefined);
+      }
+    }
+
+    await browser?.close().catch(() => undefined);
     return;
   }
 
-  await browser.close().catch(() => undefined);
+  await browser?.close().catch(() => undefined);
 
   if (ownsBrowserProcess && browserProcess && browserProcess.exitCode === null && !browserProcess.killed) {
     browserProcess.kill();
