@@ -1,11 +1,12 @@
 package com.chatterbro
 
 import com.chatterbro.api.chatterbroModule
+import com.chatterbro.config.LocalEnvironment
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.netty.Netty
 
 fun main() {
-    val port = System.getenv("CHATTERBRO_PORT")?.toIntOrNull() ?: 8080
+    val port = LocalEnvironment.read("CHATTERBRO_PORT")?.toIntOrNull() ?: 8080
 
     embeddedServer(
         factory = Netty,

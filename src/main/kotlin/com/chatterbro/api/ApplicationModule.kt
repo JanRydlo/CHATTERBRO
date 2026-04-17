@@ -1,6 +1,7 @@
 package com.chatterbro.api
 
 import com.chatterbro.api.dto.ErrorResponse
+import com.chatterbro.api.dto.SendChannelChatMessageRequest
 import com.chatterbro.data.bridge.KickBridgePaths
 import com.chatterbro.data.bridge.KickBridgeRunner
 import com.chatterbro.data.bridge.KickBridgeStatusStore
@@ -21,6 +22,7 @@ import io.ktor.server.http.content.staticFiles
 import io.ktor.server.plugins.calllogging.CallLogging
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.cors.routing.CORS
+import io.ktor.server.request.receive
 import io.ktor.server.response.respondRedirect
 import io.ktor.server.request.path
 import io.ktor.server.response.respond
@@ -40,7 +42,6 @@ fun Application.chatterbroModule() {
     val oauthService = oauthConfig?.let { KickOAuthService(it, bridgePaths, bridgeStatusStore) }
     val bridgeRunner = KickBridgeRunner(bridgePaths, bridgeStatusStore)
     val remoteDataSource = PlaywrightKickBridgeDataSource(bridgeRunner, bridgeStatusStore, oauthService)
-    bridgeRunner.prewarmService()
     val repository = BridgeBackedKickRepository(remoteDataSource)
     val loadLiveFollowedChannels = LoadLiveFollowedChannelsUseCase(repository)
     val loadChannelChat = LoadChannelChatUseCase(repository)
@@ -82,7 +83,26 @@ fun Application.chatterbroModule() {
             }
 
             post("/bridge/start") {
-                call.respond(remoteDataSource.startBridgeSession())
+                try {
+                    val forceReconnect = call.request.queryParameters["forceReconnect"]
+                        ?.toBooleanStrictOrNull() == true
+                    call.respond(remoteDataSource.startBridgeSession(forceReconnect = forceReconnect))
+                } catch (exception: IllegalStateException) {
+                    val message = exception.message ?: "Kick browser bridge could not be started."
+                    val statusCode = if (
+                        message.contains("OAuth-only mode", ignoreCase = true) ||
+                        message.contains("Kick Public API", ignoreCase = true)
+                    ) {
+                        HttpStatusCode.NotImplemented
+                    } else {
+                        HttpStatusCode.BadGateway
+                    }
+
+                    call.respond(
+                        statusCode,
+                        ErrorResponse(message),
+                    )
+                }
             }
 
             get("/auth/login") {
@@ -130,11 +150,21 @@ fun Application.chatterbroModule() {
                 } catch (exception: IllegalStateException) {
                     val message = exception.message ?: "Kick bridge failed to load channels."
                     val statusCode = if (
+                        message.contains("OAuth-only mode", ignoreCase = true) ||
+                        message.contains("Kick Public API", ignoreCase = true)
+                    ) {
+                        HttpStatusCode.NotImplemented
+                    } else if (
                         message.contains("sign in", ignoreCase = true) ||
                         message.contains("expired", ignoreCase = true) ||
                         message.contains("missing", ignoreCase = true)
                     ) {
                         HttpStatusCode.Unauthorized
+                    } else if (
+                        message.contains("Reconnect Kick browser", ignoreCase = true) ||
+                        message.contains("browser sync is not running", ignoreCase = true)
+                    ) {
+                        HttpStatusCode.Conflict
                     } else {
                         HttpStatusCode.BadGateway
                     }
@@ -143,6 +173,86 @@ fun Application.chatterbroModule() {
                         statusCode,
                         ErrorResponse(message),
                     )
+                }
+            }
+
+            get("/channels/live") {
+                val service = oauthService
+                if (service == null) {
+                    call.respond(HttpStatusCode.NotImplemented, ErrorResponse("Kick OAuth is not configured."))
+                    return@get
+                }
+
+                val slugs = call.request.queryParameters
+                    .getAll("slug")
+                    .orEmpty()
+                    .flatMap { value ->
+                        value.split(',')
+                    }
+                    .map(String::trim)
+                    .filter(String::isNotBlank)
+                    .distinct()
+
+                if (slugs.isEmpty()) {
+                    call.respond(HttpStatusCode.BadRequest, ErrorResponse("Add at least one channel slug."))
+                    return@get
+                }
+
+                try {
+                    call.respond(service.fetchLiveChannelsBySlugs(slugs))
+                } catch (exception: IllegalStateException) {
+                    val message = exception.message ?: "Kick OAuth failed to load tracked live channels."
+                    val statusCode = if (
+                        message.contains("sign in", ignoreCase = true) ||
+                        message.contains("expired", ignoreCase = true) ||
+                        message.contains("token", ignoreCase = true)
+                    ) {
+                        HttpStatusCode.Unauthorized
+                    } else {
+                        HttpStatusCode.BadGateway
+                    }
+
+                    call.respond(statusCode, ErrorResponse(message))
+                }
+            }
+
+            get("/channels/tracked") {
+                val service = oauthService
+                if (service == null) {
+                    call.respond(HttpStatusCode.NotImplemented, ErrorResponse("Kick OAuth is not configured."))
+                    return@get
+                }
+
+                val slugs = call.request.queryParameters
+                    .getAll("slug")
+                    .orEmpty()
+                    .flatMap { value ->
+                        value.split(',')
+                    }
+                    .map(String::trim)
+                    .filter(String::isNotBlank)
+                    .distinct()
+
+                if (slugs.isEmpty()) {
+                    call.respond(HttpStatusCode.BadRequest, ErrorResponse("Add at least one channel slug."))
+                    return@get
+                }
+
+                try {
+                    call.respond(service.fetchTrackedChannelsBySlugs(slugs))
+                } catch (exception: IllegalStateException) {
+                    val message = exception.message ?: "Kick OAuth failed to load tracked channels."
+                    val statusCode = if (
+                        message.contains("sign in", ignoreCase = true) ||
+                        message.contains("expired", ignoreCase = true) ||
+                        message.contains("token", ignoreCase = true)
+                    ) {
+                        HttpStatusCode.Unauthorized
+                    } else {
+                        HttpStatusCode.BadGateway
+                    }
+
+                    call.respond(statusCode, ErrorResponse(message))
                 }
             }
 
@@ -178,11 +288,21 @@ fun Application.chatterbroModule() {
                 } catch (exception: IllegalStateException) {
                     val message = exception.message ?: "Kick bridge failed to load channel chat."
                     val statusCode = if (
+                        message.contains("OAuth-only mode", ignoreCase = true) ||
+                        message.contains("Kick Public API", ignoreCase = true)
+                    ) {
+                        HttpStatusCode.NotImplemented
+                    } else if (
                         message.contains("sign in", ignoreCase = true) ||
                         message.contains("expired", ignoreCase = true) ||
                         message.contains("missing", ignoreCase = true)
                     ) {
                         HttpStatusCode.Unauthorized
+                    } else if (
+                        message.contains("Reconnect Kick browser", ignoreCase = true) ||
+                        message.contains("browser sync is not running", ignoreCase = true)
+                    ) {
+                        HttpStatusCode.Conflict
                     } else {
                         HttpStatusCode.BadGateway
                     }
@@ -191,6 +311,51 @@ fun Application.chatterbroModule() {
                         statusCode,
                         ErrorResponse(message),
                     )
+                }
+            }
+
+            post("/chat/{channelSlug}/messages") {
+                val service = oauthService
+                if (service == null) {
+                    call.respond(HttpStatusCode.NotImplemented, ErrorResponse("Kick OAuth is not configured."))
+                    return@post
+                }
+
+                val channelSlug = call.parameters["channelSlug"]?.trim().orEmpty()
+                if (channelSlug.isBlank()) {
+                    call.respond(HttpStatusCode.BadRequest, ErrorResponse("Channel slug is required."))
+                    return@post
+                }
+
+                val request = try {
+                    call.receive<SendChannelChatMessageRequest>()
+                } catch (_: Exception) {
+                    call.respond(HttpStatusCode.BadRequest, ErrorResponse("Chat message request body is invalid."))
+                    return@post
+                }
+
+                try {
+                    call.respond(
+                        service.sendChatMessage(
+                            channelSlug = channelSlug,
+                            broadcasterUserId = request.broadcasterUserId,
+                            content = request.content,
+                            replyToMessageId = request.replyToMessageId,
+                        ),
+                    )
+                } catch (exception: IllegalStateException) {
+                    val message = exception.message ?: "Kick failed to send the chat message."
+                    val statusCode = when {
+                        message.contains("chat:write", ignoreCase = true) -> HttpStatusCode.Forbidden
+                        message.contains("sign in", ignoreCase = true) ||
+                            message.contains("expired", ignoreCase = true) ||
+                            message.contains("token", ignoreCase = true) -> HttpStatusCode.Unauthorized
+                        message.contains("Enter a chat message", ignoreCase = true) ||
+                            message.contains("broadcaster user id", ignoreCase = true) -> HttpStatusCode.BadRequest
+                        else -> HttpStatusCode.BadGateway
+                    }
+
+                    call.respond(statusCode, ErrorResponse(message))
                 }
             }
         }

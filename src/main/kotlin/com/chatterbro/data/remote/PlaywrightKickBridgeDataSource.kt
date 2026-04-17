@@ -20,11 +20,12 @@ class PlaywrightKickBridgeDataSource(
         if (status.hasBrowserSession && status.isAuthenticated) {
             bridgeRunner.prewarmService()
         }
+
         return status
     }
 
-    override fun startBridgeSession(): KickBridgeStatus {
-        return bridgeRunner.startLoginBridge()
+    override fun startBridgeSession(forceReconnect: Boolean): KickBridgeStatus {
+        return bridgeRunner.startLoginBridge(forceReconnect)
     }
 
     override suspend fun getLiveFollowedChannels(): List<FollowedChannel> {

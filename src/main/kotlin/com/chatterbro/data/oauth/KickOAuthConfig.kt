@@ -1,5 +1,9 @@
 package com.chatterbro.data.oauth
 
+import com.chatterbro.config.LocalEnvironment
+import java.nio.file.Path
+import java.nio.file.Paths
+
 data class KickOAuthConfig(
     val clientId: String,
     val clientSecret: String,
@@ -8,26 +12,35 @@ data class KickOAuthConfig(
     val scopes: List<String>,
 ) {
     companion object {
+        private val defaultScopes = listOf("user:read", "channel:read", "chat:write")
+
         fun fromEnvironment(): KickOAuthConfig? {
-            val clientId = System.getenv("KICK_CLIENT_ID")?.trim().orEmpty()
-            val clientSecret = System.getenv("KICK_CLIENT_SECRET")?.trim().orEmpty()
-            val redirectUri = System.getenv("KICK_REDIRECT_URI")?.trim().orEmpty()
+            return fromSources()
+        }
+
+        internal fun fromSources(
+            environment: Map<String, String> = System.getenv(),
+            envFile: Path = Paths.get(".env"),
+        ): KickOAuthConfig? {
+            val clientId = LocalEnvironment.read("KICK_CLIENT_ID", environment, envFile).orEmpty()
+            val clientSecret = LocalEnvironment.read("KICK_CLIENT_SECRET", environment, envFile).orEmpty()
+            val redirectUri = LocalEnvironment.read("KICK_REDIRECT_URI", environment, envFile).orEmpty()
 
             if (clientId.isBlank() || clientSecret.isBlank() || redirectUri.isBlank()) {
                 return null
             }
 
-            val frontendUrl = System.getenv("CHATTERBRO_FRONTEND_URL")?.trim().orEmpty()
+            val frontendUrl = LocalEnvironment.read("CHATTERBRO_FRONTEND_URL", environment, envFile).orEmpty()
                 .ifBlank { "http://localhost:8080" }
                 .trimEnd('/')
 
-            val scopes = System.getenv("KICK_OAUTH_SCOPES")
+            val scopes = LocalEnvironment.read("KICK_OAUTH_SCOPES", environment, envFile)
                 ?.split(',', ' ')
                 ?.map(String::trim)
                 ?.filter(String::isNotBlank)
                 ?.distinct()
                 ?.takeIf(List<String>::isNotEmpty)
-                ?: listOf("user:read", "channel:read")
+                ?: defaultScopes
 
             return KickOAuthConfig(
                 clientId = clientId,

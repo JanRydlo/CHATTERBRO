@@ -11,12 +11,18 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.Closeable
 import java.io.IOException
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.time.Duration
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -31,6 +37,9 @@ class KickBridgeRunner(
     private val json = Json {
         ignoreUnknownKeys = true
     }
+    private val browserProbeClient = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofMillis(300))
+        .build()
 
     private val loginProcess = AtomicReference<Process?>(null)
     private val serviceProcess = AtomicReference<Process?>(null)
@@ -45,7 +54,7 @@ class KickBridgeRunner(
 
     private var requestCounter = 0L
 
-    fun startLoginBridge(): KickBridgeStatus {
+    fun startLoginBridge(forceReconnect: Boolean = false): KickBridgeStatus {
         paths.ensureDirectories()
 
         synchronized(serviceLock) {
@@ -54,7 +63,13 @@ class KickBridgeRunner(
 
         val currentProcess = loginProcess.get()
         if (currentProcess?.isAlive == true) {
-            return statusStore.readStatus().copy(message = "Kick bridge login window is already running.")
+            return statusStore.readStatus().copy(
+                message = if (forceReconnect) {
+                    "Kick browser reconnect window is already running."
+                } else {
+                    "Kick bridge login window is already running."
+                },
+            )
         }
 
         if (!paths.scriptFile.exists()) {
@@ -71,7 +86,11 @@ class KickBridgeRunner(
         statusStore.writeStatus(
             KickBridgeStatus(
                 state = BridgeState.RUNNING,
-                message = "Opening Kick login browser...",
+                message = if (forceReconnect) {
+                    "Opening Kick browser reconnect..."
+                } else {
+                    "Opening Kick login browser..."
+                },
                 hasToken = false,
                 isAuthenticated = false,
             ),
@@ -137,6 +156,10 @@ class KickBridgeRunner(
             return
         }
 
+        if (!hasReachableExistingBrowser()) {
+            return
+        }
+
         val existingProcess = serviceProcess.get()
         if (existingProcess?.isAlive == true && serviceReader != null && serviceWriter != null) {
             return
@@ -186,9 +209,17 @@ class KickBridgeRunner(
                     ensureServiceProcessLocked()
                     return sendServiceCommandLocked(command, payload, deserializer)
                 } catch (exception: ServiceBridgeException) {
+                    if (isReconnectRequiredBridgeFailure(exception)) {
+                        throw IllegalStateException(exception.message ?: "Kick bridge service is unavailable.", exception)
+                    }
+
                     lastFailure = exception
                     stopServiceProcessLocked()
                 } catch (exception: IllegalStateException) {
+                    if (isReconnectRequiredBridgeFailure(exception)) {
+                        throw exception
+                    }
+
                     if (!isRecoverableBridgeFailure(exception)) {
                         throw exception
                     }
@@ -240,11 +271,11 @@ class KickBridgeRunner(
 
         try {
             val readyLine = reader.readLine()
-                ?: throw ServiceBridgeException("Kick bridge service exited before becoming ready.")
+                ?: throw ServiceBridgeException(resolveServiceStartupFailureMessage("Kick bridge service exited before becoming ready."))
             val readyPayload = json.parseToJsonElement(readyLine).jsonObject
             val readyType = readyPayload["type"]?.jsonPrimitive?.contentOrNull
             if (readyType != "ready") {
-                throw ServiceBridgeException("Kick bridge service returned an unexpected startup response.")
+                throw ServiceBridgeException(resolveServiceStartupFailureMessage("Kick bridge service returned an unexpected startup response."))
             }
 
             serviceProcess.set(process)
@@ -266,10 +297,23 @@ class KickBridgeRunner(
             closeQuietly(reader)
             process.destroyForcibly()
             throw if (exception is ServiceBridgeException) exception else ServiceBridgeException(
-                exception.message ?: "Kick bridge service failed to start.",
+                resolveServiceStartupFailureMessage(exception.message ?: "Kick bridge service failed to start."),
                 exception,
             )
         }
+    }
+
+    private fun resolveServiceStartupFailureMessage(fallback: String): String {
+        val statusMessage = statusStore.readStatus().message.trim()
+        if (statusMessage.isBlank()) {
+            return fallback
+        }
+
+        if (statusMessage.equals(fallback.trim(), ignoreCase = true)) {
+            return fallback
+        }
+
+        return statusMessage
     }
 
     private fun <T> sendServiceCommandLocked(
@@ -351,6 +395,46 @@ class KickBridgeRunner(
     private fun isRecoverableBridgeFailure(exception: IllegalStateException): Boolean {
         val message = exception.message ?: return false
         return message.contains("Target page, context or browser has been closed", ignoreCase = true)
+    }
+
+    private fun isReconnectRequiredBridgeFailure(exception: IllegalStateException): Boolean {
+        val message = exception.message ?: return false
+        return message.contains("Reconnect Kick browser", ignoreCase = true) ||
+            message.contains("browser sync is not running", ignoreCase = true)
+    }
+
+    private fun hasReachableExistingBrowser(): Boolean {
+        val debuggingPort = readSavedDebuggingPort() ?: return false
+        val request = try {
+            HttpRequest.newBuilder(URI("http://127.0.0.1:$debuggingPort/json/version"))
+                .timeout(Duration.ofMillis(300))
+                .GET()
+                .build()
+        } catch (_: IllegalArgumentException) {
+            return false
+        }
+
+        return try {
+            val response = browserProbeClient.send(request, HttpResponse.BodyHandlers.discarding())
+            response.statusCode() in 200..299
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun readSavedDebuggingPort(): Int? {
+        if (!paths.metadataFile.exists()) {
+            return null
+        }
+
+        return try {
+            json.parseToJsonElement(paths.metadataFile.readText())
+                .jsonObject["debuggingPort"]
+                ?.jsonPrimitive
+                ?.intOrNull
+        } catch (_: Exception) {
+            null
+        }
     }
 
     private class ServiceBridgeException(
