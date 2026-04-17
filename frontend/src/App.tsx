@@ -45,6 +45,7 @@ const TOKEN_ONLY_ACTIVITY_MESSAGE = 'Kick OAuth is connected. Token-only mode is
 const TOKEN_ONLY_FOLLOWINGS_MESSAGE = 'Live followings are not available through Kick Public API in OAuth-only mode.';
 const TOKEN_ONLY_CHAT_MESSAGE = 'Chat history is not available through Kick Public API in OAuth-only mode.';
 const TRACKED_CHANNELS_STORAGE_KEY = 'chatterbro:tracked-channel-slugs';
+const badgeFallbackImageUrlCache = new Map<string, string>();
 
 interface RealtimeChatTarget {
   channelId: number | null;
@@ -150,7 +151,7 @@ function parseSerializedBadge(value: string): ChannelChatBadge | null {
   const typeMatch = value.match(/type=([^;}]*)/i);
   const textMatch = value.match(/text=([^;}]*)/i);
   const countMatch = value.match(/count=([^;}]*)/i);
-  const imageMatch = value.match(/(?:imageUrl|image_url|icon|icon_url|src|url)=([^;}]*)/i);
+  const imageMatch = value.match(/(?:imageUrl|image_url|image|iconUrl|icon|icon_url|src|url|badgeImageUrl|badge_image_url|badgeUrl|badge_url)=([^;}]*)/i);
   const type = typeMatch?.[1]?.trim() || '';
   const text = textMatch?.[1]?.trim() || type;
   const count = Number(countMatch?.[1]);
@@ -167,21 +168,88 @@ function parseSerializedBadge(value: string): ChannelChatBadge | null {
   };
 }
 
+function readBadgeUrlCandidate(value: unknown): string | null {
+  if (typeof value === 'string' && value.length > 0) {
+    return value;
+  }
+
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  const nestedCandidates = [
+    record.url,
+    record.src,
+    record.original,
+    record.original_url,
+    record.originalUrl,
+    record.full,
+    record.full_url,
+    record.fullUrl,
+    record.medium,
+    record.medium_url,
+    record.mediumUrl,
+    record.small,
+    record.small_url,
+    record.smallUrl,
+    record.image,
+    record.image_url,
+    record.imageUrl,
+    record.icon,
+    record.icon_url,
+    record.iconUrl,
+    record.thumbnail
+  ];
+
+  return nestedCandidates.find((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0) ?? null;
+}
+
 function resolveBadgeImageUrl(value: Record<string, unknown>) {
   const candidates = [
+    value.imageUrl,
     value.image,
     value.image_url,
+    value.iconUrl,
     value.icon,
     value.icon_url,
     value.src,
     value.url,
+    value.badgeImageUrl,
+    value.badge_image_url,
     value.badge_image,
+    value.badgeUrl,
+    value.badge_url,
+    value.smallIconUrl,
     value.small_icon_url,
-    value.thumbnail
+    value.thumbnail,
+    value.asset,
+    value.badge
   ];
 
-  const match = candidates.find((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0);
+  const match = candidates
+    .map((candidate) => readBadgeUrlCandidate(candidate))
+    .find((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0);
   return match ?? null;
+}
+
+function escapeSvgText(value: string) {
+  return value.replace(/[&<>"']/g, (character) => {
+    switch (character) {
+      case '&':
+        return '&amp;';
+      case '<':
+        return '&lt;';
+      case '>':
+        return '&gt;';
+      case '"':
+        return '&quot;';
+      case '\'':
+        return '&#39;';
+      default:
+        return character;
+    }
+  });
 }
 
 function resolvePreferredMessageContent(message: Record<string, unknown>) {
@@ -235,12 +303,90 @@ function getBadgeTitle(badge: ChannelChatBadge) {
   return badge.count ? `${label} ${badge.count}` : label;
 }
 
-function renderSenderBadge(badge: ChannelChatBadge, key: string) {
-  if (badge.imageUrl) {
-    return <img className="chat-badge-icon chat-badge-image" key={key} src={badge.imageUrl} alt={getBadgeTitle(badge)} title={getBadgeTitle(badge)} loading="lazy" decoding="async" draggable={false} />;
+function getBadgeFallbackTheme(badgeType: string) {
+  switch (badgeType) {
+    case 'moderator':
+      return { startColor: '#0d8b63', endColor: '#084c39', borderColor: '#27c98b', accentColor: '#d9fff0' };
+    case 'verified':
+      return { startColor: '#2f8cff', endColor: '#1452c6', borderColor: '#7cb7ff', accentColor: '#ecf5ff' };
+    case 'vip':
+      return { startColor: '#ff8f3f', endColor: '#c85a11', borderColor: '#ffd3a6', accentColor: '#fff1dd' };
+    case 'founder':
+      return { startColor: '#ff5f6d', endColor: '#c43758', borderColor: '#ffb8bf', accentColor: '#fff1f2' };
+    case 'subscriber':
+      return { startColor: '#9b5cff', endColor: '#5a2cb8', borderColor: '#ceb4ff', accentColor: '#f5eeff' };
+    case 'sub_gifter':
+      return { startColor: '#ff74c6', endColor: '#b93d84', borderColor: '#ffc4e6', accentColor: '#fff1f8' };
+    case 'og':
+      return { startColor: '#7d8799', endColor: '#3f4757', borderColor: '#c8d0dc', accentColor: '#f4f7fb' };
+    default:
+      return { startColor: '#54708d', endColor: '#2b384a', borderColor: '#a9b8ca', accentColor: '#f4f7fb' };
+  }
+}
+
+function getBadgeFallbackIconMarkup(badgeType: string, accentColor: string) {
+  switch (badgeType) {
+    case 'moderator':
+      return `<path d="M12 2.5L20 6v6.2c0 5.4-4 8.9-8 10.8-4-1.9-8-5.4-8-10.8V6l8-3.5Z" fill="${accentColor}"/>`;
+    case 'verified':
+      return `<circle cx="12" cy="12" r="9" fill="${accentColor}"/><path d="m8.2 12.4 2.5 2.6 5.3-5.7" fill="none" stroke="#1452c6" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>`;
+    case 'vip':
+      return `<path d="M12 2.8 20.6 12 12 21.2 3.4 12 12 2.8Z" fill="${accentColor}"/><path d="m12 6.8 1.7 3.2 3.6.5-2.6 2.5.6 3.5-3.3-1.7-3.2 1.7.6-3.5-2.6-2.5 3.6-.5L12 6.8Z" fill="#c85a11"/>`;
+    case 'founder':
+      return `<path d="M4.2 18.6 5.7 7.5l4.1 3.4 2.2-4.4 2.2 4.4 4.1-3.4 1.5 11.1H4.2Z" fill="${accentColor}"/><rect x="4.8" y="18.8" width="14.4" height="2.9" rx="1.4" fill="#c43758"/>`;
+    case 'subscriber':
+      return `<path d="m12 4.4 2.1 4.2 4.7.7-3.4 3.3.8 4.6-4.2-2.2-4.2 2.2.8-4.6-3.4-3.3 4.7-.7L12 4.4Z" fill="${accentColor}"/>`;
+    case 'sub_gifter':
+      return `<rect x="5" y="8" width="14" height="11" rx="2.2" fill="${accentColor}"/><path d="M12 8v11M5 12h14M8 8c-1.8 0-3-1-3-2.3 0-1.2 1-2.1 2.3-2.1C9.6 3.6 12 8 12 8m4 0c1.8 0 3-1 3-2.3 0-1.2-1-2.1-2.3-2.1C14.4 3.6 12 8 12 8" fill="none" stroke="#b93d84" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>`;
+    case 'og':
+      return `<path d="M7 5.1h10l5 6.9-5 6.9H7L2 12l5-6.9Z" fill="${accentColor}"/>`;
+    default:
+      return `<circle cx="12" cy="12" r="8.8" fill="${accentColor}"/>`;
+  }
+}
+
+function buildBadgeFallbackImageUrl(badge: ChannelChatBadge) {
+  const badgeType = badge.type.toLowerCase();
+  const label = getBadgeLabel(badge).slice(0, 3).toUpperCase();
+  const cacheKey = `${badgeType}:${badge.count ?? 'none'}:${label}`;
+  const cachedImageUrl = badgeFallbackImageUrlCache.get(cacheKey);
+
+  if (cachedImageUrl) {
+    return cachedImageUrl;
   }
 
-  return <span className="chat-badge-icon chat-badge-fallback" key={key} title={getBadgeTitle(badge)}>{getBadgeLabel(badge)}</span>;
+  const theme = getBadgeFallbackTheme(badgeType);
+  const badgeTitle = escapeSvgText(getBadgeTitle(badge));
+  const safeLabel = escapeSvgText(label);
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="72" height="32" viewBox="0 0 72 32" aria-label="${badgeTitle}" role="img"><defs><linearGradient id="badge-gradient" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="${theme.startColor}"/><stop offset="100%" stop-color="${theme.endColor}"/></linearGradient></defs><rect x="0.75" y="0.75" width="70.5" height="30.5" rx="10" fill="url(#badge-gradient)" stroke="${theme.borderColor}" stroke-width="1.5"/><g transform="translate(5 4)">${getBadgeFallbackIconMarkup(badgeType, theme.accentColor)}</g><text x="44" y="20.4" text-anchor="middle" fill="#ffffff" font-family="IBM Plex Mono, monospace" font-size="13" font-weight="700">${safeLabel}</text></svg>`;
+  const imageUrl = `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
+
+  badgeFallbackImageUrlCache.set(cacheKey, imageUrl);
+  return imageUrl;
+}
+
+function renderSenderBadge(badge: ChannelChatBadge, key: string) {
+  const title = getBadgeTitle(badge);
+  const fallbackImageUrl = buildBadgeFallbackImageUrl(badge);
+  const imageUrl = badge.imageUrl || fallbackImageUrl;
+
+  return (
+    <img
+      className="chat-badge-icon chat-badge-image"
+      key={key}
+      src={imageUrl}
+      alt={title}
+      title={title}
+      loading="lazy"
+      decoding="async"
+      draggable={false}
+      onError={(event) => {
+        if (event.currentTarget.src !== fallbackImageUrl) {
+          event.currentTarget.src = fallbackImageUrl;
+        }
+      }}
+    />
+  );
 }
 
 function buildChannelEmoteIndex(catalog: ChannelChatEmoteCatalog) {

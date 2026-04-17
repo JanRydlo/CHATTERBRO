@@ -710,20 +710,67 @@ async function fetchChannelChatFromApi(page, channelSlug, authToken) {
 
       const kickPlaceholderPattern = /\[emote:\d+:[^\]]+\]/;
 
+      const readBadgeUrlCandidate = (value) => {
+        if (typeof value === 'string' && value.length > 0) {
+          return value;
+        }
+
+        if (!value || typeof value !== 'object' || Array.isArray(value)) {
+          return null;
+        }
+
+        const candidates = [
+          value?.url,
+          value?.src,
+          value?.original,
+          value?.original_url,
+          value?.originalUrl,
+          value?.full,
+          value?.full_url,
+          value?.fullUrl,
+          value?.medium,
+          value?.medium_url,
+          value?.mediumUrl,
+          value?.small,
+          value?.small_url,
+          value?.smallUrl,
+          value?.image,
+          value?.image_url,
+          value?.imageUrl,
+          value?.icon,
+          value?.icon_url,
+          value?.iconUrl,
+          value?.thumbnail
+        ];
+
+        return candidates.find((candidate) => typeof candidate === 'string' && candidate.length > 0) || null;
+      };
+
       const resolveBadgeImageUrl = (badge) => {
         const candidates = [
+          badge?.imageUrl,
           badge?.image,
           badge?.image_url,
+          badge?.iconUrl,
           badge?.icon,
           badge?.icon_url,
           badge?.src,
           badge?.url,
+          badge?.badgeImageUrl,
+          badge?.badge_image_url,
           badge?.badge_image,
+          badge?.badgeUrl,
+          badge?.badge_url,
+          badge?.smallIconUrl,
           badge?.small_icon_url,
-          badge?.thumbnail
+          badge?.thumbnail,
+          badge?.asset,
+          badge?.badge
         ];
 
-        const match = candidates.find((candidate) => typeof candidate === 'string' && candidate.length > 0);
+        const match = candidates
+          .map((candidate) => readBadgeUrlCandidate(candidate))
+          .find((candidate) => typeof candidate === 'string' && candidate.length > 0);
         return match || null;
       };
 
