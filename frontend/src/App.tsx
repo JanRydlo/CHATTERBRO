@@ -216,7 +216,7 @@ function parseSerializedBadge(value: string): ChannelChatBadge | null {
   const typeMatch = value.match(/type=([^;}]*)/i);
   const textMatch = value.match(/text=([^;}]*)/i);
   const countMatch = value.match(/count=([^;}]*)/i);
-  const imageMatch = value.match(/(?:imageUrl|image_url|image|iconUrl|icon_url|icon|src|url|badgeImageUrl|badge_image_url|badgeUrl|badge_url)=([^;}]*)/i);
+  const imageMatch = value.match(/(?:imageUrl|image_url|image|iconUrl|icon_url|icon|src|srcset|url|badgeImageUrl|badge_image_url|badgeUrl|badge_url|original|originalUrl|original_url|fullsize|fullSize|full_size)=([^;}]*)/i);
   const type = typeMatch?.[1]?.trim() || '';
   const text = textMatch?.[1]?.trim() || type;
   const count = Number(countMatch?.[1]);
@@ -229,40 +229,93 @@ function parseSerializedBadge(value: string): ChannelChatBadge | null {
     type,
     text,
     count: Number.isFinite(count) ? count : null,
-    imageUrl: imageMatch?.[1]?.trim() || null
+    imageUrl: normalizeBadgeImageUrlCandidate(imageMatch?.[1] ?? null)
   };
 }
 
+function normalizeBadgeImageUrlCandidate(value: unknown) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmedValue = value.trim();
+  if (!trimmedValue) {
+    return null;
+  }
+
+  if (!trimmedValue.startsWith('data:') && (trimmedValue.includes(',') || /\s\d+[wx](?:\s|$)/i.test(trimmedValue))) {
+    const firstSrcsetEntry = trimmedValue
+      .split(',')
+      .map((entry) => entry.trim())
+      .find((entry) => entry.length > 0);
+
+    if (!firstSrcsetEntry) {
+      return null;
+    }
+
+    const [firstUrl] = firstSrcsetEntry.split(/\s+/);
+    return firstUrl || null;
+  }
+
+  return trimmedValue;
+}
+
+function resolveNestedBadgeImageUrl(value: unknown) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  const directMatch = [
+    record.url,
+    record.src,
+    record.srcUrl,
+    record.src_url,
+    record.original,
+    record.originalUrl,
+    record.original_url,
+    record.fullsize,
+    record.fullSize,
+    record.full_size
+  ]
+    .map((candidate) => normalizeBadgeImageUrlCandidate(candidate))
+    .find((candidate): candidate is string => candidate !== null);
+
+  if (directMatch) {
+    return directMatch;
+  }
+
+  return normalizeBadgeImageUrlCandidate(record.srcset)
+    ?? normalizeBadgeImageUrlCandidate(record.srcSet);
+}
+
 function resolveBadgeImageUrl(value: Record<string, unknown>) {
-  const nestedImageUrl = value.image && typeof value.image === 'object' && !Array.isArray(value.image)
-    ? (value.image as { url?: unknown }).url
-    : null;
-  const nestedIconUrl = value.icon && typeof value.icon === 'object' && !Array.isArray(value.icon)
-    ? (value.icon as { url?: unknown }).url
-    : null;
-  const nestedThumbnailUrl = value.thumbnail && typeof value.thumbnail === 'object' && !Array.isArray(value.thumbnail)
-    ? (value.thumbnail as { url?: unknown }).url
-    : null;
   const candidates = [
     value.image,
-    nestedImageUrl,
+    resolveNestedBadgeImageUrl(value.image),
     value.image_url,
+    value.badgeImage,
     value.badgeImageUrl,
     value.badge_image_url,
+    value.badge_image,
+    resolveNestedBadgeImageUrl(value.badgeImage),
+    resolveNestedBadgeImageUrl(value.badge_image),
     value.icon,
-    nestedIconUrl,
+    resolveNestedBadgeImageUrl(value.icon),
     value.icon_url,
     value.src,
+    value.srcset,
     value.url,
     value.badgeUrl,
     value.badge_url,
-    value.badge_image,
     value.small_icon_url,
     value.thumbnail,
-    nestedThumbnailUrl
+    resolveNestedBadgeImageUrl(value.thumbnail)
   ];
 
-  const match = candidates.find((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0);
+  const match = candidates
+    .map((candidate) => normalizeBadgeImageUrlCandidate(candidate))
+    .find((candidate): candidate is string => candidate !== null);
   return match ?? null;
 }
 
