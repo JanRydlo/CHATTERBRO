@@ -40,7 +40,8 @@ const KICK_PUSHER_OPTIONS: PusherOptions = {
 const INVISIBLE_EXTERNAL_EMOTE_PATTERN = /[\u200B-\u200D\uFEFF\u00AD\u{E0000}-\u{E007F}]/gu;
 const KICK_PLACEHOLDER_PATTERN = /\[emote:(\d+):([^\]]+)\]/g;
 const KICK_PLACEHOLDER_DETECTION_PATTERN = /\[emote:\d+:[^\]]+\]/;
-const BROWSER_RECONNECT_REQUIRED_PATTERN = /reconnect kick browser|browser sync is not running|refresh the kick website session/i;
+const SECURITY_POLICY_BLOCKED_PATTERN = /security policy|request blocked by security policy/i;
+const BROWSER_RECONNECT_REQUIRED_PATTERN = /reconnect kick browser|browser sync is not running|sign in again|rejected the saved session|security policy/i;
 const TOKEN_ONLY_ACTIVITY_MESSAGE = 'Kick OAuth is connected. Token-only mode is active. No Kick browser will be kept running in the background.';
 const TOKEN_ONLY_FOLLOWINGS_MESSAGE = 'Live followings are not available through Kick Public API in OAuth-only mode.';
 const TOKEN_ONLY_CHAT_MESSAGE = 'Chat history is not available through Kick Public API in OAuth-only mode.';
@@ -74,6 +75,10 @@ function isBrowserReconnectRequiredMessage(value: string | null | undefined) {
   return Boolean(value && BROWSER_RECONNECT_REQUIRED_PATTERN.test(value));
 }
 
+function isSecurityPolicyBlockedMessage(value: string | null | undefined) {
+  return Boolean(value && SECURITY_POLICY_BLOCKED_PATTERN.test(value));
+}
+
 function parseTrackedChannelSlugs(value: string) {
   return [...new Set(
     value
@@ -92,7 +97,7 @@ function buildTokenOnlyChatShell(channel: FollowedChannel): ChannelChat {
     channelSlug: channel.channelSlug,
     channelId: channel.channelId,
     channelUserId: channel.broadcasterUserId,
-    chatroomId: null,
+    chatroomId: channel.chatroomId,
     displayName: channel.displayName,
     channelUrl: channel.channelUrl,
     avatarUrl: channel.thumbnailUrl,
@@ -101,6 +106,20 @@ function buildTokenOnlyChatShell(channel: FollowedChannel): ChannelChat {
     pinnedMessage: null,
     updatedAt: new Date().toISOString()
   };
+}
+
+function AvatarMedia({ imageUrl, label }: { imageUrl: string | null | undefined; label: string }) {
+  const [imageFailed, setImageFailed] = useState(false);
+
+  useEffect(() => {
+    setImageFailed(false);
+  }, [imageUrl]);
+
+  if (!imageUrl || imageFailed) {
+    return <span>{label.slice(0, 1).toUpperCase()}</span>;
+  }
+
+  return <img src={imageUrl} alt={label} onError={() => setImageFailed(true)} />;
 }
 
 function appendLocalChatMessage(currentChat: ChannelChat | null, nextMessage: ChannelChatMessage) {
@@ -160,6 +179,7 @@ function mergeDiscoveredChannel(currentChannel: FollowedChannel | undefined, nex
     thumbnailUrl: nextChannel.thumbnailUrl ?? currentChannel.thumbnailUrl,
     broadcasterUserId: nextChannel.broadcasterUserId ?? currentChannel.broadcasterUserId,
     channelId: nextChannel.channelId ?? currentChannel.channelId,
+    chatroomId: nextChannel.chatroomId ?? currentChannel.chatroomId,
     viewerCount: nextChannel.viewerCount ?? currentChannel.viewerCount,
     streamTitle: nextChannel.streamTitle ?? currentChannel.streamTitle,
     categoryName: nextChannel.categoryName ?? currentChannel.categoryName,
@@ -196,7 +216,7 @@ function parseSerializedBadge(value: string): ChannelChatBadge | null {
   const typeMatch = value.match(/type=([^;}]*)/i);
   const textMatch = value.match(/text=([^;}]*)/i);
   const countMatch = value.match(/count=([^;}]*)/i);
-  const imageMatch = value.match(/(?:imageUrl|image_url|image|iconUrl|icon|icon_url|src|url|badgeImageUrl|badge_image_url|badgeUrl|badge_url)=([^;}]*)/i);
+  const imageMatch = value.match(/(?:imageUrl|image_url|image|iconUrl|icon_url|icon|src|url|badgeImageUrl|badge_image_url|badgeUrl|badge_url)=([^;}]*)/i);
   const type = typeMatch?.[1]?.trim() || '';
   const text = textMatch?.[1]?.trim() || type;
   const count = Number(countMatch?.[1]);
@@ -213,68 +233,36 @@ function parseSerializedBadge(value: string): ChannelChatBadge | null {
   };
 }
 
-function readBadgeUrlCandidate(value: unknown): string | null {
-  if (typeof value === 'string' && value.length > 0) {
-    return value;
-  }
-
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return null;
-  }
-
-  const record = value as Record<string, unknown>;
-  const nestedCandidates = [
-    record.url,
-    record.src,
-    record.original,
-    record.original_url,
-    record.originalUrl,
-    record.full,
-    record.full_url,
-    record.fullUrl,
-    record.medium,
-    record.medium_url,
-    record.mediumUrl,
-    record.small,
-    record.small_url,
-    record.smallUrl,
-    record.image,
-    record.image_url,
-    record.imageUrl,
-    record.icon,
-    record.icon_url,
-    record.iconUrl,
-    record.thumbnail
-  ];
-
-  return nestedCandidates.find((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0) ?? null;
-}
-
 function resolveBadgeImageUrl(value: Record<string, unknown>) {
+  const nestedImageUrl = value.image && typeof value.image === 'object' && !Array.isArray(value.image)
+    ? (value.image as { url?: unknown }).url
+    : null;
+  const nestedIconUrl = value.icon && typeof value.icon === 'object' && !Array.isArray(value.icon)
+    ? (value.icon as { url?: unknown }).url
+    : null;
+  const nestedThumbnailUrl = value.thumbnail && typeof value.thumbnail === 'object' && !Array.isArray(value.thumbnail)
+    ? (value.thumbnail as { url?: unknown }).url
+    : null;
   const candidates = [
-    value.imageUrl,
     value.image,
+    nestedImageUrl,
     value.image_url,
-    value.iconUrl,
+    value.badgeImageUrl,
+    value.badge_image_url,
     value.icon,
+    nestedIconUrl,
     value.icon_url,
     value.src,
     value.url,
-    value.badgeImageUrl,
-    value.badge_image_url,
-    value.badge_image,
     value.badgeUrl,
     value.badge_url,
-    value.smallIconUrl,
+    value.badge_image,
     value.small_icon_url,
     value.thumbnail,
-    value.asset,
-    value.badge
+    nestedThumbnailUrl
   ];
 
-  const match = candidates
-    .map((candidate) => readBadgeUrlCandidate(candidate))
-    .find((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0);
+  const match = candidates.find((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0);
   return match ?? null;
 }
 
@@ -1031,33 +1019,181 @@ function mergeChannelChat(currentChat: ChannelChat | null, nextChat: ChannelChat
   };
 }
 
+interface OpenChatTabState {
+  channel: FollowedChannel;
+  chat: ChannelChat | null;
+  isLoadingChat: boolean;
+  isSendingChat: boolean;
+  chatError: string | null;
+  sendChatError: string | null;
+  liveChatState: LiveChatState;
+  liveChatError: string | null;
+  draft: string;
+}
+
+type OpenChatTabStateRecord = Record<string, OpenChatTabState>;
+
+function createOpenChatTabState(channel: FollowedChannel): OpenChatTabState {
+  return {
+    channel,
+    chat: null,
+    isLoadingChat: false,
+    isSendingChat: false,
+    chatError: null,
+    sendChatError: null,
+    liveChatState: 'idle',
+    liveChatError: null,
+    draft: ''
+  };
+}
+
+function mergeOpenChatTabChannel(currentChannel: FollowedChannel, nextChannel: FollowedChannel): FollowedChannel {
+  return {
+    channelSlug: nextChannel.channelSlug || currentChannel.channelSlug,
+    displayName: nextChannel.displayName || currentChannel.displayName,
+    isLive: currentChannel.isLive || nextChannel.isLive,
+    channelUrl: nextChannel.channelUrl || currentChannel.channelUrl,
+    chatUrl: nextChannel.chatUrl || currentChannel.chatUrl,
+    thumbnailUrl: nextChannel.thumbnailUrl ?? currentChannel.thumbnailUrl,
+    broadcasterUserId: nextChannel.broadcasterUserId ?? currentChannel.broadcasterUserId,
+    channelId: nextChannel.channelId ?? currentChannel.channelId,
+    chatroomId: nextChannel.chatroomId ?? currentChannel.chatroomId,
+    viewerCount: nextChannel.viewerCount ?? currentChannel.viewerCount,
+    streamTitle: nextChannel.streamTitle ?? currentChannel.streamTitle,
+    categoryName: nextChannel.categoryName ?? currentChannel.categoryName,
+    tags: nextChannel.tags.length > 0 ? nextChannel.tags : currentChannel.tags,
+  };
+}
+
+function mergeOpenChatChannelChat(currentChat: ChannelChat | null, channel: FollowedChannel) {
+  if (!currentChat || currentChat.channelSlug !== channel.channelSlug) {
+    return currentChat;
+  }
+
+  return {
+    ...currentChat,
+    channelId: channel.channelId ?? currentChat.channelId,
+    channelUserId: channel.broadcasterUserId ?? currentChat.channelUserId,
+    chatroomId: channel.chatroomId ?? currentChat.chatroomId,
+    displayName: channel.displayName,
+    channelUrl: channel.channelUrl,
+    avatarUrl: channel.thumbnailUrl ?? currentChat.avatarUrl
+  };
+}
+
+function updateOpenChatTabState(
+  currentTabs: OpenChatTabStateRecord,
+  channelSlug: string,
+  updater: (currentTab: OpenChatTabState) => OpenChatTabState,
+) {
+  const currentTab = currentTabs[channelSlug];
+  if (!currentTab) {
+    return currentTabs;
+  }
+
+  const nextTab = updater(currentTab);
+  if (nextTab === currentTab) {
+    return currentTabs;
+  }
+
+  return {
+    ...currentTabs,
+    [channelSlug]: nextTab
+  };
+}
+
+function removeRecordEntry<T>(record: Record<string, T>, key: string) {
+  if (!(key in record)) {
+    return record;
+  }
+
+  const nextRecord = { ...record };
+  delete nextRecord[key];
+  return nextRecord;
+}
+
+function getRealtimeTargetForTab(tab: OpenChatTabState): RealtimeChatTarget {
+  const chatroomId = tab.chat?.chatroomId ?? tab.channel.chatroomId ?? null;
+
+  return {
+    channelId: chatroomId === null ? null : (tab.chat?.channelId ?? tab.channel.channelId ?? null),
+    chatroomId
+  };
+}
+
+function channelChatHasMissingBadgeAssets(chat: ChannelChat | null) {
+  if (!chat) {
+    return false;
+  }
+
+  const badgeImageUrlIndex = buildBadgeImageUrlIndex(chat.messages);
+  return chat.messages.some((message) => (message.sender.badges || []).some(
+    (badge) => !badge.imageUrl && !resolveCachedBadgeImageUrl(badge, badgeImageUrlIndex)
+  ));
+}
+
+function channelChatNeedsSnapshotEnrichment(chat: ChannelChat | null) {
+  if (!chat) {
+    return false;
+  }
+
+  return chat.chatroomId === null || channelChatHasMissingBadgeAssets(chat);
+}
+
+function appendRealtimeChatMessageToTabs(
+  currentTabs: OpenChatTabStateRecord,
+  entries: Array<{ channelSlug: string; target: RealtimeChatTarget }>,
+  nextMessage: ChannelChatMessage,
+) {
+  let nextTabs = currentTabs;
+
+  for (const entry of entries) {
+    const currentTab = nextTabs[entry.channelSlug] ?? currentTabs[entry.channelSlug];
+    if (!currentTab?.chat) {
+      continue;
+    }
+
+    const nextChat = appendRealtimeChatMessage(currentTab.chat, entry.target, nextMessage);
+    if (nextChat === currentTab.chat) {
+      continue;
+    }
+
+    if (nextTabs === currentTabs) {
+      nextTabs = { ...currentTabs };
+    }
+
+    nextTabs[entry.channelSlug] = {
+      ...currentTab,
+      chat: nextChat
+    };
+  }
+
+  return nextTabs;
+}
+
 export default function App() {
   const [bridgeStatus, setBridgeStatus] = useState<KickBridgeStatus>(FALLBACK_STATUS);
   const [channels, setChannels] = useState<FollowedChannel[]>([]);
   const [trackedChannelSlugs, setTrackedChannelSlugs] = useState<string[]>([]);
   const [trackedChannelDraft, setTrackedChannelDraft] = useState('');
-  const [selectedChannel, setSelectedChannel] = useState<FollowedChannel | null>(null);
-  const [channelChat, setChannelChat] = useState<ChannelChat | null>(null);
+  const [openChatTabSlugs, setOpenChatTabSlugs] = useState<string[]>([]);
+  const [activeChatTabSlug, setActiveChatTabSlug] = useState<string | null>(null);
+  const [openChatTabs, setOpenChatTabs] = useState<OpenChatTabStateRecord>({});
   const [globalEmoteIndex, setGlobalEmoteIndex] = useState<Record<string, ChannelChatEmote>>({});
   const [channelEmoteCache, setChannelEmoteCache] = useState<Record<string, ChannelEmoteCacheEntry>>({});
   const [isStartingBridge, setIsStartingBridge] = useState(false);
   const [isLoadingChannels, setIsLoadingChannels] = useState(false);
-  const [isLoadingChat, setIsLoadingChat] = useState(false);
-  const [isSendingChat, setIsSendingChat] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [chatError, setChatError] = useState<string | null>(null);
-  const [sendChatError, setSendChatError] = useState<string | null>(null);
-  const [liveChatState, setLiveChatState] = useState<LiveChatState>('idle');
-  const [liveChatError, setLiveChatError] = useState<string | null>(null);
   const [activity, setActivity] = useState('Kick token mode is idle. Connect Kick once and the app will keep using the saved token until it expires.');
   const [requiresBrowserReconnect, setRequiresBrowserReconnect] = useState(false);
   const [lastLoadedUsername, setLastLoadedUsername] = useState('');
-  const [chatDraft, setChatDraft] = useState('');
-  const chatFeedRef = useRef<HTMLDivElement | null>(null);
-  const channelChatRef = useRef<ChannelChat | null>(null);
-  const openChatRefreshInFlightRef = useRef(false);
-  const lastRealtimeBadgeRefreshAtRef = useRef(0);
+  const openChatTabsRef = useRef<OpenChatTabStateRecord>({});
+  const openChatRefreshInFlightRef = useRef(new Set<string>());
+  const chatRequestsInFlightRef = useRef(new Map<string, Promise<ChannelChat>>());
+  const lastRealtimeBadgeRefreshAtRef = useRef(new Map<string, number>());
+  const lastSnapshotEnrichmentAtRef = useRef(new Map<string, number>());
   const emoteRequestsInFlightRef = useRef(new Set<string>());
+  const chatFeedRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     void refreshBridgeStatus();
@@ -1096,10 +1232,6 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    channelChatRef.current = channelChat;
-  }, [channelChat]);
-
-  useEffect(() => {
     if (trackedChannelSlugs.length === 0) {
       window.localStorage.removeItem(TRACKED_CHANNELS_STORAGE_KEY);
       return;
@@ -1119,20 +1251,221 @@ export default function App() {
     }
   }
 
+  useEffect(() => {
+    openChatTabsRef.current = openChatTabs;
+  }, [openChatTabs]);
+
+  function rememberOpenChatChannel(channel: FollowedChannel) {
+    startTransition(() => {
+      setOpenChatTabs((currentTabs) => {
+        const currentTab = currentTabs[channel.channelSlug];
+        if (!currentTab) {
+          return {
+            ...currentTabs,
+            [channel.channelSlug]: createOpenChatTabState(channel)
+          };
+        }
+
+        const nextChannel = mergeOpenChatTabChannel(currentTab.channel, channel);
+        const nextChat = mergeOpenChatChannelChat(currentTab.chat, nextChannel);
+
+        return {
+          ...currentTabs,
+          [channel.channelSlug]: {
+            ...currentTab,
+            channel: nextChannel,
+            chat: nextChat
+          }
+        };
+      });
+    });
+  }
+
+  function setChatDraftForChannel(channelSlug: string, draft: string) {
+    startTransition(() => {
+      setOpenChatTabs((currentTabs) => updateOpenChatTabState(currentTabs, channelSlug, (currentTab) => ({
+        ...currentTab,
+        draft
+      })));
+    });
+  }
+
+  function setChatErrorForChannel(channelSlug: string, nextChatError: string | null) {
+    startTransition(() => {
+      setOpenChatTabs((currentTabs) => updateOpenChatTabState(currentTabs, channelSlug, (currentTab) => ({
+        ...currentTab,
+        chatError: nextChatError
+      })));
+    });
+  }
+
+  function setSendChatErrorForChannel(channelSlug: string, nextSendChatError: string | null) {
+    startTransition(() => {
+      setOpenChatTabs((currentTabs) => updateOpenChatTabState(currentTabs, channelSlug, (currentTab) => ({
+        ...currentTab,
+        sendChatError: nextSendChatError
+      })));
+    });
+  }
+
+  function setLiveChatStateForChannel(channelSlug: string, nextLiveChatState: LiveChatState, nextLiveChatError: string | null = null) {
+    startTransition(() => {
+      setOpenChatTabs((currentTabs) => updateOpenChatTabState(currentTabs, channelSlug, (currentTab) => ({
+        ...currentTab,
+        liveChatState: nextLiveChatState,
+        liveChatError: nextLiveChatError
+      })));
+    });
+  }
+
+  function setLoadingChatForChannel(channelSlug: string, nextIsLoadingChat: boolean) {
+    startTransition(() => {
+      setOpenChatTabs((currentTabs) => updateOpenChatTabState(currentTabs, channelSlug, (currentTab) => ({
+        ...currentTab,
+        isLoadingChat: nextIsLoadingChat
+      })));
+    });
+  }
+
+  function setSendingChatForChannel(channelSlug: string, nextIsSendingChat: boolean) {
+    startTransition(() => {
+      setOpenChatTabs((currentTabs) => updateOpenChatTabState(currentTabs, channelSlug, (currentTab) => ({
+        ...currentTab,
+        isSendingChat: nextIsSendingChat
+      })));
+    });
+  }
+
+  function updateOpenChannelChat(channelSlug: string, updater: (currentChat: ChannelChat | null) => ChannelChat | null) {
+    startTransition(() => {
+      setOpenChatTabs((currentTabs) => updateOpenChatTabState(currentTabs, channelSlug, (currentTab) => ({
+        ...currentTab,
+        chat: updater(currentTab.chat)
+      })));
+    });
+  }
+
+  function getOpenChatChannel(channelSlug: string) {
+    return openChatTabsRef.current[channelSlug]?.channel
+      ?? channels.find((channel) => channel.channelSlug === channelSlug)
+      ?? null;
+  }
+
+  async function loadChannelChatSnapshot(channel: FollowedChannel, options: { forceFull?: boolean } = {}) {
+    const currentTab = openChatTabsRef.current[channel.channelSlug];
+    const resolvedChannelId = currentTab?.chat?.channelId ?? currentTab?.channel.channelId ?? channel.channelId;
+    const resolvedChannelUserId = currentTab?.chat?.channelUserId ?? currentTab?.channel.broadcasterUserId ?? channel.broadcasterUserId;
+    const resolvedDisplayName = currentTab?.chat?.displayName ?? currentTab?.channel.displayName ?? channel.displayName;
+    const resolvedAvatarUrl = currentTab?.chat?.avatarUrl ?? currentTab?.channel.thumbnailUrl ?? channel.thumbnailUrl;
+    const requestMode = options.forceFull || resolvedChannelId === null ? 'full' : 'fast';
+    const requestKey = `${channel.channelSlug}:${requestMode}`;
+    const existingRequest = chatRequestsInFlightRef.current.get(requestKey);
+    if (existingRequest) {
+      return existingRequest;
+    }
+
+    const request = fetchChannelChat({
+      channelSlug: channel.channelSlug,
+      channelId: resolvedChannelId,
+      channelUserId: resolvedChannelUserId,
+      displayName: resolvedDisplayName,
+      avatarUrl: resolvedAvatarUrl,
+      fast: requestMode === 'fast'
+    }).finally(() => {
+      chatRequestsInFlightRef.current.delete(requestKey);
+    });
+
+    chatRequestsInFlightRef.current.set(requestKey, request);
+    return request;
+  }
+
+  function activateChatTab(channelSlug: string) {
+    if (activeChatTabSlug === channelSlug) {
+      return;
+    }
+
+    setActiveChatTabSlug(channelSlug);
+  }
+
+  function openChatTab(channel: FollowedChannel) {
+    rememberOpenChatChannel(channel);
+    setOpenChatTabSlugs((currentTabSlugs) => currentTabSlugs.includes(channel.channelSlug)
+      ? currentTabSlugs
+      : [...currentTabSlugs, channel.channelSlug]);
+    activateChatTab(channel.channelSlug);
+
+    const currentTab = openChatTabsRef.current[channel.channelSlug];
+    if (!currentTab?.chat || (!currentTab.channel.isLive && channel.isLive)) {
+      void loadChannelChat(channel);
+    }
+  }
+
+  function closeChatTab(channelSlug: string) {
+    const currentIndex = openChatTabSlugs.indexOf(channelSlug);
+    if (currentIndex < 0) {
+      return;
+    }
+
+    const nextTabSlugs = openChatTabSlugs.filter((entry) => entry !== channelSlug);
+
+    startTransition(() => {
+      setOpenChatTabSlugs(nextTabSlugs);
+      setActiveChatTabSlug((currentActiveChatTabSlug) => currentActiveChatTabSlug === channelSlug
+        ? nextTabSlugs[currentIndex] ?? nextTabSlugs[currentIndex - 1] ?? null
+        : currentActiveChatTabSlug);
+      setOpenChatTabs((currentTabs) => removeRecordEntry(currentTabs, channelSlug));
+    });
+
+    for (const requestKey of [...openChatRefreshInFlightRef.current]) {
+      if (requestKey.startsWith(`${channelSlug}:`)) {
+        openChatRefreshInFlightRef.current.delete(requestKey);
+      }
+    }
+
+    for (const requestKey of [...chatRequestsInFlightRef.current.keys()]) {
+      if (requestKey.startsWith(`${channelSlug}:`)) {
+        chatRequestsInFlightRef.current.delete(requestKey);
+      }
+    }
+
+    lastRealtimeBadgeRefreshAtRef.current.delete(channelSlug);
+    lastSnapshotEnrichmentAtRef.current.delete(channelSlug);
+  }
+
   const isAuthenticated = bridgeStatus.isAuthenticated && Boolean(bridgeStatus.profile);
   const profile = bridgeStatus.profile;
   const tokenOnlyMode = true;
-  const browserChatEnabled = bridgeStatus.hasBrowserSession;
+  const browserChatEnabled = bridgeStatus.hasBrowserSession && !requiresBrowserReconnect;
   const hasChatWriteScope = bridgeStatus.grantedScopes.includes('chat:write');
+  const selectedChannelSlug = activeChatTabSlug;
+  const activeChatTab = selectedChannelSlug ? openChatTabs[selectedChannelSlug] ?? null : null;
+  const selectedChannel = activeChatTab?.channel ?? null;
+  const channelChat = activeChatTab?.chat ?? null;
+  const isLoadingChat = activeChatTab?.isLoadingChat ?? false;
+  const isSendingChat = activeChatTab?.isSendingChat ?? false;
+  const chatError = activeChatTab?.chatError ?? null;
+  const sendChatError = activeChatTab?.sendChatError ?? null;
+  const liveChatState = activeChatTab?.liveChatState ?? 'idle';
+  const liveChatError = activeChatTab?.liveChatError ?? null;
+  const chatDraft = activeChatTab?.draft ?? '';
   const liveTrackedChannelsCount = channels.filter((channel) => channel.isLive).length;
+  const hasChannelDiscoverySource = browserChatEnabled || trackedChannelSlugs.length > 0;
   const liveCountLabel = tokenOnlyMode
     ? !isAuthenticated || !profile
       ? 'Sign in to activate Kick token-only mode.'
-      : trackedChannelSlugs.length === 0
-        ? 'Add tracked channel slugs to load live channels without any background browser.'
+      : !hasChannelDiscoverySource
+        ? 'Enable the Kick browser sync once or add tracked channel slugs to start loading channels.'
         : liveTrackedChannelsCount === 0
-          ? `No tracked channels are live right now across ${trackedChannelSlugs.length} saved slug${trackedChannelSlugs.length === 1 ? '' : 's'}.`
-          : `${liveTrackedChannelsCount} tracked channel${liveTrackedChannelsCount === 1 ? '' : 's'} are live right now.`
+          ? bridgeStatus.hasBrowserSession
+            ? trackedChannelSlugs.length === 0
+              ? `No live followings are online for ${profile.username} right now.`
+              : 'No live followed or tracked channels are online right now.'
+            : `No tracked channels are live right now across ${trackedChannelSlugs.length} saved slug${trackedChannelSlugs.length === 1 ? '' : 's'}.`
+          : bridgeStatus.hasBrowserSession
+            ? trackedChannelSlugs.length === 0
+              ? `${liveTrackedChannelsCount} live following channel${liveTrackedChannelsCount === 1 ? '' : 's'} are live right now.`
+              : `${liveTrackedChannelsCount} live channel${liveTrackedChannelsCount === 1 ? '' : 's'} are live right now across your followings and watchlist.`
+            : `${liveTrackedChannelsCount} tracked channel${liveTrackedChannelsCount === 1 ? '' : 's'} are live right now.`
     : !lastLoadedUsername
       ? isAuthenticated && profile
         ? `No live followings loaded for ${profile.username} yet.`
@@ -1143,8 +1476,6 @@ export default function App() {
   const sessionExpiryLabel = bridgeStatus.tokenExpiresAt
     ? new Date(bridgeStatus.tokenExpiresAt).toLocaleString()
     : 'No Kick token stored';
-  const selectedChannelSlug = selectedChannel?.channelSlug || null;
-  const hasOpenChat = channelChat?.channelSlug === selectedChannelSlug;
   const needsBrowserSync = bridgeStatus.oauthEnabled && isAuthenticated && !browserChatEnabled;
   const showReconnectBrowserAction = isAuthenticated && requiresBrowserReconnect;
   const activeEmoteCacheKey = channelChat
@@ -1160,8 +1491,11 @@ export default function App() {
   const badgeImageUrlIndex = buildBadgeImageUrlIndex(channelChat?.messages ?? []);
   const displayedChatMessages = channelChat ? [...channelChat.messages].reverse() : [];
   const newestVisibleMessageId = displayedChatMessages[0]?.id ?? null;
-  const activeChatroomId = channelChat?.chatroomId ?? null;
-  const activeChannelId = channelChat?.channelId ?? null;
+  const activeChatroomId = channelChat?.chatroomId ?? selectedChannel?.chatroomId ?? null;
+  const activeRealtimeChannelId = channelChat?.channelId ?? selectedChannel?.channelId ?? null;
+  const hasActiveRealtimeTarget = activeChatroomId !== null;
+  const selectedChannelSupportsRealtime = Boolean(selectedChannel?.isLive && selectedChannel.chatroomId !== null);
+  const selectedChannelRealtimeOnly = tokenOnlyMode && !browserChatEnabled && selectedChannelSupportsRealtime;
   const canSendSelectedChannelChat = Boolean(
     selectedChannel?.isLive &&
     selectedChannel.channelSlug === channelChat?.channelSlug &&
@@ -1181,8 +1515,11 @@ export default function App() {
       : liveChatState === 'error'
         ? 'status-error'
         : 'status-idle';
-
-  const hasChannelDiscoverySource = bridgeStatus.hasBrowserSession || trackedChannelSlugs.length > 0;
+  const realtimeSubscriptionsKey = openChatTabSlugs.map((channelSlug) => {
+    const currentTab = openChatTabs[channelSlug];
+    const realtimeTarget = currentTab ? getRealtimeTargetForTab(currentTab) : { channelId: null, chatroomId: null };
+    return `${channelSlug}:${realtimeTarget.channelId ?? 'none'}:${realtimeTarget.chatroomId ?? 'none'}`;
+  }).join('|');
 
   useEffect(() => {
     if (!tokenOnlyMode || !isAuthenticated || !hasChannelDiscoverySource) {
@@ -1190,10 +1527,10 @@ export default function App() {
     }
 
     void loadAvailableChannels({ silent: channels.length > 0 });
-  }, [channels.length, hasChannelDiscoverySource, isAuthenticated, tokenOnlyMode, trackedChannelSlugs, bridgeStatus.hasBrowserSession]);
+  }, [browserChatEnabled, channels.length, hasChannelDiscoverySource, isAuthenticated, tokenOnlyMode, trackedChannelSlugs]);
 
   useEffect(() => {
-    if (!tokenOnlyMode || !isAuthenticated || trackedChannelSlugs.length === 0 || bridgeStatus.hasBrowserSession) {
+    if (!tokenOnlyMode || !isAuthenticated || !hasChannelDiscoverySource) {
       return;
     }
 
@@ -1204,7 +1541,7 @@ export default function App() {
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [isAuthenticated, tokenOnlyMode, trackedChannelSlugs, bridgeStatus.hasBrowserSession]);
+  }, [browserChatEnabled, hasChannelDiscoverySource, isAuthenticated, tokenOnlyMode, trackedChannelSlugs]);
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -1225,113 +1562,250 @@ export default function App() {
   }, [hasChannelDiscoverySource, isAuthenticated]);
 
   useEffect(() => {
-    setRequiresBrowserReconnect(
-      isBrowserReconnectRequiredMessage(bridgeStatus.message)
-    );
-  }, [bridgeStatus.message]);
+    if (isBrowserReconnectRequiredMessage(bridgeStatus.message)) {
+      setRequiresBrowserReconnect(true);
+      return;
+    }
+
+    if (!bridgeStatus.hasBrowserSession || bridgeStatus.state === 'RUNNING') {
+      setRequiresBrowserReconnect(false);
+    }
+  }, [bridgeStatus.hasBrowserSession, bridgeStatus.message, bridgeStatus.state]);
 
   useEffect(() => {
     if (isAuthenticated) {
       return;
     }
 
-    setSelectedChannel(null);
-    setChannelChat(null);
-    setChatError(null);
-    setSendChatError(null);
-    setLiveChatState('idle');
-    setLiveChatError(null);
-    setChatDraft('');
+    setRequiresBrowserReconnect(false);
+    setOpenChatTabSlugs([]);
+    setActiveChatTabSlug(null);
+    setOpenChatTabs({});
   }, [isAuthenticated]);
 
   useEffect(() => {
-    if (!selectedChannelSlug) {
-      return;
-    }
-
-    const nextSelectedChannel = channels.find((channel) => channel.channelSlug === selectedChannelSlug) ?? null;
-    if (!nextSelectedChannel) {
-      setSelectedChannel(null);
-      setChannelChat(null);
-      setChatError(null);
-      setSendChatError(null);
-      setLiveChatState('idle');
-      setLiveChatError(null);
-      return;
-    }
-
-    if (nextSelectedChannel !== selectedChannel) {
-      startTransition(() => {
-        setSelectedChannel(nextSelectedChannel);
-      });
-    }
-
-    if (!channelChat || channelChat.channelSlug !== nextSelectedChannel.channelSlug) {
+    if (openChatTabSlugs.length === 0 || channels.length === 0) {
       return;
     }
 
     startTransition(() => {
-      setChannelChat((currentChat) => currentChat && currentChat.channelSlug === nextSelectedChannel.channelSlug
-        ? {
-            ...currentChat,
-            channelId: nextSelectedChannel.channelId ?? currentChat.channelId,
-            channelUserId: nextSelectedChannel.broadcasterUserId ?? currentChat.channelUserId,
-            displayName: nextSelectedChannel.displayName,
-            channelUrl: nextSelectedChannel.channelUrl,
-            avatarUrl: nextSelectedChannel.thumbnailUrl ?? currentChat.avatarUrl
+      setOpenChatTabs((currentTabs) => {
+        let nextTabs = currentTabs;
+
+        for (const channelSlug of openChatTabSlugs) {
+          const currentTab = currentTabs[channelSlug];
+          const nextChannel = channels.find((channel) => channel.channelSlug === channelSlug);
+          if (!currentTab || !nextChannel) {
+            continue;
           }
-        : currentChat);
+
+          const mergedChannel = mergeOpenChatTabChannel(currentTab.channel, nextChannel);
+          const mergedChat = mergeOpenChatChannelChat(currentTab.chat, mergedChannel);
+
+          if (nextTabs === currentTabs) {
+            nextTabs = { ...currentTabs };
+          }
+
+          nextTabs[channelSlug] = {
+            ...currentTab,
+            channel: mergedChannel,
+            chat: mergedChat
+          };
+        }
+
+        return nextTabs;
+      });
     });
-  }, [channelChat, channels, selectedChannel, selectedChannelSlug]);
+  }, [channels, openChatTabSlugs]);
 
   useEffect(() => {
-    if (!browserChatEnabled) {
-      setLiveChatState('idle');
+    if (!isAuthenticated || openChatTabSlugs.length === 0) {
       return;
     }
 
-    if (!channelChat || (activeChatroomId === null && activeChannelId === null)) {
-      setLiveChatState('idle');
-      setLiveChatError(null);
+    const realtimeEntries = openChatTabSlugs
+      .map((channelSlug) => {
+        const currentTab = openChatTabs[channelSlug];
+        if (!currentTab?.chat) {
+          return null;
+        }
+
+        const target = getRealtimeTargetForTab(currentTab);
+        return {
+          channelSlug,
+          target,
+          displayName: currentTab.chat.displayName || currentTab.channel.displayName,
+          subscriptionNames: getRealtimeChannelNames(target)
+        };
+      })
+      .filter((entry): entry is {
+        channelSlug: string;
+        target: RealtimeChatTarget;
+        displayName: string;
+        subscriptionNames: string[];
+      } => entry !== null);
+
+    if (realtimeEntries.length === 0) {
       return;
     }
 
-    const realtimeTarget = {
-      chatroomId: activeChatroomId,
-      channelId: activeChannelId
-    };
-    const subscriptionNames = getRealtimeChannelNames(realtimeTarget);
-    if (subscriptionNames.length === 0) {
-      setLiveChatState('error');
-      setLiveChatError('Kick did not expose a realtime subscription target for this channel.');
+    startTransition(() => {
+      setOpenChatTabs((currentTabs) => {
+        let nextTabs = currentTabs;
+
+        for (const entry of realtimeEntries) {
+          const currentTab = currentTabs[entry.channelSlug];
+          if (!currentTab) {
+            continue;
+          }
+
+          const nextTab = entry.subscriptionNames.length === 0
+            ? {
+                ...currentTab,
+                liveChatState: 'error' as const,
+                liveChatError: 'Kick did not expose a realtime subscription target for this channel.'
+              }
+            : currentTab.liveChatState === 'live' && currentTab.liveChatError === null
+              ? currentTab
+              : {
+                  ...currentTab,
+                  liveChatState: 'connecting' as const,
+                  liveChatError: null
+                };
+
+          if (nextTab === currentTab) {
+            continue;
+          }
+
+          if (nextTabs === currentTabs) {
+            nextTabs = { ...currentTabs };
+          }
+
+          nextTabs[entry.channelSlug] = nextTab;
+        }
+
+        return nextTabs;
+      });
+    });
+
+    const validRealtimeEntries = realtimeEntries.filter((entry) => entry.subscriptionNames.length > 0);
+    if (validRealtimeEntries.length === 0) {
       return;
+    }
+
+    const subscriptionEntries = new Map<string, Array<{ channelSlug: string; target: RealtimeChatTarget }>>();
+    for (const entry of validRealtimeEntries) {
+      for (const subscriptionName of entry.subscriptionNames) {
+        const currentEntries = subscriptionEntries.get(subscriptionName) ?? [];
+        currentEntries.push({
+          channelSlug: entry.channelSlug,
+          target: entry.target
+        });
+        subscriptionEntries.set(subscriptionName, currentEntries);
+      }
     }
 
     const pusher = new Pusher(KICK_PUSHER_KEY, KICK_PUSHER_OPTIONS);
-    let hasMarkedLive = false;
 
-    setLiveChatState('connecting');
-    setLiveChatError(null);
+    const markLive = (channelSlugs: string[], source: string) => {
+      const activeTab = activeChatTabSlug ? openChatTabsRef.current[activeChatTabSlug] ?? null : null;
+      const shouldUpdateActivity = Boolean(
+        activeTab
+        && activeChatTabSlug
+        && channelSlugs.includes(activeChatTabSlug)
+        && activeTab.liveChatState !== 'live'
+      );
 
-    const markLive = (source: string) => {
-      if (!hasMarkedLive) {
-        hasMarkedLive = true;
-        setActivity(`Live chat connected for ${channelChat.displayName} via ${source}. New Kick messages will appear automatically.`);
+      startTransition(() => {
+        setOpenChatTabs((currentTabs) => {
+          let nextTabs = currentTabs;
+
+          for (const channelSlug of channelSlugs) {
+            const currentTab = currentTabs[channelSlug];
+            if (!currentTab) {
+              continue;
+            }
+
+            if (currentTab.liveChatState === 'live' && currentTab.liveChatError === null) {
+              continue;
+            }
+
+            if (nextTabs === currentTabs) {
+              nextTabs = { ...currentTabs };
+            }
+
+            nextTabs[channelSlug] = {
+              ...currentTab,
+              liveChatState: 'live',
+              liveChatError: null
+            };
+          }
+
+          return nextTabs;
+        });
+      });
+
+      if (shouldUpdateActivity && activeTab) {
+        setActivity(`Live chat connected for ${activeTab.chat?.displayName || activeTab.channel.displayName} via ${source}. New Kick messages will appear automatically.`);
       }
-
-      setLiveChatState('live');
     };
 
     const handleConnectionError = () => {
-      setLiveChatState('error');
-      setLiveChatError('Live chat disconnected. You can still refresh chat manually.');
+      startTransition(() => {
+        setOpenChatTabs((currentTabs) => {
+          let nextTabs = currentTabs;
+
+          for (const entry of validRealtimeEntries) {
+            const currentTab = currentTabs[entry.channelSlug];
+            if (!currentTab) {
+              continue;
+            }
+
+            if (
+              currentTab.liveChatState === 'error'
+              && currentTab.liveChatError === 'Live chat disconnected. You can still refresh chat manually.'
+            ) {
+              continue;
+            }
+
+            if (nextTabs === currentTabs) {
+              nextTabs = { ...currentTabs };
+            }
+
+            nextTabs[entry.channelSlug] = {
+              ...currentTab,
+              liveChatState: 'error',
+              liveChatError: 'Live chat disconnected. You can still refresh chat manually.'
+            };
+          }
+
+          return nextTabs;
+        });
+      });
     };
 
-    const subscriptions = subscriptionNames.map((subscriptionName) => {
+    const subscriptions = Array.from(subscriptionEntries.entries()).map(([subscriptionName, entries]) => {
       const subscription = pusher.subscribe(subscriptionName);
 
       const handleSubscriptionSucceeded = () => {
-        markLive(subscriptionName);
+        markLive(entries.map((entry) => entry.channelSlug), subscriptionName);
+      };
+
+      const handleRealtimePayload = (source: string, payload: unknown) => {
+        const nextMessage = normalizeRealtimeChatMessage(payload);
+        if (!nextMessage) {
+          return;
+        }
+
+        markLive(entries.map((entry) => entry.channelSlug), source);
+
+        startTransition(() => {
+          setOpenChatTabs((currentTabs) => appendRealtimeChatMessageToTabs(currentTabs, entries, nextMessage));
+        });
+
+        if (activeChatTabSlug && entries.some((entry) => entry.channelSlug === activeChatTabSlug)) {
+          void refreshOpenChatForMissingBadgeAssets(activeChatTabSlug, nextMessage);
+        }
       };
 
       const handleGlobalEvent = (eventName: string, payload: unknown) => {
@@ -1339,55 +1813,31 @@ export default function App() {
           return;
         }
 
-        const nextMessage = normalizeRealtimeChatMessage(payload);
-        if (!nextMessage) {
-          return;
-        }
+        handleRealtimePayload(`${subscriptionName} · ${eventName}`, payload);
+      };
 
-        markLive(`${subscriptionName} · ${eventName}`);
-
-        startTransition(() => {
-          setChannelChat((currentChat) => appendRealtimeChatMessage(currentChat, realtimeTarget, nextMessage));
-        });
-
-        void refreshOpenChatForMissingBadgeAssets(nextMessage);
+      const handleChatMessage = (payload: unknown) => {
+        handleRealtimePayload(`${subscriptionName} · App\\Events\\ChatMessageEvent`, payload);
       };
 
       subscription.bind('pusher:subscription_succeeded', handleSubscriptionSucceeded);
       subscription.bind_global(handleGlobalEvent);
+      subscription.bind('App\\Events\\ChatMessageEvent', handleChatMessage);
+      subscription.bind('ChatMessageEvent', handleChatMessage);
 
       return {
         subscription,
         subscriptionName,
         handleSubscriptionSucceeded,
-        handleGlobalEvent
+        handleGlobalEvent,
+        handleChatMessage
       };
     });
-
-    const handleChatMessage = (payload: unknown) => {
-      const nextMessage = normalizeRealtimeChatMessage(payload);
-      if (!nextMessage) {
-        return;
-      }
-
-      markLive(`chatrooms.${activeChatroomId}.v2 · App\\Events\\ChatMessageEvent`);
-
-      startTransition(() => {
-        setChannelChat((currentChat) => appendRealtimeChatMessage(currentChat, realtimeTarget, nextMessage));
-      });
-
-      void refreshOpenChatForMissingBadgeAssets(nextMessage);
-    };
-
-    for (const { subscription } of subscriptions) {
-      subscription.bind('App\\Events\\ChatMessageEvent', handleChatMessage);
-      subscription.bind('ChatMessageEvent', handleChatMessage);
-    }
 
     pusher.connection.bind('error', handleConnectionError);
 
     return () => {
-      for (const { subscription, subscriptionName, handleSubscriptionSucceeded, handleGlobalEvent } of subscriptions) {
+      for (const { subscription, subscriptionName, handleSubscriptionSucceeded, handleGlobalEvent, handleChatMessage } of subscriptions) {
         subscription.unbind('pusher:subscription_succeeded', handleSubscriptionSucceeded);
         subscription.unbind('App\\Events\\ChatMessageEvent', handleChatMessage);
         subscription.unbind('ChatMessageEvent', handleChatMessage);
@@ -1398,7 +1848,7 @@ export default function App() {
       pusher.connection.unbind('error', handleConnectionError);
       pusher.disconnect();
     };
-  }, [activeChannelId, activeChatroomId, browserChatEnabled, channelChat?.displayName]);
+  }, [activeChatTabSlug, browserChatEnabled, isAuthenticated, openChatTabSlugs, realtimeSubscriptionsKey]);
 
   useEffect(() => {
     if (!channelChat?.channelSlug) {
@@ -1436,87 +1886,93 @@ export default function App() {
     })();
   }, [channelChat?.channelSlug, channelChat?.channelUserId, channelEmoteCache]);
 
-  const refreshOpenChat = useEffectEvent(async () => {
-    if (!browserChatEnabled || !isAuthenticated || !selectedChannelSlug || !hasOpenChat || isLoadingChat || openChatRefreshInFlightRef.current) {
+  const refreshOpenChat = useEffectEvent(async (channelSlug: string, options: { forceFull?: boolean } = {}) => {
+    if (!browserChatEnabled || !isAuthenticated) {
       return;
     }
 
-    openChatRefreshInFlightRef.current = true;
+    const channel = getOpenChatChannel(channelSlug);
+    if (!channel) {
+      return;
+    }
+
+    const refreshKey = `${channelSlug}:${options.forceFull ? 'full' : 'fast'}`;
+    if (openChatRefreshInFlightRef.current.has(refreshKey)) {
+      return;
+    }
+
+    openChatRefreshInFlightRef.current.add(refreshKey);
 
     try {
-      const nextChat = await fetchChannelChat(selectedChannelSlug);
+      const nextChat = await loadChannelChatSnapshot(channel, { forceFull: options.forceFull });
 
-      startTransition(() => {
-        setChannelChat((currentChat) => currentChat?.channelSlug === nextChat.channelSlug
-          ? mergeChannelChat(currentChat, nextChat)
-          : currentChat);
+      rememberOpenChatChannel({
+        ...channel,
+        displayName: nextChat.displayName || channel.displayName,
+        thumbnailUrl: nextChat.avatarUrl ?? channel.thumbnailUrl,
+        broadcasterUserId: nextChat.channelUserId ?? channel.broadcasterUserId,
+        channelId: nextChat.channelId ?? channel.channelId,
+        chatroomId: nextChat.chatroomId ?? channel.chatroomId,
+        channelUrl: nextChat.channelUrl || channel.channelUrl,
+        chatUrl: channel.chatUrl ?? nextChat.channelUrl
       });
+
+      updateOpenChannelChat(channelSlug, (currentChat) => currentChat?.channelSlug === nextChat.channelSlug
+        ? mergeChannelChat(currentChat, nextChat)
+        : nextChat);
     } catch {
-      if (liveChatState !== 'live') {
-        setLiveChatError('Live chat is delayed. Recent messages are still syncing automatically in the background.');
+      const currentTab = openChatTabsRef.current[channelSlug];
+      if (currentTab?.liveChatState !== 'live') {
+        setLiveChatStateForChannel(channelSlug, 'error', 'Live chat is delayed. Recent messages are still syncing automatically in the background.');
       }
     } finally {
-      openChatRefreshInFlightRef.current = false;
+      openChatRefreshInFlightRef.current.delete(refreshKey);
     }
   });
 
-  const refreshOpenChatForMissingBadgeAssets = useEffectEvent(async (nextMessage: ChannelChatMessage) => {
-    const currentChat = channelChatRef.current;
+  const refreshOpenChatForMissingBadgeAssets = useEffectEvent(async (channelSlug: string, nextMessage: ChannelChatMessage) => {
+    const currentChat = openChatTabsRef.current[channelSlug]?.chat ?? null;
     if (!realtimeMessageNeedsBadgeRefresh(currentChat, nextMessage)) {
       return;
     }
 
     const now = Date.now();
-    if (now - lastRealtimeBadgeRefreshAtRef.current < 2500) {
+    const lastRefreshAt = lastRealtimeBadgeRefreshAtRef.current.get(channelSlug) ?? 0;
+    if (now - lastRefreshAt < 2500) {
       return;
     }
 
-    lastRealtimeBadgeRefreshAtRef.current = now;
-    await refreshOpenChat();
+    lastRealtimeBadgeRefreshAtRef.current.set(channelSlug, now);
+    await refreshOpenChat(channelSlug, { forceFull: true });
   });
 
   useEffect(() => {
-    if (!browserChatEnabled || !isAuthenticated || !selectedChannelSlug || !hasOpenChat || isLoadingChat) {
+    if (!browserChatEnabled || !isAuthenticated || !selectedChannelSlug || !activeChatTab?.chat || activeChatTab.isLoadingChat) {
       return;
     }
 
-    let isDisposed = false;
-    let timeoutId = 0;
-    if (liveChatState === 'live') {
+    if (!channelChatNeedsSnapshotEnrichment(activeChatTab.chat)) {
       return;
     }
 
-    const refreshIntervalMs = liveChatState === 'error' ? 15000 : 4000;
+    const now = Date.now();
+    const lastEnrichmentAt = lastSnapshotEnrichmentAtRef.current.get(selectedChannelSlug) ?? 0;
+    if (now - lastEnrichmentAt < 15000) {
+      return;
+    }
 
-    const scheduleNextRefresh = () => {
-      timeoutId = window.setTimeout(async () => {
-        await refreshOpenChat();
-
-        if (!isDisposed) {
-          scheduleNextRefresh();
-        }
-      }, refreshIntervalMs);
-    };
-
-    scheduleNextRefresh();
-
-    return () => {
-      isDisposed = true;
-      window.clearTimeout(timeoutId);
-    };
-  }, [browserChatEnabled, hasOpenChat, isAuthenticated, isLoadingChat, liveChatState, selectedChannelSlug]);
+    lastSnapshotEnrichmentAtRef.current.set(selectedChannelSlug, now);
+    void refreshOpenChat(selectedChannelSlug, { forceFull: true });
+  }, [activeChatTab?.chat, activeChatTab?.isLoadingChat, browserChatEnabled, isAuthenticated, selectedChannelSlug]);
 
   useEffect(() => {
     const feedElement = chatFeedRef.current;
-    if (!feedElement || !newestVisibleMessageId) {
+    if (!feedElement) {
       return;
     }
 
-    feedElement.scrollTo({
-      top: 0,
-      behavior: 'smooth'
-    });
-  }, [newestVisibleMessageId]);
+    feedElement.scrollTop = 0;
+  }, [newestVisibleMessageId, selectedChannelSlug]);
 
   function handleReconnectOAuth() {
     window.location.assign(getOAuthLoginUrl());
@@ -1547,12 +2003,13 @@ export default function App() {
       const nextStatus = await startBridge(forceReconnect);
       startTransition(() => {
         setBridgeStatus(nextStatus);
+        setRequiresBrowserReconnect(false);
         setActivity(
           forceReconnect
             ? nextStatus.state === 'READY'
-              ? 'Kick website session is already connected. Retry channels or chat.'
-              : 'The Kick website session window was opened. Finish the login there and Chatterbro will close it automatically after capture.'
-            : 'The Kick website session window was opened. Finish the login there and Chatterbro will close it automatically after capture.'
+              ? 'Kick browser session is already connected. Retry followings or chat.'
+              : 'The Kick browser reconnect window was opened. Keep it open, then retry followings or chat.'
+            : 'The Kick browser sync window was opened. Finish the website login there, keep that browser open, then retry chat.'
         );
       });
     } catch (caughtError) {
@@ -1563,11 +2020,11 @@ export default function App() {
   }
 
   async function ensureBrowserSessionForWebsiteData(featureLabel: string) {
-    if (bridgeStatus.hasBrowserSession || !bridgeStatus.oauthEnabled) {
+    if (browserChatEnabled || !bridgeStatus.oauthEnabled) {
       return true;
     }
 
-    setActivity(`Kick OAuth is connected, but ${featureLabel} still need one website session capture. Finish the sign-in window once and Chatterbro will reopen a temporary browser automatically only when it needs website-only data.`);
+    setActivity(`Kick OAuth is connected, but ${featureLabel} still need a one-time Kick website session sync. Finish the browser sign-in window and retry.`);
     await startBrowserSessionSync();
     return false;
   }
@@ -1580,6 +2037,7 @@ export default function App() {
       const nextStatus = await startBridge();
       startTransition(() => {
         setBridgeStatus(nextStatus);
+        setRequiresBrowserReconnect(false);
       });
     } catch (caughtError) {
       setError(caughtError instanceof Error ? caughtError.message : 'Failed to start the Kick website session sync.');
@@ -1612,7 +2070,9 @@ export default function App() {
       setActivity(`Removed ${channelSlug} from your local Kick watchlist.`);
     });
 
-    void loadAvailableChannels({ silent: true });
+    if (openChatTabSlugs.includes(channelSlug)) {
+      closeChatTab(channelSlug);
+    }
   }
 
   async function loadAvailableChannels(options: { silent?: boolean } = {}) {
@@ -1626,10 +2086,10 @@ export default function App() {
       return;
     }
 
-    if (!bridgeStatus.hasBrowserSession && trackedChannelSlugs.length === 0) {
+    if (!browserChatEnabled && trackedChannelSlugs.length === 0) {
       if (!silent) {
-        setError('Enable the Kick website session once or add at least one extra channel slug first.');
-        setActivity('Kick OAuth is connected. Add channel slugs like xqc, shroud, or your own favorites to extend the local watchlist, or enable the website session to pull your live followed channels too.');
+        setError('Enable the Kick browser sync once or add at least one tracked channel slug first.');
+        setActivity('Kick OAuth is connected. Add channel slugs like xqc or shroud, or enable the browser sync to load your live followings too.');
         setChannels([]);
       }
 
@@ -1643,7 +2103,7 @@ export default function App() {
 
     try {
       const [followedChannelsResult, trackedChannelsResult] = await Promise.allSettled([
-        bridgeStatus.hasBrowserSession
+        browserChatEnabled
           ? fetchLiveFollowedChannels()
           : Promise.resolve<FollowedChannel[]>([]),
         trackedChannelSlugs.length > 0
@@ -1677,6 +2137,10 @@ export default function App() {
         ? trackedChannelsResult.reason.message
         : null;
 
+      if (followedChannelsErrorMessage && isBrowserReconnectRequiredMessage(followedChannelsErrorMessage)) {
+        setRequiresBrowserReconnect(true);
+      }
+
       startTransition(() => {
         setChannels(loadedChannels);
         setLastLoadedUsername(profile.username);
@@ -1685,21 +2149,35 @@ export default function App() {
         if (!silent) {
           setActivity(
             hasFollowedChannelsFailure && followedChannels.length === 0 && trackedChannels.length > 0
-              ? `Loaded your extra watchlist, but live followed channels were unavailable: ${followedChannelsErrorMessage}`
+              ? `Loaded your local watchlist, but live followings were unavailable: ${followedChannelsErrorMessage}`
               : hasTrackedChannelsFailure && followedChannels.length > 0
-                ? `Loaded ${followedChannels.length} live followed channel${followedChannels.length === 1 ? '' : 's'}. Extra watchlist entries were unavailable: ${trackedChannelsErrorMessage}`
+                ? `Loaded ${followedChannels.length} live following channel${followedChannels.length === 1 ? '' : 's'}. Extra watchlist entries were unavailable: ${trackedChannelsErrorMessage}`
                 : nextLiveTrackedChannelsCount === 0
-                  ? bridgeStatus.hasBrowserSession
-                    ? 'No live followed or tracked channels are online right now.'
+                  ? browserChatEnabled
+                    ? trackedChannelSlugs.length > 0
+                      ? 'No live followed or tracked channels are online right now.'
+                      : `No live followings found for ${profile.username}.`
                     : `None of your ${trackedChannelSlugs.length} tracked channels are live right now.`
-                  : `Loaded ${nextLiveTrackedChannelsCount} live channel${nextLiveTrackedChannelsCount === 1 ? '' : 's'} across your followings and watchlist.`
+                  : browserChatEnabled && trackedChannelSlugs.length > 0
+                    ? `Loaded ${nextLiveTrackedChannelsCount} live channel${nextLiveTrackedChannelsCount === 1 ? '' : 's'} across your followings and watchlist.`
+                    : browserChatEnabled
+                      ? `Loaded ${nextLiveTrackedChannelsCount} live following channel${nextLiveTrackedChannelsCount === 1 ? '' : 's'} for ${profile.username}.`
+                      : `Loaded ${nextLiveTrackedChannelsCount} live tracked channel${nextLiveTrackedChannelsCount === 1 ? '' : 's'} from your local watchlist.`
           );
         }
       });
     } catch (caughtError) {
-      if (!silent) {
         const message = caughtError instanceof Error ? caughtError.message : 'Failed to load Kick channels.';
+      if (!silent) {
         setError(message);
+      }
+
+      if (isBrowserReconnectRequiredMessage(message)) {
+        setRequiresBrowserReconnect(true);
+        setActivity('Kick browser sync is offline. Click Reconnect Kick browser, leave that window open, then retry followings or chat.');
+        if (!isSecurityPolicyBlockedMessage(message)) {
+          await refreshBridgeStatus();
+        }
       }
     } finally {
       if (!silent) {
@@ -1714,104 +2192,208 @@ export default function App() {
       return;
     }
 
-    await loadAvailableChannels();
-  }
-
-  async function loadChannelChat(channel: FollowedChannel) {
-    if (!isAuthenticated) {
-      setChatError('Connect Kick first so the app can use your saved session.');
+    if (tokenOnlyMode) {
+      await loadAvailableChannels();
       return;
     }
 
-    if (tokenOnlyMode && !channel.isLive) {
-      setSelectedChannel(channel);
-      setChannelChat(buildTokenOnlyChatShell(channel));
-      setChatDraft('');
-      setChatError(null);
-      setSendChatError(null);
-      setLiveChatState('idle');
-      setLiveChatError('This tracked channel is offline right now. The watchlist will refresh it automatically.');
+    if (!(await ensureBrowserSessionForWebsiteData('live followings'))) {
+      return;
+    }
+
+    setIsLoadingChannels(true);
+    setError(null);
+
+    try {
+      const loadedChannels = await fetchLiveFollowedChannels();
+      startTransition(() => {
+        setChannels(loadedChannels);
+        setLastLoadedUsername(profile.username);
+        setActivity(
+          loadedChannels.length === 0
+            ? `Connected as ${profile.username}, but no live followings were found.`
+            : `Loaded ${loadedChannels.length} live followings for ${profile.username}.`
+        );
+      });
+      await refreshBridgeStatus();
+    } catch (caughtError) {
+      const message = caughtError instanceof Error ? caughtError.message : 'Failed to load live followings.';
+      setError(message);
+      if (isBrowserReconnectRequiredMessage(message)) {
+        setRequiresBrowserReconnect(true);
+        setActivity('Kick browser sync is offline. Click Reconnect Kick browser, leave that window open, then retry followings.');
+        if (!isSecurityPolicyBlockedMessage(message)) {
+          await refreshBridgeStatus();
+        }
+      }
+    } finally {
+      setIsLoadingChannels(false);
+    }
+  }
+
+  async function loadChannelChat(channel: FollowedChannel, options: { forceFull?: boolean } = {}) {
+    const currentChannel = getOpenChatChannel(channel.channelSlug);
+    const resolvedChannel = currentChannel
+      ? mergeOpenChatTabChannel(currentChannel, channel)
+      : channel;
+
+    rememberOpenChatChannel(resolvedChannel);
+
+    if (!isAuthenticated) {
+      setChatErrorForChannel(resolvedChannel.channelSlug, 'Connect Kick first so the app can use your saved session.');
+      return;
+    }
+
+    if (tokenOnlyMode && !resolvedChannel.isLive) {
+      updateOpenChannelChat(resolvedChannel.channelSlug, () => buildTokenOnlyChatShell(resolvedChannel));
+      setChatDraftForChannel(resolvedChannel.channelSlug, '');
+      setChatErrorForChannel(resolvedChannel.channelSlug, null);
+      setSendChatErrorForChannel(resolvedChannel.channelSlug, null);
+      setLiveChatStateForChannel(resolvedChannel.channelSlug, 'idle', 'This tracked channel is offline right now. The watchlist will refresh it automatically.');
+      setLoadingChatForChannel(resolvedChannel.channelSlug, false);
       setActivity(
-        `${channel.displayName} is offline right now. Chatterbro will keep refreshing the watchlist automatically.`
+        `${resolvedChannel.displayName} is offline right now. Chatterbro will keep refreshing the watchlist automatically.`
       );
       return;
     }
 
+    if (tokenOnlyMode && !browserChatEnabled && resolvedChannel.chatroomId !== null) {
+      updateOpenChannelChat(resolvedChannel.channelSlug, () => buildTokenOnlyChatShell(resolvedChannel));
+      setChatDraftForChannel(resolvedChannel.channelSlug, '');
+      setChatErrorForChannel(resolvedChannel.channelSlug, null);
+      setSendChatErrorForChannel(resolvedChannel.channelSlug, null);
+      setLiveChatStateForChannel(
+        resolvedChannel.channelSlug,
+        'connecting',
+        'Browser sync is offline. Waiting for new realtime messages for this live channel.'
+      );
+      setLoadingChatForChannel(resolvedChannel.channelSlug, false);
+      setActivity(`Opened realtime-only chat for ${resolvedChannel.displayName}. New messages will appear as soon as Kick emits them.`);
+      return;
+    }
+
     if (tokenOnlyMode && !(await ensureBrowserSessionForWebsiteData('live chat'))) {
-      setSelectedChannel(channel);
-      setChannelChat(buildTokenOnlyChatShell(channel));
-      setChatDraft('');
-      setChatError(null);
-      setSendChatError(null);
-      setLiveChatState('idle');
-      setLiveChatError('Live chat needs the Kick browser sync. Finish that browser window, keep it open, then reopen chat.');
+      updateOpenChannelChat(resolvedChannel.channelSlug, () => buildTokenOnlyChatShell(resolvedChannel));
+      setChatDraftForChannel(resolvedChannel.channelSlug, '');
+      setChatErrorForChannel(resolvedChannel.channelSlug, null);
+      setSendChatErrorForChannel(resolvedChannel.channelSlug, null);
+      setLiveChatStateForChannel(
+        resolvedChannel.channelSlug,
+        'idle',
+        'Live chat needs the Kick browser sync. Finish that browser window, keep it open, then reopen chat.'
+      );
+      setLoadingChatForChannel(resolvedChannel.channelSlug, false);
       return;
     }
 
     if (!tokenOnlyMode && !(await ensureBrowserSessionForWebsiteData('chat history'))) {
-      setSelectedChannel(channel);
+      setLoadingChatForChannel(resolvedChannel.channelSlug, false);
       return;
     }
 
-    setSelectedChannel(channel);
-    setChatError(null);
-    setLiveChatState('idle');
-    setLiveChatError(null);
-    setIsLoadingChat(true);
-    setChannelChat((currentChat) => currentChat?.channelSlug === channel.channelSlug ? currentChat : null);
+    setChatErrorForChannel(resolvedChannel.channelSlug, null);
+    setSendChatErrorForChannel(resolvedChannel.channelSlug, null);
+    setLiveChatStateForChannel(resolvedChannel.channelSlug, 'idle', null);
+    setLoadingChatForChannel(resolvedChannel.channelSlug, true);
+    updateOpenChannelChat(resolvedChannel.channelSlug, (currentChat) => currentChat ?? buildTokenOnlyChatShell(resolvedChannel));
 
     try {
-      const nextChat = await fetchChannelChat(channel.channelSlug);
+      const nextChat = await loadChannelChatSnapshot(resolvedChannel, { forceFull: options.forceFull });
+
       startTransition(() => {
-        setChannelChat(nextChat);
+        setOpenChatTabs((currentTabs) => updateOpenChatTabState(currentTabs, resolvedChannel.channelSlug, (currentTab) => ({
+          ...currentTab,
+          channel: mergeOpenChatTabChannel(currentTab.channel, {
+            ...resolvedChannel,
+            displayName: nextChat.displayName || resolvedChannel.displayName,
+            thumbnailUrl: nextChat.avatarUrl ?? resolvedChannel.thumbnailUrl,
+            broadcasterUserId: nextChat.channelUserId ?? resolvedChannel.broadcasterUserId,
+            channelId: nextChat.channelId ?? resolvedChannel.channelId,
+            chatroomId: nextChat.chatroomId ?? resolvedChannel.chatroomId,
+            channelUrl: nextChat.channelUrl || resolvedChannel.channelUrl,
+            chatUrl: resolvedChannel.chatUrl ?? nextChat.channelUrl
+          }),
+          chat: currentTab.chat?.channelSlug === nextChat.channelSlug
+            ? mergeChannelChat(currentTab.chat, nextChat)
+            : nextChat,
+          chatError: null,
+          sendChatError: null,
+          liveChatState: currentTab.liveChatState === 'live' ? 'live' : 'idle',
+          liveChatError: null
+        })));
         setActivity(
           nextChat.messages.length === 0
-            ? `Loaded chat for ${channel.displayName}, but Kick returned no recent messages.`
-            : `Loaded ${nextChat.messages.length} recent chat messages for ${channel.displayName}.`
+            ? `Loaded chat for ${resolvedChannel.displayName}, but Kick returned no recent messages.`
+            : `Loaded ${nextChat.messages.length} recent chat messages for ${resolvedChannel.displayName}.`
         );
       });
     } catch (caughtError) {
       const message = caughtError instanceof Error ? caughtError.message : 'Failed to load the selected channel chat.';
-      setChatError(message);
-      if (isBrowserReconnectRequiredMessage(message)) {
+      const reconnectRequired = isBrowserReconnectRequiredMessage(message);
+      const securityPolicyBlocked = isSecurityPolicyBlockedMessage(message);
+      const canFallbackToRealtimeOnly = tokenOnlyMode && resolvedChannel.isLive && resolvedChannel.chatroomId !== null;
+
+      if (reconnectRequired && canFallbackToRealtimeOnly) {
         setRequiresBrowserReconnect(true);
-        setActivity('The saved Kick website session needs to be refreshed. Run the website sync again, then retry chat.');
-        await refreshBridgeStatus();
+        updateOpenChannelChat(resolvedChannel.channelSlug, (currentChat) => mergeChannelChat(currentChat, buildTokenOnlyChatShell(resolvedChannel)));
+        setChatErrorForChannel(resolvedChannel.channelSlug, null);
+        setSendChatErrorForChannel(resolvedChannel.channelSlug, null);
+        setLiveChatStateForChannel(
+          resolvedChannel.channelSlug,
+          'connecting',
+          securityPolicyBlocked
+            ? 'Kick blocked website snapshot reads. Realtime chat will keep listening on the saved chatroom target.'
+            : 'Browser sync is offline. Waiting for new realtime messages for this live channel.'
+        );
+        setActivity(
+          securityPolicyBlocked
+            ? `Kick blocked website snapshot reads for ${resolvedChannel.displayName}. Switched to realtime-only chat using the saved chatroom target.`
+            : `Opened realtime-only chat for ${resolvedChannel.displayName}. New messages will appear as soon as Kick emits them.`
+        );
+        return;
+      }
+
+      setChatErrorForChannel(resolvedChannel.channelSlug, message);
+      if (reconnectRequired) {
+        setRequiresBrowserReconnect(true);
+        setActivity('Kick browser sync is offline. Click Reconnect Kick browser, leave that window open, then retry chat.');
+        if (!securityPolicyBlocked) {
+          await refreshBridgeStatus();
+        }
       }
     } finally {
-      setIsLoadingChat(false);
+      setLoadingChatForChannel(resolvedChannel.channelSlug, false);
     }
   }
 
   async function handleSendChatMessage() {
-    if (!selectedChannel || !channelChat) {
-      setSendChatError('Open a tracked channel first.');
+    if (!selectedChannelSlug || !selectedChannel || !channelChat) {
       return;
     }
 
     if (!selectedChannel.isLive) {
-      setSendChatError('This tracked channel is offline right now.');
+      setSendChatErrorForChannel(selectedChannelSlug, 'This tracked channel is offline right now.');
       return;
     }
 
     if (!hasChatWriteScope) {
-      setSendChatError('Reconnect Kick with the chat:write scope before sending messages from Chatterbro.');
+      setSendChatErrorForChannel(selectedChannelSlug, 'Reconnect Kick with the chat:write scope before sending messages from Chatterbro.');
       return;
     }
 
     const content = chatDraft.trim();
     if (content.length === 0) {
-      setSendChatError('Enter a chat message before sending it.');
+      setSendChatErrorForChannel(selectedChannelSlug, 'Enter a chat message before sending it.');
       return;
     }
 
     if (channelChat.channelUserId === null) {
-      setSendChatError('Kick did not expose a broadcaster user id for this channel.');
+      setSendChatErrorForChannel(selectedChannelSlug, 'Kick did not expose a broadcaster user id for this channel.');
       return;
     }
 
-    setIsSendingChat(true);
-    setSendChatError(null);
+    setSendingChatForChannel(selectedChannelSlug, true);
+    setSendChatErrorForChannel(selectedChannelSlug, null);
 
     try {
       const response = await sendChannelChatMessage(selectedChannel.channelSlug, {
@@ -1834,14 +2416,17 @@ export default function App() {
       };
 
       startTransition(() => {
-        setChannelChat((currentChat) => appendLocalChatMessage(currentChat, optimisticMessage));
-        setChatDraft('');
+        setOpenChatTabs((currentTabs) => updateOpenChatTabState(currentTabs, selectedChannelSlug, (currentTab) => ({
+          ...currentTab,
+          chat: appendLocalChatMessage(currentTab.chat, optimisticMessage),
+          draft: ''
+        })));
         setActivity(`Sent a chat message to ${selectedChannel.displayName} through Kick's official API.`);
       });
     } catch (caughtError) {
-      setSendChatError(caughtError instanceof Error ? caughtError.message : 'Failed to send the chat message.');
+      setSendChatErrorForChannel(selectedChannelSlug, caughtError instanceof Error ? caughtError.message : 'Failed to send the chat message.');
     } finally {
-      setIsSendingChat(false);
+      setSendingChatForChannel(selectedChannelSlug, false);
     }
   }
 
@@ -1902,7 +2487,7 @@ export default function App() {
           <h1>{tokenOnlyMode ? 'React dashboard for Kick followings, watchlist, and live chat.' : 'React dashboard for a browser-backed Kick bridge.'}</h1>
           <p className="hero-description">
             {tokenOnlyMode
-              ? 'The UI stays in React. Kotlin runs the local API. Live followed channels and chat snapshots still come from a short-lived Kick website sync, while your extra watchlist slugs continue to merge in through Kick OAuth.'
+              ? 'The UI stays in React. Kotlin runs the local API. Live followed channels and your tracked watchlist merge into one list, while live chat uses an explicit Kick browser sync because Kick still does not expose chatroom ids publicly.'
               : 'The UI stays in React. Kotlin runs the local API. Kick OAuth handles account connection first, while the browser bridge is only kept for the unsupported followings and chat-read flows.'}
           </p>
         </div>
@@ -2023,30 +2608,34 @@ export default function App() {
               <button className="primary-button" onClick={startBrowserSessionSync} disabled={isStartingBridge || bridgeStatus.state === 'RUNNING'}>
                 {isStartingBridge
                   ? tokenOnlyMode
-                    ? 'Opening live chat sync...'
+                    ? 'Opening followings and live chat sync...'
                     : 'Opening Kick browser sync...'
                   : bridgeStatus.state === 'RUNNING'
                     ? tokenOnlyMode
-                      ? 'Waiting for live chat sync...'
+                      ? 'Waiting for followings and live chat sync...'
                       : 'Waiting for website session sync...'
                     : tokenOnlyMode
-                      ? 'Enable website sync'
+                      ? 'Enable followings and live chat sync'
                       : 'Enable followings and chat sync'}
               </button>
             ) : showReconnectBrowserAction ? (
               <button className="primary-button" onClick={() => void handleStartBridge(true)} disabled={isStartingBridge || bridgeStatus.state === 'RUNNING'}>
                 {isStartingBridge
-                  ? 'Opening website session refresh...'
+                  ? 'Opening Kick browser reconnect...'
                   : bridgeStatus.state === 'RUNNING'
-                    ? 'Waiting for website session refresh...'
-                    : 'Refresh website session'}
+                    ? 'Waiting for Kick browser reconnect...'
+                    : 'Reconnect Kick browser'}
               </button>
             ) : null}
-            <button className="secondary-button" onClick={handleLoadChannels} disabled={isLoadingChannels || !isAuthenticated}>
+            <button className="secondary-button" onClick={handleLoadChannels} disabled={isLoadingChannels || !isAuthenticated || (tokenOnlyMode && !hasChannelDiscoverySource && !needsBrowserSync)}>
               {tokenOnlyMode
                 ? isLoadingChannels
                   ? 'Refreshing channels...'
-                  : 'Refresh channels'
+                  : hasChannelDiscoverySource
+                    ? 'Refresh channels'
+                    : needsBrowserSync
+                      ? 'Enable followings sync'
+                      : 'Add tracked channels first'
                 : isLoadingChannels
                   ? 'Loading live followings...'
                   : needsBrowserSync
@@ -2075,14 +2664,14 @@ export default function App() {
           {tokenOnlyMode && isAuthenticated ? (
             <div className="message-strip subtle-strip">
               <strong>Followings + watchlist</strong>
-              <p>Chatterbro merges your live followed channels with any extra slugs saved in the local watchlist. The watchlist still loads through Kick OAuth, while followed-channel discovery and chat snapshots still need the saved website session.</p>
+              <p>Chatterbro merges your live followed channels with any extra slugs saved in the local watchlist. The watchlist still loads through Kick OAuth, while live followings and live chat still depend on the saved browser sync.</p>
             </div>
           ) : null}
 
           {tokenOnlyMode && isAuthenticated ? (
             <div className="message-strip subtle-strip">
               <strong>Live chat sync</strong>
-              <p>{browserChatEnabled ? 'Kick website session is saved. Chatterbro will reopen a temporary browser only when it needs a followings or chat snapshot, then close it again automatically.' : 'Click Enable website sync once, finish the Kick website login there, and Chatterbro will capture that session for followings and live chat reads.'}</p>
+              <p>{browserChatEnabled ? 'Browser sync is connected. Live followings can refresh automatically, and opening any live channel will load a chat snapshot before switching into realtime updates.' : 'Click Enable followings and live chat sync once, finish the Kick website login there, keep that browser open, then open chat on any live channel.'}</p>
             </div>
           ) : null}
 
@@ -2096,14 +2685,14 @@ export default function App() {
           {needsBrowserSync ? (
             <div className="message-strip subtle-strip">
               <strong>Website data sync</strong>
-              <p>Kick OAuth is active, but live followings and recent chat still require one browser-based website session capture because those read endpoints are not yet exposed in the official Public API.</p>
+              <p>Kick OAuth is active, but live followings and recent chat still require one browser-based website session sync because those read endpoints are not yet exposed in the official Public API.</p>
             </div>
           ) : null}
 
           {showReconnectBrowserAction ? (
             <div className="message-strip subtle-strip">
               <strong>Browser reconnect required</strong>
-              <p>The saved website session is no longer usable. Run the website sync again to refresh it, then retry the action you wanted.</p>
+              <p>Live followings and chat will no longer reopen the Kick browser automatically. Reconnect it explicitly, keep that browser window open, then retry the action you wanted.</p>
             </div>
           ) : null}
 
@@ -2124,12 +2713,12 @@ export default function App() {
           <ol className="step-list">
             <li>Click <strong>Connect Kick via OAuth</strong>.</li>
             <li>Finish the Kick authorization flow in your browser.</li>
-            <li>{tokenOnlyMode ? 'Optionally add extra channel slugs to the local watchlist. When you need followed channels or live chat, run Enable website sync once and Chatterbro will reopen a temporary Kick window only when a website-only read is needed.' : 'If you need live followings or chat history, run the one-time website session sync the first time you load them.'}</li>
+            <li>{tokenOnlyMode ? 'Add a few tracked channel slugs. When you need live chat, run Enable live chat sync once, keep that browser window open, and Chatterbro will read chat through it while still sending through the official API.' : 'If you need live followings or chat history, run the one-time website session sync the first time you load them.'}</li>
           </ol>
 
           <p className="helper-copy">
             {tokenOnlyMode
-              ? 'Chat sending stays on the official API path, but followed-channel discovery and live chat reads still need the Kick website session because that is still the only place Chatterbro can reliably resolve realtime chat targets.'
+              ? 'Tracked channels and chat sending stay on the official API path, but live chat reads need the Kick website session because that is still the only place Chatterbro can reliably resolve the realtime chat target.'
               : 'Kick\'s Public API now covers auth and profile reads cleanly, but followed-channel and chat-history reads still require the browser bridge until official read endpoints exist.'}
           </p>
         </article>
@@ -2146,8 +2735,8 @@ export default function App() {
 
         {channels.length === 0 ? (
           <div className="empty-state">
-            <p>No followed or tracked channels are loaded yet.</p>
-            <span>{tokenOnlyMode ? 'Enable the website session to load your live followed channels, or add extra slugs above to extend the local watchlist.' : 'Once your Kick session is connected, this panel will list every live followed channel returned by the backend.'}</span>
+            <p>{tokenOnlyMode ? 'No followed or tracked channels are loaded yet.' : 'No tracked channels are loaded yet.'}</p>
+            <span>{tokenOnlyMode ? 'Enable the browser sync to load your live followings, or add one or more channel slugs above to extend the local watchlist.' : 'Once your Kick session is connected, this panel will list every live followed channel returned by the backend.'}</span>
           </div>
         ) : (
           <div className="channel-grid">
@@ -2156,7 +2745,7 @@ export default function App() {
                 <div className="channel-card-topline">
                   <div className="channel-identity">
                     <div className="channel-avatar">
-                      {channel.thumbnailUrl ? <img src={channel.thumbnailUrl} alt={channel.displayName} /> : <span>{channel.displayName.slice(0, 1).toUpperCase()}</span>}
+                      <AvatarMedia imageUrl={channel.thumbnailUrl} label={channel.displayName} />
                     </div>
                     <div>
                       <h3>{channel.displayName}</h3>
@@ -2188,7 +2777,7 @@ export default function App() {
                   <button
                     className="primary-button"
                     onClick={() => {
-                      void loadChannelChat(channel);
+                      openChatTab(channel);
                     }}
                     disabled={(!channel.isLive && tokenOnlyMode) || (isLoadingChat && selectedChannelSlug === channel.channelSlug)}
                   >
@@ -2197,14 +2786,22 @@ export default function App() {
                         ? selectedChannelSlug === channel.channelSlug
                           ? browserChatEnabled
                             ? 'Live chat open'
-                            : 'Chat sync pending'
-                          : browserChatEnabled
-                            ? 'Open live chat'
-                            : 'Enable live chat'
+                            : channel.chatroomId !== null
+                              ? 'Realtime open'
+                              : 'Chat sync pending'
+                          : openChatTabSlugs.includes(channel.channelSlug)
+                            ? 'Switch chat'
+                            : browserChatEnabled
+                              ? 'Open live chat'
+                              : channel.chatroomId !== null
+                                ? 'Open realtime chat'
+                                : 'Enable live chat'
                         : 'Channel offline'
                       : isLoadingChat && selectedChannelSlug === channel.channelSlug
                         ? 'Loading chat...'
-                        : 'Open chat'}
+                        : openChatTabSlugs.includes(channel.channelSlug)
+                          ? 'Switch chat'
+                          : 'Open chat'}
                   </button>
                 </div>
               </article>
@@ -2222,8 +2819,10 @@ export default function App() {
                 ? selectedChannel
                   ? browserChatEnabled
                     ? `Hybrid chat for ${selectedChannel.displayName}. Chatterbro reads recent and live messages through the Kick browser sync, and can still send through the official chat API.`
-                    : `Live chat for ${selectedChannel.displayName} needs the Kick browser sync before Chatterbro can read messages in realtime.`
-                  : 'Select any live followed or tracked channel. Chatterbro uses the merged channel list for discovery and the saved Kick website session for live chat.'
+                    : selectedChannelRealtimeOnly
+                      ? `Realtime chat for ${selectedChannel.displayName} is active from Kick events now. Enable the browser sync only if you also want recent message history and richer channel metadata.`
+                      : `Live chat for ${selectedChannel.displayName} needs the Kick browser sync before Chatterbro can read recent website chat history.`
+                  : 'Select any live followed or tracked channel. Chatterbro uses the merged channel list for discovery and the Kick browser sync for live chat.'
                 : selectedChannel
                   ? `Read-only Kick-style chat mirror for ${selectedChannel.displayName}, with realtime updates layered over the latest snapshot.`
                   : 'Click Open chat on any live followed channel to load its snapshot and render it in a Kick-style chat shell.'}
@@ -2237,6 +2836,39 @@ export default function App() {
           ) : null}
         </div>
 
+        {openChatTabSlugs.length > 0 ? (
+          <div className="chat-tab-strip">
+            {openChatTabSlugs.map((channelSlug) => {
+              const tab = openChatTabs[channelSlug];
+              if (!tab) {
+                return null;
+              }
+
+              const tabDisplayName = tab.chat?.displayName || tab.channel.displayName;
+              const tabAvatarUrl = tab.chat?.avatarUrl ?? tab.channel.thumbnailUrl;
+              const isActiveTab = channelSlug === activeChatTabSlug;
+
+              return (
+                <div className={`chat-tab${isActiveTab ? ' chat-tab-active' : ''}`} key={channelSlug}>
+                  <button className="chat-tab-select" type="button" onClick={() => activateChatTab(channelSlug)}>
+                    <span className="chat-tab-avatar">
+                      <AvatarMedia imageUrl={tabAvatarUrl} label={tabDisplayName} />
+                    </span>
+                    <span className="chat-tab-copy">
+                      <strong>{tabDisplayName}</strong>
+                      <span>{channelSlug}</span>
+                    </span>
+                    {tab.chat ? <span className="chat-tab-count">{tab.chat.messages.length}</span> : null}
+                  </button>
+                  <button className="chat-tab-close" type="button" onClick={() => closeChatTab(channelSlug)} aria-label={`Close ${tabDisplayName} chat tab`}>
+                    ×
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
+
         {selectedChannel ? (
           <div className="chat-shell">
             <div className="chat-summary-card">
@@ -2244,13 +2876,13 @@ export default function App() {
                 <span className="chat-kick-mark">{tokenOnlyMode ? (browserChatEnabled ? 'Kick live chat' : 'Kick chat tools') : 'Kick chat mirror'}</span>
                 <span className="chat-transport-pill">
                   {tokenOnlyMode
-                    ? browserChatEnabled
-                      ? activeChatroomId !== null
-                        ? `chatroom_${activeChatroomId}`
-                        : 'snapshot sync'
-                      : hasChatWriteScope
-                        ? 'chat:write ready'
-                        : 'reauthorize for chat:write'
+                    ? activeChatroomId !== null
+                      ? `chatroom_${activeChatroomId}`
+                      : browserChatEnabled
+                        ? 'snapshot sync'
+                        : hasChatWriteScope
+                          ? 'chat:write ready'
+                          : 'reauthorize for chat:write'
                     : activeChatroomId !== null
                       ? `chatroom_${activeChatroomId}`
                       : 'snapshot mode'}
@@ -2261,11 +2893,7 @@ export default function App() {
                 <div>
                   <div className="channel-identity">
                     <div className="channel-avatar">
-                      {channelChat?.avatarUrl || selectedChannel.thumbnailUrl ? (
-                        <img src={channelChat?.avatarUrl || selectedChannel.thumbnailUrl || ''} alt={selectedChannel.displayName} />
-                      ) : (
-                        <span>{selectedChannel.displayName.slice(0, 1).toUpperCase()}</span>
-                      )}
+                      <AvatarMedia imageUrl={channelChat?.avatarUrl || selectedChannel.thumbnailUrl} label={selectedChannel.displayName} />
                     </div>
                     <div className="chat-summary-copy">
                       <h3>{channelChat?.displayName || selectedChannel.displayName}</h3>
@@ -2277,7 +2905,7 @@ export default function App() {
                 <div className="chat-summary-stats">
                   <span>{channelChat?.messages.length ?? 0} messages</span>
                   <span>Updated {formatChatClockTime(channelChat?.updatedAt ?? null)}</span>
-                  <span>{tokenOnlyMode ? browserChatEnabled ? (liveChatState === 'live' ? 'Realtime on' : 'Snapshot sync') : (selectedChannel.isLive ? 'Awaiting sync' : 'Offline') : liveChatState === 'live' ? 'Realtime on' : 'Snapshot sync'}</span>
+                  <span>{tokenOnlyMode ? liveChatState === 'live' ? 'Realtime on' : hasActiveRealtimeTarget && selectedChannel.isLive ? 'Realtime ready' : browserChatEnabled ? 'Snapshot sync' : selectedChannelSupportsRealtime ? 'Realtime only' : selectedChannel.isLive ? 'Awaiting sync' : 'Offline' : liveChatState === 'live' ? 'Realtime on' : 'Snapshot sync'}</span>
                 </div>
               </div>
 
@@ -2288,18 +2916,24 @@ export default function App() {
                 {tokenOnlyMode ? (
                   browserChatEnabled ? (
                     <button className="primary-button" onClick={() => {
-                      void loadChannelChat(selectedChannel);
+                      void loadChannelChat(selectedChannel, { forceFull: true });
                     }} disabled={isLoadingChat}>
                       {isLoadingChat ? 'Refreshing chat...' : 'Refresh chat'}
                     </button>
+                  ) : hasActiveRealtimeTarget && selectedChannel.isLive ? (
+                    <button className="primary-button" onClick={() => {
+                      void loadChannelChat(selectedChannel);
+                    }} disabled={isLoadingChat}>
+                      {isLoadingChat ? 'Connecting chat...' : 'Reconnect realtime'}
+                    </button>
                   ) : (
                     <button className="primary-button" onClick={startBrowserSessionSync} disabled={isStartingBridge || bridgeStatus.state === 'RUNNING'}>
-                      {isStartingBridge ? 'Opening website sync...' : bridgeStatus.state === 'RUNNING' ? 'Waiting for website sync...' : 'Enable website sync'}
+                      {isStartingBridge ? 'Opening live chat sync...' : bridgeStatus.state === 'RUNNING' ? 'Waiting for live chat sync...' : 'Enable live chat sync'}
                     </button>
                   )
                 ) : (
                   <button className="primary-button" onClick={() => {
-                    void loadChannelChat(selectedChannel);
+                    void loadChannelChat(selectedChannel, { forceFull: true });
                   }} disabled={isLoadingChat}>
                     {isLoadingChat ? 'Refreshing chat...' : 'Refresh chat'}
                   </button>
@@ -2331,7 +2965,7 @@ export default function App() {
             {!channelChat && isLoadingChat ? (
               <div className="empty-state">
                 <p>Loading recent chat messages...</p>
-                <span>The app is fetching the initial snapshot through the browser bridge. Once it arrives, live Kick messages will append automatically.</span>
+                <span>The app is fetching the initial snapshot through the browser bridge. Once it arrives, the newest Kick messages will stay pinned at the top automatically.</span>
               </div>
             ) : null}
 
@@ -2345,8 +2979,8 @@ export default function App() {
             {channelChat ? (
               channelChat.messages.length === 0 ? (
                 <div className="empty-state">
-                  <p>{tokenOnlyMode ? browserChatEnabled ? 'No recent chat messages were returned yet.' : 'Live chat sync is not connected yet.' : 'No recent chat messages were returned.'}</p>
-                  <span>{tokenOnlyMode ? browserChatEnabled ? 'If the realtime websocket is connected, new messages will still appear here automatically.' : 'Finish the website session sync first. After that, Chatterbro can load chat history and switch into realtime updates.' : 'Kick may have an empty history for this channel right now. If the live websocket is connected, new messages will still appear here automatically.'}</span>
+                  <p>{tokenOnlyMode ? hasActiveRealtimeTarget ? 'No recent realtime messages were returned yet.' : browserChatEnabled ? 'No recent chat messages were returned yet.' : 'Live chat sync is not connected yet.' : 'No recent chat messages were returned.'}</p>
+                  <span>{tokenOnlyMode ? hasActiveRealtimeTarget ? 'Realtime subscriptions are active for this live channel, so the latest messages should appear at the top automatically.' : browserChatEnabled ? 'If the realtime websocket is connected, the latest messages will appear at the top automatically.' : 'Finish the Kick browser sync first. After that, Chatterbro can load chat history and switch into realtime updates.' : 'Kick may have an empty history for this channel right now. If the live websocket is connected, the latest messages will appear at the top automatically.'}</span>
                 </div>
               ) : (
                 <div className="chat-feed" ref={chatFeedRef}>
@@ -2358,7 +2992,7 @@ export default function App() {
             <div className="chat-composer-shell">
               <div className="chat-composer-status">
                 <span className="chat-composer-status-dot" />
-                <span>{tokenOnlyMode ? browserChatEnabled ? hasChatWriteScope ? 'Live mirror + official send' : 'Live mirror + reconnect for chat:write' : hasChatWriteScope ? 'Official send ready' : 'Reconnect for chat:write' : liveChatState === 'live' ? 'Live mirror' : 'Read-only sync'}</span>
+                <span>{tokenOnlyMode ? hasActiveRealtimeTarget ? hasChatWriteScope ? 'Realtime + official send' : 'Realtime + reconnect for chat:write' : browserChatEnabled ? hasChatWriteScope ? 'Live mirror + official send' : 'Live mirror + reconnect for chat:write' : hasChatWriteScope ? 'Official send ready' : 'Reconnect for chat:write' : liveChatState === 'live' ? 'Live mirror' : 'Read-only sync'}</span>
               </div>
 
               {tokenOnlyMode ? (
@@ -2366,7 +3000,13 @@ export default function App() {
                   <textarea
                     className="chat-composer-textarea"
                     value={chatDraft}
-                    onChange={(event) => setChatDraft(event.target.value)}
+                    onChange={(event) => {
+                      if (!selectedChannelSlug) {
+                        return;
+                      }
+
+                      setChatDraftForChannel(selectedChannelSlug, event.target.value);
+                    }}
                     placeholder={selectedChannel.isLive
                       ? hasChatWriteScope
                         ? `Write to ${selectedChannel.displayName}...`
@@ -2409,7 +3049,7 @@ export default function App() {
         ) : (
           <div className="empty-state">
             <p>No channel chat selected yet.</p>
-            <span>{tokenOnlyMode ? 'After your channel list loads, enable the website session once and then open chat on any live followed or tracked channel to render recent messages and keep them updating in realtime.' : 'After loading your live followings, click Open chat on any online channel to render its recent Kick chat here and keep it updating in real time.'}</span>
+            <span>{tokenOnlyMode ? 'After your followings or watchlist load, enable live chat sync once and then open chat on any live channel to render recent messages and keep them updating in realtime.' : 'After loading your live followings, click Open chat on any online channel to render its recent Kick chat here and keep it updating in real time.'}</span>
           </div>
         )}
       </section>

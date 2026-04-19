@@ -8,8 +8,12 @@ import com.chatterbro.data.bridge.KickBridgeStatusStore
 import com.chatterbro.data.oauth.KickOAuthConfig
 import com.chatterbro.data.oauth.KickOAuthService
 import com.chatterbro.data.remote.ChannelChatEmoteService
+import com.chatterbro.data.remote.KickPublicChannelMetadataResolver
 import com.chatterbro.data.remote.PlaywrightKickBridgeDataSource
 import com.chatterbro.data.repository.BridgeBackedKickRepository
+import com.chatterbro.domain.model.ChannelChat
+import com.chatterbro.domain.model.ChannelChatRequest
+import com.chatterbro.domain.model.FollowedChannel
 import com.chatterbro.domain.usecase.LoadChannelChatUseCase
 import com.chatterbro.domain.usecase.LoadLiveFollowedChannelsUseCase
 import io.ktor.http.HttpMethod
@@ -31,8 +35,16 @@ import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.route
 import io.ktor.server.routing.routing
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 import java.nio.file.Paths
+import kotlin.io.path.exists
+import kotlin.io.path.listDirectoryEntries
+import kotlin.io.path.readText
+
+private val bridgeCacheJson = Json {
+    ignoreUnknownKeys = true
+}
 
 fun Application.chatterbroModule() {
     val rootDirectory = Paths.get("").toAbsolutePath().normalize()
@@ -45,6 +57,7 @@ fun Application.chatterbroModule() {
     val repository = BridgeBackedKickRepository(remoteDataSource)
     val loadLiveFollowedChannels = LoadLiveFollowedChannelsUseCase(repository)
     val loadChannelChat = LoadChannelChatUseCase(repository)
+    val publicChannelMetadataResolver = KickPublicChannelMetadataResolver(rootDirectory)
     val channelChatEmoteService = ChannelChatEmoteService()
     val frontendDistDirectory = rootDirectory.resolve("frontend").resolve("dist").toFile()
     val frontendAssetsDirectory = frontendDistDirectory.resolve("assets")
@@ -146,7 +159,14 @@ fun Application.chatterbroModule() {
 
             get("/following/live") {
                 try {
-                    call.respond(loadLiveFollowedChannels())
+                    call.respond(
+                        enrichLiveFollowedChannels(
+                            followedChannels = loadLiveFollowedChannels(),
+                            oauthService = oauthService,
+                            bridgePaths = bridgePaths,
+                            publicChannelMetadataResolver = publicChannelMetadataResolver,
+                        ),
+                    )
                 } catch (exception: IllegalStateException) {
                     val message = exception.message ?: "Kick bridge failed to load channels."
                     val statusCode = if (
@@ -199,7 +219,12 @@ fun Application.chatterbroModule() {
                 }
 
                 try {
-                    call.respond(service.fetchLiveChannelsBySlugs(slugs))
+                    call.respond(
+                        enrichChannelsWithPublicMetadata(
+                            service.fetchTrackedChannelsBySlugs(slugs),
+                            publicChannelMetadataResolver,
+                        ).filter(FollowedChannel::isLive),
+                    )
                 } catch (exception: IllegalStateException) {
                     val message = exception.message ?: "Kick OAuth failed to load tracked live channels."
                     val statusCode = if (
@@ -239,7 +264,12 @@ fun Application.chatterbroModule() {
                 }
 
                 try {
-                    call.respond(service.fetchTrackedChannelsBySlugs(slugs))
+                    call.respond(
+                        enrichChannelsWithPublicMetadata(
+                            service.fetchTrackedChannelsBySlugs(slugs),
+                            publicChannelMetadataResolver,
+                        ),
+                    )
                 } catch (exception: IllegalStateException) {
                     val message = exception.message ?: "Kick OAuth failed to load tracked channels."
                     val statusCode = if (
@@ -283,8 +313,37 @@ fun Application.chatterbroModule() {
                     return@get
                 }
 
+                val rawChannelId = call.request.queryParameters["channelId"]?.trim()
+                val channelId = rawChannelId
+                    ?.takeIf { it.isNotBlank() }
+                    ?.toLongOrNull()
+
+                if (!rawChannelId.isNullOrBlank() && channelId == null) {
+                    call.respond(HttpStatusCode.BadRequest, ErrorResponse("Channel id must be a number."))
+                    return@get
+                }
+
+                val rawChannelUserId = call.request.queryParameters["channelUserId"]?.trim()
+                val channelUserId = rawChannelUserId
+                    ?.takeIf { it.isNotBlank() }
+                    ?.toLongOrNull()
+
+                if (!rawChannelUserId.isNullOrBlank() && channelUserId == null) {
+                    call.respond(HttpStatusCode.BadRequest, ErrorResponse("Channel user id must be a number."))
+                    return@get
+                }
+
+                val chatRequest = ChannelChatRequest(
+                    channelSlug = channelSlug,
+                    channelId = channelId,
+                    channelUserId = channelUserId,
+                    displayName = call.request.queryParameters["displayName"]?.trim()?.takeIf(String::isNotBlank),
+                    avatarUrl = call.request.queryParameters["avatarUrl"]?.trim()?.takeIf(String::isNotBlank),
+                    fast = call.request.queryParameters["fast"]?.trim()?.equals("true", ignoreCase = true) == true,
+                )
+
                 try {
-                    call.respond(loadChannelChat(channelSlug))
+                    call.respond(loadChannelChat(chatRequest))
                 } catch (exception: IllegalStateException) {
                     val message = exception.message ?: "Kick bridge failed to load channel chat."
                     val statusCode = if (
@@ -382,4 +441,158 @@ fun Application.chatterbroModule() {
             }
         }
     }
+}
+
+private fun enrichLiveFollowedChannels(
+    followedChannels: List<FollowedChannel>,
+    oauthService: KickOAuthService?,
+    bridgePaths: KickBridgePaths,
+    publicChannelMetadataResolver: KickPublicChannelMetadataResolver,
+): List<FollowedChannel> {
+    if (followedChannels.isEmpty()) {
+        return followedChannels
+    }
+
+    val cachedChannelsBySlug = readCachedFollowedChannels(bridgePaths)
+    val enrichedChannelsBySlug = if (oauthService == null) {
+        emptyMap()
+    } else {
+        try {
+            oauthService.fetchTrackedChannelsBySlugs(
+                followedChannels.map(FollowedChannel::channelSlug),
+            ).associateBy { channel ->
+                channel.channelSlug.trim().lowercase()
+            }
+        } catch (_: IllegalStateException) {
+            emptyMap()
+        }
+    }
+
+    val mergedChannels = followedChannels.map { channel ->
+        val normalizedSlug = channel.channelSlug.trim().lowercase()
+        val cachedChannel = cachedChannelsBySlug[normalizedSlug]
+        val oauthChannel = enrichedChannelsBySlug[normalizedSlug]
+
+        val cachedMergedChannel = if (cachedChannel == null) {
+            channel
+        } else {
+            mergeFollowedChannel(channel, cachedChannel)
+        }
+
+        if (oauthChannel == null) {
+            cachedMergedChannel
+        } else {
+            mergeFollowedChannel(cachedMergedChannel, oauthChannel)
+        }
+    }
+
+    return enrichChannelsWithPublicMetadata(mergedChannels, publicChannelMetadataResolver)
+}
+
+private fun enrichChannelsWithPublicMetadata(
+    channels: List<FollowedChannel>,
+    publicChannelMetadataResolver: KickPublicChannelMetadataResolver,
+): List<FollowedChannel> {
+    if (channels.isEmpty()) {
+        return channels
+    }
+
+    val missingMetadataSlugs = channels.filter { channel ->
+        channel.chatroomId == null || channel.channelId == null || !channel.isLive
+    }.map(FollowedChannel::channelSlug)
+
+    if (missingMetadataSlugs.isEmpty()) {
+        return channels
+    }
+
+    val metadataBySlug = publicChannelMetadataResolver.resolveMany(missingMetadataSlugs)
+    if (metadataBySlug.isEmpty()) {
+        return channels
+    }
+
+    return channels.map { channel ->
+        val metadata = metadataBySlug[channel.channelSlug.trim().lowercase()] ?: return@map channel
+        FollowedChannel(
+            channelSlug = channel.channelSlug,
+            displayName = if (channel.displayName.equals(channel.channelSlug, ignoreCase = true)) {
+                metadata.displayName ?: channel.displayName
+            } else {
+                channel.displayName.ifBlank { metadata.displayName ?: channel.channelSlug }
+            },
+            isLive = channel.isLive || metadata.isLive == true,
+            channelUrl = channel.channelUrl.ifBlank { metadata.channelUrl },
+            chatUrl = channel.chatUrl ?: metadata.channelUrl,
+            thumbnailUrl = channel.thumbnailUrl ?: metadata.avatarUrl,
+            broadcasterUserId = channel.broadcasterUserId ?: metadata.broadcasterUserId,
+            channelId = channel.channelId ?: metadata.channelId,
+            chatroomId = channel.chatroomId ?: metadata.chatroomId,
+            viewerCount = channel.viewerCount,
+            streamTitle = channel.streamTitle,
+            categoryName = channel.categoryName,
+            tags = channel.tags,
+        )
+    }
+}
+
+private fun readCachedFollowedChannels(bridgePaths: KickBridgePaths): Map<String, FollowedChannel> {
+    val cacheFiles = buildList {
+        if (bridgePaths.chatOutputFile.exists()) {
+            add(bridgePaths.chatOutputFile)
+        }
+        if (bridgePaths.chatCacheDirectory.exists()) {
+            addAll(bridgePaths.chatCacheDirectory.listDirectoryEntries("*.json"))
+        }
+    }
+
+    if (cacheFiles.isEmpty()) {
+        return emptyMap()
+    }
+
+    return cacheFiles.mapNotNull(::readCachedFollowedChannel)
+        .associateBy(FollowedChannel::channelSlug)
+}
+
+private fun readCachedFollowedChannel(path: java.nio.file.Path): FollowedChannel? {
+    return try {
+        val chat = bridgeCacheJson.decodeFromString<ChannelChat>(path.readText())
+        val normalizedSlug = chat.channelSlug.trim().lowercase()
+        if (normalizedSlug.isBlank()) {
+            null
+        } else {
+            FollowedChannel(
+                channelSlug = normalizedSlug,
+                displayName = chat.displayName,
+                isLive = true,
+                channelUrl = chat.channelUrl,
+                chatUrl = chat.channelUrl,
+                thumbnailUrl = chat.avatarUrl,
+                broadcasterUserId = chat.channelUserId,
+                channelId = chat.channelId,
+                chatroomId = chat.chatroomId,
+            )
+        }
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun mergeFollowedChannel(
+    baseChannel: FollowedChannel,
+    enrichedChannel: FollowedChannel,
+): FollowedChannel {
+    return FollowedChannel(
+        channelSlug = baseChannel.channelSlug.ifBlank { enrichedChannel.channelSlug },
+        displayName = baseChannel.displayName.ifBlank { enrichedChannel.displayName },
+        isLive = baseChannel.isLive || enrichedChannel.isLive,
+        channelUrl = baseChannel.channelUrl.ifBlank { enrichedChannel.channelUrl },
+        chatUrl = baseChannel.chatUrl ?: enrichedChannel.chatUrl,
+        thumbnailUrl = baseChannel.thumbnailUrl ?: enrichedChannel.thumbnailUrl,
+        broadcasterUserId = baseChannel.broadcasterUserId ?: enrichedChannel.broadcasterUserId,
+        channelId = baseChannel.channelId ?: enrichedChannel.channelId,
+        chatroomId = baseChannel.chatroomId ?: enrichedChannel.chatroomId,
+        viewerCount = baseChannel.viewerCount ?: enrichedChannel.viewerCount,
+        streamTitle = baseChannel.streamTitle ?: enrichedChannel.streamTitle,
+        categoryName = baseChannel.categoryName ?: enrichedChannel.categoryName,
+        tags = if (baseChannel.tags.isNotEmpty()) baseChannel.tags else enrichedChannel.tags,
+    )
 }

@@ -74,8 +74,45 @@ export function fetchTrackedChannels(channelSlugs: string[]): Promise<FollowedCh
   return request<FollowedChannel[]>(`/api/channels/tracked?${query.toString()}`);
 }
 
-export function fetchChannelChat(channelSlug: string): Promise<ChannelChat> {
-  return request<ChannelChat>(`/api/chat/${channelSlug}`);
+export function fetchChannelChat({
+  channelSlug,
+  channelId,
+  channelUserId,
+  displayName,
+  avatarUrl,
+  fast = false,
+}: {
+  channelSlug: string;
+  channelId?: number | null;
+  channelUserId?: number | null;
+  displayName?: string | null;
+  avatarUrl?: string | null;
+  fast?: boolean;
+}): Promise<ChannelChat> {
+  const query = new URLSearchParams();
+
+  if (channelId !== undefined && channelId !== null) {
+    query.set('channelId', String(channelId));
+  }
+
+  if (channelUserId !== undefined && channelUserId !== null) {
+    query.set('channelUserId', String(channelUserId));
+  }
+
+  if (displayName) {
+    query.set('displayName', displayName);
+  }
+
+  if (avatarUrl) {
+    query.set('avatarUrl', avatarUrl);
+  }
+
+  if (fast) {
+    query.set('fast', 'true');
+  }
+
+  const queryString = query.toString();
+  return request<ChannelChat>(`/api/chat/${channelSlug}${queryString ? `?${queryString}` : ''}`);
 }
 
 export function sendChannelChatMessage(

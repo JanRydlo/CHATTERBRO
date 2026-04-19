@@ -1,6 +1,7 @@
 package com.chatterbro.data.bridge
 
 import com.chatterbro.domain.model.ChannelChat
+import com.chatterbro.domain.model.ChannelChatRequest
 import com.chatterbro.domain.model.FollowedChannel
 import kotlinx.serialization.DeserializationStrategy
 import kotlinx.serialization.builtins.ListSerializer
@@ -23,17 +24,25 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
+import java.time.Instant
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
+import kotlin.io.path.deleteIfExists
+import kotlin.io.path.createDirectories
 import kotlin.io.path.exists
 import kotlin.io.path.readText
+import kotlin.io.path.writeText
 
 class KickBridgeRunner(
     private val paths: KickBridgePaths,
     private val statusStore: KickBridgeStatusStore,
 ) {
+    private companion object {
+        const val RECONNECT_REQUIRED_MESSAGE = "Reconnect Kick browser and keep that window open to restore website-only reads."
+    }
+
     private val json = Json {
         ignoreUnknownKeys = true
     }
@@ -126,21 +135,49 @@ class KickBridgeRunner(
     }
 
     fun fetchLiveFollowedChannels(): List<FollowedChannel> {
-        return invokeServiceCommand(
-            command = "fetch-live-following",
-            payload = emptyMap(),
-            deserializer = ListSerializer(FollowedChannel.serializer()),
-        )
+        return try {
+            invokeServiceCommand(
+                command = "fetch-live-following",
+                payload = emptyMap(),
+                deserializer = ListSerializer(FollowedChannel.serializer()),
+            )
+        } catch (exception: IllegalStateException) {
+            val cachedChannels = readCachedFollowedChannels()
+            if (cachedChannels.isEmpty() || !isRecoverableFollowingsFailure(exception.message)) {
+                throw exception
+            }
+
+            statusStore.writeStatus(
+                statusStore.readStatus().copy(
+                    state = BridgeState.READY,
+                    message = "Kick blocked the latest followings refresh. Using the last cached live followings until the next successful sync.",
+                ),
+            )
+
+            cachedChannels
+        }
     }
 
-    fun fetchChannelChat(
-        channelSlug: String,
-    ): ChannelChat {
-        return invokeServiceCommand(
+    fun fetchChannelChat(request: ChannelChatRequest): ChannelChat {
+        val payload = buildMap<String, JsonElement> {
+            put("channelSlug", JsonPrimitive(request.channelSlug))
+            request.channelId?.let { put("channelId", JsonPrimitive(it)) }
+            request.channelUserId?.let { put("channelUserId", JsonPrimitive(it)) }
+            request.displayName?.takeIf(String::isNotBlank)?.let { put("displayName", JsonPrimitive(it)) }
+            request.avatarUrl?.takeIf(String::isNotBlank)?.let { put("avatarUrl", JsonPrimitive(it)) }
+            if (request.fast) {
+                put("fast", JsonPrimitive(true))
+            }
+        }
+
+        val chat = invokeServiceCommand(
             command = "fetch-channel-chat",
-            payload = mapOf("channelSlug" to JsonPrimitive(channelSlug)),
+            payload = payload,
             deserializer = ChannelChat.serializer(),
         )
+
+        persistCachedChannelChat(chat)
+        return chat
     }
 
     fun prewarmService() {
@@ -188,6 +225,31 @@ class KickBridgeRunner(
                 serviceWarmupInProgress.set(false)
             }
         }
+    }
+
+    fun reconcileBrowserSessionAvailability() {
+        if (!statusStore.hasValidBrowserSession()) {
+            return
+        }
+
+        if (loginProcess.get()?.isAlive == true) {
+            return
+        }
+
+        if (hasReachableExistingBrowser()) {
+            return
+        }
+
+        paths.sessionFile.deleteIfExists()
+        paths.cookiesFile.deleteIfExists()
+        paths.metadataFile.deleteIfExists()
+
+        statusStore.writeStatus(
+            statusStore.readStatus().copy(
+                state = BridgeState.ERROR,
+                message = RECONNECT_REQUIRED_MESSAGE,
+            ),
+        )
     }
 
     private fun <T> invokeServiceCommand(
@@ -246,6 +308,7 @@ class KickBridgeRunner(
         }
 
         stopServiceProcessLocked()
+        resolveReachableDebuggingPort()
 
         val process = ProcessBuilder(
             "node",
@@ -300,6 +363,39 @@ class KickBridgeRunner(
                 resolveServiceStartupFailureMessage(exception.message ?: "Kick bridge service failed to start."),
                 exception,
             )
+        }
+    }
+
+    private fun readCachedFollowedChannels(): List<FollowedChannel> {
+        if (!paths.outputFile.exists()) {
+            return emptyList()
+        }
+
+        return runCatching {
+            json.decodeFromString(
+                ListSerializer(FollowedChannel.serializer()),
+                paths.outputFile.readText(),
+            )
+        }.getOrDefault(emptyList())
+    }
+
+    private fun isRecoverableFollowingsFailure(message: String?): Boolean {
+        val normalizedMessage = message?.lowercase().orEmpty()
+        return normalizedMessage.contains("security policy")
+            || normalizedMessage.contains("timed out")
+            || normalizedMessage.contains("failed while loading followings")
+    }
+
+    private fun persistCachedChannelChat(chat: ChannelChat) {
+        val normalizedSlug = chat.channelSlug.trim().lowercase()
+        if (normalizedSlug.isBlank()) {
+            return
+        }
+
+        runCatching {
+            paths.chatCacheDirectory.createDirectories()
+            val chatCacheFile = paths.chatCacheDirectory.resolve("$normalizedSlug.json")
+            chatCacheFile.writeText(json.encodeToString(ChannelChat.serializer(), chat))
         }
     }
 
@@ -404,7 +500,25 @@ class KickBridgeRunner(
     }
 
     private fun hasReachableExistingBrowser(): Boolean {
-        val debuggingPort = readSavedDebuggingPort() ?: return false
+        return resolveReachableDebuggingPort() != null
+    }
+
+    private fun resolveReachableDebuggingPort(): Int? {
+        val savedDebuggingPort = readSavedDebuggingPort()
+        if (savedDebuggingPort != null && isReachableDebuggingPort(savedDebuggingPort)) {
+            return savedDebuggingPort
+        }
+
+        val discoveredDebuggingPort = discoverRunningDebuggingPort() ?: return null
+        if (!isReachableDebuggingPort(discoveredDebuggingPort)) {
+            return null
+        }
+
+        persistDiscoveredBrowserMetadata(discoveredDebuggingPort)
+        return discoveredDebuggingPort
+    }
+
+    private fun isReachableDebuggingPort(debuggingPort: Int): Boolean {
         val request = try {
             HttpRequest.newBuilder(URI("http://127.0.0.1:$debuggingPort/json/version"))
                 .timeout(Duration.ofMillis(300))
@@ -422,19 +536,85 @@ class KickBridgeRunner(
         }
     }
 
-    private fun readSavedDebuggingPort(): Int? {
+    private fun discoverRunningDebuggingPort(): Int? {
+        val expectedProfilePath = paths.profileDirectory.toAbsolutePath().normalize().toString()
+        val processes = ProcessHandle.allProcesses()
+
+        try {
+            val iterator = processes.iterator()
+            while (iterator.hasNext()) {
+                val arguments = iterator.next().info().arguments().orElse(null) ?: continue
+                if (!arguments.any { argument -> matchesProfileDirectory(argument, expectedProfilePath) }) {
+                    continue
+                }
+
+                val debuggingPort = arguments.firstNotNullOfOrNull(::parseDebuggingPortArgument) ?: continue
+                return debuggingPort
+            }
+        } finally {
+            processes.close()
+        }
+
+        return null
+    }
+
+    private fun matchesProfileDirectory(argument: String, expectedProfilePath: String): Boolean {
+        val normalizedArgument = argument.trim().removeSurrounding("\"")
+        val prefix = "--user-data-dir="
+        if (!normalizedArgument.startsWith(prefix, ignoreCase = true)) {
+            return false
+        }
+
+        val actualProfilePath = normalizedArgument.substring(prefix.length).trim().removeSurrounding("\"")
+        return actualProfilePath.replace('/', '\\').equals(
+            expectedProfilePath.replace('/', '\\'),
+            ignoreCase = true,
+        )
+    }
+
+    private fun parseDebuggingPortArgument(argument: String): Int? {
+        val normalizedArgument = argument.trim().removeSurrounding("\"")
+        val prefix = "--remote-debugging-port="
+        if (!normalizedArgument.startsWith(prefix, ignoreCase = true)) {
+            return null
+        }
+
+        return normalizedArgument.substring(prefix.length).toIntOrNull()
+    }
+
+    private fun persistDiscoveredBrowserMetadata(debuggingPort: Int) {
+        val existingMetadata = readSavedMetadata()
+        val updatedMetadata = buildJsonObject {
+            existingMetadata?.forEach { (key, value) ->
+                put(key, value)
+            }
+            put("profileDir", JsonPrimitive(paths.profileDirectory.toAbsolutePath().normalize().toString()))
+            put("debuggingPort", JsonPrimitive(debuggingPort))
+            put("capturedAt", JsonPrimitive(Instant.now().toString()))
+        }
+
+        runCatching {
+            paths.metadataFile.writeText(updatedMetadata.toString())
+        }
+    }
+
+    private fun readSavedMetadata(): JsonObject? {
         if (!paths.metadataFile.exists()) {
             return null
         }
 
         return try {
-            json.parseToJsonElement(paths.metadataFile.readText())
-                .jsonObject["debuggingPort"]
-                ?.jsonPrimitive
-                ?.intOrNull
+            json.parseToJsonElement(paths.metadataFile.readText()).jsonObject
         } catch (_: Exception) {
             null
         }
+    }
+
+    private fun readSavedDebuggingPort(): Int? {
+        return readSavedMetadata()
+            ?.get("debuggingPort")
+            ?.jsonPrimitive
+            ?.intOrNull
     }
 
     private class ServiceBridgeException(
