@@ -14,6 +14,7 @@ data class ChannelChat(
 	val cursor: String? = null,
 	val messages: List<ChannelChatMessage> = emptyList(),
 	val pinnedMessage: ChannelChatMessage? = null,
+	val subscriberBadgeImageUrlsByMonths: Map<Int, String> = emptyMap(),
 	val updatedAt: String,
 )
 

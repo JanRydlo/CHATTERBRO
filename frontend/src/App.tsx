@@ -1,6 +1,7 @@
 import Pusher, { type Options as PusherOptions } from 'pusher-js';
 import { Fragment, type ReactNode, startTransition, useEffect, useEffectEvent, useRef, useState } from 'react';
 import { fetchChannelChat, fetchChannelChatEmotes, fetchGlobalChatEmotes, fetchLiveFollowedChannels, fetchTrackedChannels, getBridgeStatus, getOAuthLoginUrl, sendChannelChatMessage, startBridge } from './api';
+import { KNOWN_KICK_BADGE_IMAGE_URLS_BY_KIND, KNOWN_KICK_CHANNEL_BADGE_IMAGE_URLS_BY_SLUG } from './knownKickBadgeAssets';
 import type { ChannelChat, ChannelChatBadge, ChannelChatEmote, ChannelChatEmoteCatalog, ChannelChatMessage, ChannelChatSender, FollowedChannel, KickBridgeStatus } from './types';
 
 const FALLBACK_STATUS: KickBridgeStatus = {
@@ -104,7 +105,8 @@ function buildTokenOnlyChatShell(channel: FollowedChannel): ChannelChat {
     cursor: null,
     messages: [],
     pinnedMessage: null,
-    updatedAt: new Date().toISOString()
+    updatedAt: new Date().toISOString(),
+    subscriberBadgeImageUrlsByMonths: channel.subscriberBadgeImageUrlsByMonths ?? null
   };
 }
 
@@ -184,6 +186,7 @@ function mergeDiscoveredChannel(currentChannel: FollowedChannel | undefined, nex
     streamTitle: nextChannel.streamTitle ?? currentChannel.streamTitle,
     categoryName: nextChannel.categoryName ?? currentChannel.categoryName,
     tags: nextChannel.tags.length > 0 ? nextChannel.tags : currentChannel.tags,
+    subscriberBadgeImageUrlsByMonths: nextChannel.subscriberBadgeImageUrlsByMonths ?? currentChannel.subscriberBadgeImageUrlsByMonths ?? null,
   };
 }
 
@@ -342,29 +345,6 @@ function resolvePreferredMessageContent(message: Record<string, unknown>) {
   return normalizeExternalEmoteCode(candidates.sort((left, right) => right.length - left.length)[0] ?? '');
 }
 
-function getBadgeLabel(badge: ChannelChatBadge) {
-  const badgeType = badge.type.toLowerCase();
-
-  switch (badgeType) {
-    case 'moderator':
-      return 'MOD';
-    case 'verified':
-      return 'VER';
-    case 'vip':
-      return 'VIP';
-    case 'founder':
-      return 'F';
-    case 'subscriber':
-      return badge.count ? `S${badge.count}` : 'SUB';
-    case 'sub_gifter':
-      return badge.count ? `G${badge.count}` : 'G';
-    case 'og':
-      return 'OG';
-    default:
-      return (badge.text || badge.type || '?').slice(0, 3).toUpperCase();
-  }
-}
-
 function getBadgeTitle(badge: ChannelChatBadge) {
   const label = badge.text || badge.type || 'Badge';
   return badge.count ? `${label} ${badge.count}` : label;
@@ -376,6 +356,92 @@ function getBadgeTypeKey(badge: Pick<ChannelChatBadge, 'type' | 'text'>) {
 
 function getBadgeVariantKey(badge: Pick<ChannelChatBadge, 'type' | 'text' | 'count'>) {
   return `${getBadgeTypeKey(badge)}:${badge.count ?? 'none'}`;
+}
+
+function getKnownBadgeKind(badge: Pick<ChannelChatBadge, 'type' | 'text'>) {
+  const candidates = [badge.type, badge.text]
+    .map((value) => value.trim().toLowerCase())
+    .filter((value) => value.length > 0)
+    .map((value) => value.replace(/[\s-]+/g, '_'));
+
+  for (const candidate of candidates) {
+    if (candidate.includes('moderator')) {
+      return 'moderator';
+    }
+    if (candidate.includes('verified')) {
+      return 'verified';
+    }
+    if (candidate.includes('broadcaster')) {
+      return 'broadcaster';
+    }
+    if (candidate.includes('vip')) {
+      return 'vip';
+    }
+    if (candidate.includes('founder')) {
+      return 'founder';
+    }
+    if (candidate.includes('subscriber')) {
+      return 'subscriber';
+    }
+    if (candidate.includes('sub_gifter') || candidate.includes('gifter') || candidate.includes('gift')) {
+      return 'sub-gifter';
+    }
+    if (candidate === 'og' || candidate.includes('_og') || candidate.includes('og_')) {
+      return 'og';
+    }
+  }
+
+  return null;
+}
+
+function resolveSubscriberBadgeImageUrlFromCatalog(
+  badge: Pick<ChannelChatBadge, 'type' | 'text' | 'count'>,
+  subscriberBadgeImageUrlsByMonths: Record<string, string> | null | undefined,
+) {
+  if (getKnownBadgeKind(badge) !== 'subscriber' || !subscriberBadgeImageUrlsByMonths) {
+    return null;
+  }
+
+  const count = badge.count ?? 0;
+  if (count <= 0) {
+    return null;
+  }
+
+  const badgeEntries = Object.entries(subscriberBadgeImageUrlsByMonths)
+    .map(([months, imageUrl]) => ({ months: Number(months), imageUrl }))
+    .filter(({ months, imageUrl }) => Number.isFinite(months) && months > 0 && imageUrl.length > 0)
+    .sort((left, right) => left.months - right.months);
+
+  if (badgeEntries.length === 0) {
+    return null;
+  }
+
+  const bestMatchingBadge = [...badgeEntries].reverse().find(({ months }) => months <= count);
+  return bestMatchingBadge?.imageUrl ?? badgeEntries[0].imageUrl;
+}
+
+function resolveKnownBadgeImageUrl(
+  badge: Pick<ChannelChatBadge, 'type' | 'text'>,
+  channelSlug: string | null | undefined,
+) {
+  const badgeKind = getKnownBadgeKind(badge);
+  if (!badgeKind) {
+    return null;
+  }
+
+  const normalizedChannelSlug = channelSlug?.trim().toLowerCase() ?? '';
+  if (normalizedChannelSlug) {
+    const channelBadgeImageUrl = KNOWN_KICK_CHANNEL_BADGE_IMAGE_URLS_BY_SLUG[normalizedChannelSlug]?.[badgeKind];
+    if (channelBadgeImageUrl) {
+      return channelBadgeImageUrl;
+    }
+  }
+
+  return KNOWN_KICK_BADGE_IMAGE_URLS_BY_KIND[badgeKind] ?? null;
+}
+
+function isSubscriberBadgeImageUrl(imageUrl: string | null) {
+  return typeof imageUrl === 'string' && /\/channel_subscriber_badges\//i.test(imageUrl);
 }
 
 function isOpaqueBadgeValue(value: string) {
@@ -445,31 +511,57 @@ function getBadgeTextKey(badge: Pick<ChannelChatBadge, 'text'>) {
   return badge.text.trim().toLowerCase();
 }
 
-function findMatchingCachedBadgeIndex(cachedBadges: ChannelChatBadge[], badge: ChannelChatBadge, fallbackIndex: number) {
+function findMatchingCachedBadgeIndex(
+  cachedBadges: ChannelChatBadge[],
+  badge: ChannelChatBadge,
+  fallbackIndex: number,
+  matchedCachedBadgeIndexes: Set<number>
+) {
   const badgeVariantKey = getBadgeVariantKey(badge);
   const badgeTypeKey = getBadgeTypeKey(badge);
   const badgeTextKey = getBadgeTextKey(badge);
 
-  const exactVariantIndex = cachedBadges.findIndex((cachedBadge) => getBadgeVariantKey(cachedBadge) === badgeVariantKey);
+  const availableCachedBadgeEntries = cachedBadges
+    .map((cachedBadge, cachedBadgeIndex) => ({ cachedBadge, cachedBadgeIndex }))
+    .filter(({ cachedBadgeIndex }) => !matchedCachedBadgeIndexes.has(cachedBadgeIndex));
+
+  const exactVariantIndex = availableCachedBadgeEntries.find(
+    ({ cachedBadge }) => getBadgeVariantKey(cachedBadge) === badgeVariantKey
+  )?.cachedBadgeIndex ?? -1;
   if (exactVariantIndex >= 0) {
     return exactVariantIndex;
   }
 
   if (!isOpaqueBadgeValue(badge.type)) {
-    const typeIndex = cachedBadges.findIndex((cachedBadge) => getBadgeTypeKey(cachedBadge) === badgeTypeKey);
+    if (badgeTypeKey === 'subscriber') {
+      const subscriberImageIndex = availableCachedBadgeEntries.find(
+        ({ cachedBadge }) => isSubscriberBadgeImageUrl(cachedBadge.imageUrl)
+      )?.cachedBadgeIndex ?? -1;
+      if (subscriberImageIndex >= 0) {
+        return subscriberImageIndex;
+      }
+    }
+
+    const typeIndex = availableCachedBadgeEntries.find(
+      ({ cachedBadge }) => getBadgeTypeKey(cachedBadge) === badgeTypeKey
+    )?.cachedBadgeIndex ?? -1;
     if (typeIndex >= 0) {
       return typeIndex;
     }
   }
 
   if (!isOpaqueBadgeValue(badge.text)) {
-    const textIndex = cachedBadges.findIndex((cachedBadge) => getBadgeTextKey(cachedBadge) === badgeTextKey);
+    const textIndex = availableCachedBadgeEntries.find(
+      ({ cachedBadge }) => getBadgeTextKey(cachedBadge) === badgeTextKey
+    )?.cachedBadgeIndex ?? -1;
     if (textIndex >= 0) {
       return textIndex;
     }
   }
 
-  return fallbackIndex < cachedBadges.length ? fallbackIndex : -1;
+  return fallbackIndex < cachedBadges.length && !matchedCachedBadgeIndexes.has(fallbackIndex)
+    ? fallbackIndex
+    : -1;
 }
 
 function mergeBadgeWithCachedBadge(badge: ChannelChatBadge, cachedBadge: ChannelChatBadge | null) {
@@ -496,7 +588,7 @@ function hydrateSenderBadgesWithCachedBadges(nextBadges: ChannelChatBadge[], cac
 
   const matchedCachedBadgeIndexes = new Set<number>();
   const hydratedBadges = nextBadges.map((badge, badgeIndex) => {
-    const cachedBadgeIndex = findMatchingCachedBadgeIndex(cachedSenderBadges, badge, badgeIndex);
+    const cachedBadgeIndex = findMatchingCachedBadgeIndex(cachedSenderBadges, badge, badgeIndex, matchedCachedBadgeIndexes);
     if (cachedBadgeIndex >= 0) {
       matchedCachedBadgeIndexes.add(cachedBadgeIndex);
     }
@@ -647,6 +739,10 @@ function buildBadgeImageUrlIndex(messages: ChannelChatMessage[]) {
       if (!badgeImageUrlIndex.has(typeKey)) {
         badgeImageUrlIndex.set(typeKey, badge.imageUrl);
       }
+
+      if (isSubscriberBadgeImageUrl(badge.imageUrl) && !badgeImageUrlIndex.has('subscriber')) {
+        badgeImageUrlIndex.set('subscriber', badge.imageUrl);
+      }
     }
   }
 
@@ -659,13 +755,22 @@ function resolveCachedBadgeImageUrl(badge: ChannelChatBadge, badgeImageUrlIndex:
     ?? null;
 }
 
-function renderSenderBadge(badge: ChannelChatBadge, key: string, badgeImageUrlIndex: Map<string, string>) {
-  const imageUrl = badge.imageUrl || resolveCachedBadgeImageUrl(badge, badgeImageUrlIndex);
+function renderSenderBadge(
+  badge: ChannelChatBadge,
+  key: string,
+  badgeImageUrlIndex: Map<string, string>,
+  subscriberBadgeImageUrlsByMonths: Record<string, string> | null | undefined,
+  channelSlug: string | null | undefined,
+) {
+  const imageUrl = badge.imageUrl
+    || resolveCachedBadgeImageUrl(badge, badgeImageUrlIndex)
+    || resolveSubscriberBadgeImageUrlFromCatalog(badge, subscriberBadgeImageUrlsByMonths)
+    || resolveKnownBadgeImageUrl(badge, channelSlug);
   if (imageUrl) {
     return <img className="chat-badge-icon chat-badge-image" key={key} src={imageUrl} alt={getBadgeTitle(badge)} title={getBadgeTitle(badge)} loading="lazy" decoding="async" draggable={false} />;
   }
 
-  return <span className="chat-badge-icon chat-badge-fallback" key={key} title={getBadgeTitle(badge)}>{getBadgeLabel(badge)}</span>;
+  return null;
 }
 
 function buildChannelEmoteIndex(catalog: ChannelChatEmoteCatalog) {
@@ -1042,8 +1147,13 @@ function realtimeMessageNeedsBadgeRefresh(currentChat: ChannelChat | null, nextM
 
   const hydratedRealtimeMessage = hydrateRealtimeSenderBadges(currentChat, nextMessage);
   const badgeImageUrlIndex = buildBadgeImageUrlIndex(currentChat.messages);
+  const subscriberBadgeImageUrlsByMonths = currentChat.subscriberBadgeImageUrlsByMonths ?? null;
 
-  return hydratedRealtimeMessage.sender.badges.some((badge) => !badge.imageUrl && !resolveCachedBadgeImageUrl(badge, badgeImageUrlIndex));
+  return hydratedRealtimeMessage.sender.badges.some(
+    (badge) => !badge.imageUrl
+      && !resolveCachedBadgeImageUrl(badge, badgeImageUrlIndex)
+      && !resolveSubscriberBadgeImageUrlFromCatalog(badge, subscriberBadgeImageUrlsByMonths)
+  );
 }
 
 function mergeChannelChat(currentChat: ChannelChat | null, nextChat: ChannelChat): ChannelChat {
@@ -1068,6 +1178,7 @@ function mergeChannelChat(currentChat: ChannelChat | null, nextChat: ChannelChat
     ...nextChat,
     channelUserId: nextChat.channelUserId ?? currentChat.channelUserId,
     pinnedMessage: nextChat.pinnedMessage || currentChat.pinnedMessage,
+    subscriberBadgeImageUrlsByMonths: nextChat.subscriberBadgeImageUrlsByMonths ?? currentChat.subscriberBadgeImageUrlsByMonths ?? null,
     messages: mergedMessages.slice(-200)
   };
 }
@@ -1115,6 +1226,7 @@ function mergeOpenChatTabChannel(currentChannel: FollowedChannel, nextChannel: F
     streamTitle: nextChannel.streamTitle ?? currentChannel.streamTitle,
     categoryName: nextChannel.categoryName ?? currentChannel.categoryName,
     tags: nextChannel.tags.length > 0 ? nextChannel.tags : currentChannel.tags,
+    subscriberBadgeImageUrlsByMonths: nextChannel.subscriberBadgeImageUrlsByMonths ?? currentChannel.subscriberBadgeImageUrlsByMonths ?? null,
   };
 }
 
@@ -1130,7 +1242,8 @@ function mergeOpenChatChannelChat(currentChat: ChannelChat | null, channel: Foll
     chatroomId: channel.chatroomId ?? currentChat.chatroomId,
     displayName: channel.displayName,
     channelUrl: channel.channelUrl,
-    avatarUrl: channel.thumbnailUrl ?? currentChat.avatarUrl
+    avatarUrl: channel.thumbnailUrl ?? currentChat.avatarUrl,
+    subscriberBadgeImageUrlsByMonths: channel.subscriberBadgeImageUrlsByMonths ?? currentChat.subscriberBadgeImageUrlsByMonths ?? null
   };
 }
 
@@ -2386,8 +2499,10 @@ export default function App() {
       const securityPolicyBlocked = isSecurityPolicyBlockedMessage(message);
       const canFallbackToRealtimeOnly = tokenOnlyMode && resolvedChannel.isLive && resolvedChannel.chatroomId !== null;
 
-      if (reconnectRequired && canFallbackToRealtimeOnly) {
-        setRequiresBrowserReconnect(true);
+      if ((reconnectRequired || securityPolicyBlocked) && canFallbackToRealtimeOnly) {
+        if (reconnectRequired) {
+          setRequiresBrowserReconnect(true);
+        }
         updateOpenChannelChat(resolvedChannel.channelSlug, (currentChat) => mergeChannelChat(currentChat, buildTokenOnlyChatShell(resolvedChannel)));
         setChatErrorForChannel(resolvedChannel.channelSlug, null);
         setSendChatErrorForChannel(resolvedChannel.channelSlug, null);
@@ -2509,6 +2624,17 @@ export default function App() {
 
   function renderChatMessage(message: ChannelChatMessage) {
     const senderBadges = message.sender.badges || [];
+    const renderedSenderBadges = senderBadges.flatMap((badge, index) => {
+      const renderedBadge = renderSenderBadge(
+        badge,
+        `${message.id}-${badge.type}-${index}`,
+        badgeImageUrlIndex,
+        channelChat?.subscriberBadgeImageUrlsByMonths,
+        channelChat?.channelSlug,
+      );
+
+      return renderedBadge ? [renderedBadge] : [];
+    });
     const timeLabel = formatChatClockTime(message.createdAt);
     const timeTitle = formatChatTimestamp(message.createdAt);
     const renderedMessageContent = renderMessageContent(message.content, message.id, activeEmoteIndex);
@@ -2519,7 +2645,7 @@ export default function App() {
         <div className="chat-message-main">
           <div className="chat-message-header">
             <div className="chat-sender-group">
-              {senderBadges.length > 0 ? <span className="chat-badge-list">{senderBadges.map((badge, index) => renderSenderBadge(badge, `${message.id}-${badge.type}-${index}`, badgeImageUrlIndex))}</span> : null}
+              {renderedSenderBadges.length > 0 ? <span className="chat-badge-list">{renderedSenderBadges}</span> : null}
               <strong className="chat-sender-name" style={message.sender.color ? { color: message.sender.color } : undefined}>
                 {message.sender.username}
               </strong>

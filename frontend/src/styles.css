@@ -913,10 +913,6 @@ input {
   border: 0;
 }
 
-.chat-badge-fallback {
-  padding: 0 0.34rem;
-}
-
 .chat-badge,
 .chat-type-pill,
 .chat-message-time {

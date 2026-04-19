@@ -343,7 +343,15 @@ fun Application.chatterbroModule() {
                 )
 
                 try {
-                    call.respond(loadChannelChat(chatRequest))
+                    call.respond(
+                        enrichChannelChatWithCachedBadgeAssets(
+                            enrichChannelChatWithPublicMetadata(
+                                loadChannelChat(chatRequest),
+                                publicChannelMetadataResolver,
+                            ),
+                            bridgePaths,
+                        ),
+                    )
                 } catch (exception: IllegalStateException) {
                     val message = exception.message ?: "Kick bridge failed to load channel chat."
                     val statusCode = if (
@@ -443,6 +451,126 @@ fun Application.chatterbroModule() {
     }
 }
 
+internal fun enrichChannelChatWithPublicMetadata(
+    chat: ChannelChat,
+    publicChannelMetadataResolver: KickPublicChannelMetadataResolver,
+): ChannelChat {
+    val metadata = publicChannelMetadataResolver.resolve(chat.channelSlug) ?: return chat
+    val subscriberBadgeImageUrlsByMonths = if (chat.subscriberBadgeImageUrlsByMonths.isNotEmpty()) {
+        chat.subscriberBadgeImageUrlsByMonths
+    } else {
+        metadata.subscriberBadgeImageUrlsByMonths
+    }
+
+    if (subscriberBadgeImageUrlsByMonths.isEmpty()) {
+        return chat
+    }
+
+    val chatWithBadgeCatalog = if (chat.subscriberBadgeImageUrlsByMonths == subscriberBadgeImageUrlsByMonths) {
+        chat
+    } else {
+        chat.copy(subscriberBadgeImageUrlsByMonths = subscriberBadgeImageUrlsByMonths)
+    }
+
+    if (!channelChatNeedsSubscriberBadgeImageEnrichment(chatWithBadgeCatalog)) {
+        return chatWithBadgeCatalog
+    }
+
+    return enrichChannelChatWithSubscriberBadgeImages(chatWithBadgeCatalog, subscriberBadgeImageUrlsByMonths)
+}
+
+internal fun enrichChannelChatWithSubscriberBadgeImages(
+    chat: ChannelChat,
+    subscriberBadgeImageUrlsByMonths: Map<Int, String>,
+): ChannelChat {
+    if (subscriberBadgeImageUrlsByMonths.isEmpty()) {
+        return chat
+    }
+
+    val nextSubscriberBadgeImageUrlsByMonths = if (chat.subscriberBadgeImageUrlsByMonths.isNotEmpty()) {
+        chat.subscriberBadgeImageUrlsByMonths
+    } else {
+        subscriberBadgeImageUrlsByMonths
+    }
+    var changed = false
+    val nextMessages = chat.messages.map { message ->
+        val nextBadges = enrichSubscriberBadgeImages(message.sender.badges, subscriberBadgeImageUrlsByMonths)
+        if (nextBadges === message.sender.badges) {
+            message
+        } else {
+            changed = true
+            message.copy(sender = message.sender.copy(badges = nextBadges))
+        }
+    }
+    val nextPinnedMessage = chat.pinnedMessage?.let { pinnedMessage ->
+        val nextBadges = enrichSubscriberBadgeImages(pinnedMessage.sender.badges, subscriberBadgeImageUrlsByMonths)
+        if (nextBadges === pinnedMessage.sender.badges) {
+            pinnedMessage
+        } else {
+            changed = true
+            pinnedMessage.copy(sender = pinnedMessage.sender.copy(badges = nextBadges))
+        }
+    }
+
+    return if (changed || chat.subscriberBadgeImageUrlsByMonths != nextSubscriberBadgeImageUrlsByMonths) {
+        chat.copy(
+            messages = nextMessages,
+            pinnedMessage = nextPinnedMessage,
+            subscriberBadgeImageUrlsByMonths = nextSubscriberBadgeImageUrlsByMonths,
+        )
+    } else {
+        chat
+    }
+}
+
+internal fun enrichChannelChatWithCachedBadgeAssets(
+    chat: ChannelChat,
+    bridgePaths: KickBridgePaths,
+): ChannelChat {
+    if (!channelChatNeedsCachedBadgeAssetEnrichment(chat)) {
+        return chat
+    }
+
+    val cachedChats = readCachedChannelChats(bridgePaths, chat.channelSlug)
+    if (cachedChats.isEmpty()) {
+        return chat
+    }
+
+    val cachedSenderBadgesByKey = buildCachedSenderBadgesIndex(cachedChats)
+    if (cachedSenderBadgesByKey.isEmpty()) {
+        return chat
+    }
+
+    var changed = false
+    val nextMessages = chat.messages.map { message ->
+        val nextBadges = hydrateBadgesWithCachedSenderBadges(message.sender, message.sender.badges, cachedSenderBadgesByKey)
+        if (nextBadges === message.sender.badges) {
+            message
+        } else {
+            changed = true
+            message.copy(sender = message.sender.copy(badges = nextBadges))
+        }
+    }
+    val nextPinnedMessage = chat.pinnedMessage?.let { pinnedMessage ->
+        val nextBadges = hydrateBadgesWithCachedSenderBadges(pinnedMessage.sender, pinnedMessage.sender.badges, cachedSenderBadgesByKey)
+        if (nextBadges === pinnedMessage.sender.badges) {
+            pinnedMessage
+        } else {
+            changed = true
+            pinnedMessage.copy(sender = pinnedMessage.sender.copy(badges = nextBadges))
+        }
+    }
+
+    return if (changed) {
+        chat.copy(
+            messages = nextMessages,
+            pinnedMessage = nextPinnedMessage,
+        )
+    } else {
+        chat
+    }
+}
+
 private fun enrichLiveFollowedChannels(
     followedChannels: List<FollowedChannel>,
     oauthService: KickOAuthService?,
@@ -499,6 +627,7 @@ private fun enrichChannelsWithPublicMetadata(
 
     val missingMetadataSlugs = channels.filter { channel ->
         channel.chatroomId == null || channel.channelId == null || !channel.isLive
+                || channel.subscriberBadgeImageUrlsByMonths.isEmpty()
     }.map(FollowedChannel::channelSlug)
 
     if (missingMetadataSlugs.isEmpty()) {
@@ -530,11 +659,96 @@ private fun enrichChannelsWithPublicMetadata(
             streamTitle = channel.streamTitle,
             categoryName = channel.categoryName,
             tags = channel.tags,
+            subscriberBadgeImageUrlsByMonths = if (channel.subscriberBadgeImageUrlsByMonths.isNotEmpty()) {
+                channel.subscriberBadgeImageUrlsByMonths
+            } else {
+                metadata.subscriberBadgeImageUrlsByMonths
+            },
         )
     }
 }
 
+private fun channelChatNeedsSubscriberBadgeImageEnrichment(chat: ChannelChat): Boolean {
+    if (chat.messages.any(::messageNeedsSubscriberBadgeImageEnrichment)) {
+        return true
+    }
+
+    return chat.pinnedMessage?.let(::messageNeedsSubscriberBadgeImageEnrichment) == true
+}
+
+private fun channelChatNeedsCachedBadgeAssetEnrichment(chat: ChannelChat): Boolean {
+    if (chat.messages.any(::messageNeedsCachedBadgeAssetEnrichment)) {
+        return true
+    }
+
+    return chat.pinnedMessage?.let(::messageNeedsCachedBadgeAssetEnrichment) == true
+}
+
+private fun messageNeedsSubscriberBadgeImageEnrichment(message: com.chatterbro.domain.model.ChannelChatMessage): Boolean {
+    return message.sender.badges.any { badge ->
+        badge.imageUrl.isNullOrBlank()
+            && badge.type.equals("subscriber", ignoreCase = true)
+            && (badge.count ?: 0) > 0
+    }
+}
+
+private fun messageNeedsCachedBadgeAssetEnrichment(message: com.chatterbro.domain.model.ChannelChatMessage): Boolean {
+    return message.sender.badges.any { badge ->
+        badge.imageUrl.isNullOrBlank()
+    }
+}
+
+private fun enrichSubscriberBadgeImages(
+    badges: List<com.chatterbro.domain.model.ChannelChatBadge>,
+    subscriberBadgeImageUrlsByMonths: Map<Int, String>,
+): List<com.chatterbro.domain.model.ChannelChatBadge> {
+    var changed = false
+    val nextBadges = badges.map { badge ->
+        if (!badge.imageUrl.isNullOrBlank()) {
+            return@map badge
+        }
+
+        val imageUrl = resolveSubscriberBadgeImageUrl(badge.count, badge.type, subscriberBadgeImageUrlsByMonths)
+            ?: return@map badge
+
+        changed = true
+        badge.copy(imageUrl = imageUrl)
+    }
+
+    return if (changed) {
+        nextBadges
+    } else {
+        badges
+    }
+}
+
+private fun resolveSubscriberBadgeImageUrl(
+    count: Int?,
+    type: String,
+    subscriberBadgeImageUrlsByMonths: Map<Int, String>,
+): String? {
+    if (!type.equals("subscriber", ignoreCase = true) || count == null || count <= 0 || subscriberBadgeImageUrlsByMonths.isEmpty()) {
+        return null
+    }
+
+    return subscriberBadgeImageUrlsByMonths.entries
+        .filter { (months, _) -> months <= count }
+        .maxByOrNull { (months, _) -> months }
+        ?.value
+        ?: subscriberBadgeImageUrlsByMonths.minByOrNull { (months, _) -> months }?.value
+}
+
 private fun readCachedFollowedChannels(bridgePaths: KickBridgePaths): Map<String, FollowedChannel> {
+    return readCachedChannelChats(bridgePaths)
+        .mapNotNull(::readCachedFollowedChannel)
+        .associateBy(FollowedChannel::channelSlug)
+}
+
+private fun readCachedChannelChats(
+    bridgePaths: KickBridgePaths,
+    channelSlug: String? = null,
+): List<ChannelChat> {
+    val normalizedChannelSlug = channelSlug?.trim()?.lowercase()
     val cacheFiles = buildList {
         if (bridgePaths.chatOutputFile.exists()) {
             add(bridgePaths.chatOutputFile)
@@ -545,16 +759,22 @@ private fun readCachedFollowedChannels(bridgePaths: KickBridgePaths): Map<String
     }
 
     if (cacheFiles.isEmpty()) {
-        return emptyMap()
+        return emptyList()
     }
 
-    return cacheFiles.mapNotNull(::readCachedFollowedChannel)
-        .associateBy(FollowedChannel::channelSlug)
+    return cacheFiles.mapNotNull { path ->
+        try {
+            bridgeCacheJson.decodeFromString<ChannelChat>(path.readText())
+        } catch (_: Exception) {
+            null
+        }
+    }.filter { cachedChat ->
+        normalizedChannelSlug == null || cachedChat.channelSlug.trim().lowercase() == normalizedChannelSlug
+    }
 }
 
-private fun readCachedFollowedChannel(path: java.nio.file.Path): FollowedChannel? {
+private fun readCachedFollowedChannel(chat: ChannelChat): FollowedChannel? {
     return try {
-        val chat = bridgeCacheJson.decodeFromString<ChannelChat>(path.readText())
         val normalizedSlug = chat.channelSlug.trim().lowercase()
         if (normalizedSlug.isBlank()) {
             null
@@ -569,10 +789,170 @@ private fun readCachedFollowedChannel(path: java.nio.file.Path): FollowedChannel
                 broadcasterUserId = chat.channelUserId,
                 channelId = chat.channelId,
                 chatroomId = chat.chatroomId,
+                subscriberBadgeImageUrlsByMonths = chat.subscriberBadgeImageUrlsByMonths,
             )
         }
     } catch (_: Exception) {
         null
+    }
+}
+
+private fun buildCachedSenderBadgesIndex(cachedChats: List<ChannelChat>): Map<String, List<com.chatterbro.domain.model.ChannelChatBadge>> {
+    val cachedSenderBadgesByKey = linkedMapOf<String, List<com.chatterbro.domain.model.ChannelChatBadge>>()
+    val cachedSenderBadgeScores = mutableMapOf<String, Int>()
+
+    cachedChats.asSequence()
+        .flatMap { chat -> sequenceOf(*chat.messages.toTypedArray(), *listOfNotNull(chat.pinnedMessage).toTypedArray()) }
+        .forEach { message ->
+            if (message.sender.badges.isEmpty()) {
+                return@forEach
+            }
+
+            val senderKey = getSenderBadgeCacheKey(message.sender)
+            val score = scoreSenderBadges(message.sender.badges)
+            if (score < (cachedSenderBadgeScores[senderKey] ?: -1)) {
+                return@forEach
+            }
+
+            cachedSenderBadgesByKey[senderKey] = message.sender.badges
+            cachedSenderBadgeScores[senderKey] = score
+        }
+
+    return cachedSenderBadgesByKey
+}
+
+private fun hydrateBadgesWithCachedSenderBadges(
+    sender: com.chatterbro.domain.model.ChannelChatSender,
+    badges: List<com.chatterbro.domain.model.ChannelChatBadge>,
+    cachedSenderBadgesByKey: Map<String, List<com.chatterbro.domain.model.ChannelChatBadge>>,
+): List<com.chatterbro.domain.model.ChannelChatBadge> {
+    if (badges.isEmpty() || badges.none { it.imageUrl.isNullOrBlank() }) {
+        return badges
+    }
+
+    val cachedBadges = cachedSenderBadgesByKey[getSenderBadgeCacheKey(sender)].orEmpty()
+    if (cachedBadges.isEmpty()) {
+        return badges
+    }
+
+    var changed = false
+    val matchedCachedBadgeIndexes = mutableSetOf<Int>()
+    val nextBadges = badges.mapIndexed { badgeIndex, badge ->
+        if (!badge.imageUrl.isNullOrBlank()) {
+            return@mapIndexed badge
+        }
+
+        val cachedBadgeIndex = findMatchingCachedBadgeIndex(cachedBadges, badge, badgeIndex, matchedCachedBadgeIndexes)
+        if (cachedBadgeIndex < 0) {
+            return@mapIndexed badge
+        }
+
+        matchedCachedBadgeIndexes += cachedBadgeIndex
+        val cachedBadge = cachedBadges[cachedBadgeIndex]
+        if (cachedBadge.imageUrl.isNullOrBlank()) {
+            return@mapIndexed badge
+        }
+
+        changed = true
+        badge.copy(imageUrl = cachedBadge.imageUrl)
+    }
+
+    return if (changed) nextBadges else badges
+}
+
+private fun getSenderBadgeCacheKey(sender: com.chatterbro.domain.model.ChannelChatSender): String {
+    val normalizedSlug = sender.slug.trim().lowercase()
+    if (normalizedSlug.isNotBlank()) {
+        return "slug:$normalizedSlug"
+    }
+
+    if (sender.id != null) {
+        return "id:${sender.id}"
+    }
+
+    return "username:${sender.username.trim().lowercase()}"
+}
+
+private fun scoreSenderBadges(badges: List<com.chatterbro.domain.model.ChannelChatBadge>): Int {
+    return badges.mapIndexed { index, badge ->
+        (if (!badge.imageUrl.isNullOrBlank()) 100 else 0) +
+            (if (!isOpaqueBadgeValue(badge.type)) 10 else 0) +
+            (if (!isOpaqueBadgeValue(badge.text)) 5 else 0) +
+            maxOf(0, badges.size - index)
+    }.sum()
+}
+
+private fun isOpaqueBadgeValue(value: String): Boolean {
+    val normalizedValue = value.trim().lowercase()
+    return normalizedValue.isBlank() || normalizedValue.startsWith("size-[") || normalizedValue.contains("calc(")
+}
+
+private fun isSubscriberBadgeImageUrl(imageUrl: String?): Boolean {
+    return imageUrl?.contains("/channel_subscriber_badges/", ignoreCase = true) == true
+}
+
+private fun getBadgeTypeKey(badge: com.chatterbro.domain.model.ChannelChatBadge): String {
+    return badge.type.trim().lowercase()
+}
+
+private fun getBadgeTextKey(badge: com.chatterbro.domain.model.ChannelChatBadge): String {
+    return badge.text.trim().lowercase()
+}
+
+private fun getBadgeVariantKey(badge: com.chatterbro.domain.model.ChannelChatBadge): String {
+    return "${getBadgeTypeKey(badge)}:${badge.count ?: "none"}"
+}
+
+private fun findMatchingCachedBadgeIndex(
+    cachedBadges: List<com.chatterbro.domain.model.ChannelChatBadge>,
+    badge: com.chatterbro.domain.model.ChannelChatBadge,
+    fallbackIndex: Int,
+    matchedCachedBadgeIndexes: Set<Int>,
+): Int {
+    val availableCachedBadgeEntries = cachedBadges.withIndex()
+        .filter { (cachedBadgeIndex, _) -> cachedBadgeIndex !in matchedCachedBadgeIndexes }
+
+    val badgeVariantKey = getBadgeVariantKey(badge)
+    val exactVariantIndex = availableCachedBadgeEntries.firstOrNull { (_, cachedBadge) ->
+        getBadgeVariantKey(cachedBadge) == badgeVariantKey
+    }?.index ?: -1
+    if (exactVariantIndex >= 0) {
+        return exactVariantIndex
+    }
+
+    val badgeTypeKey = getBadgeTypeKey(badge)
+    if (!isOpaqueBadgeValue(badge.type)) {
+        if (badgeTypeKey == "subscriber") {
+            val subscriberImageIndex = availableCachedBadgeEntries.firstOrNull { (_, cachedBadge) ->
+                isSubscriberBadgeImageUrl(cachedBadge.imageUrl)
+            }?.index ?: -1
+            if (subscriberImageIndex >= 0) {
+                return subscriberImageIndex
+            }
+        }
+
+        val typeIndex = availableCachedBadgeEntries.firstOrNull { (_, cachedBadge) ->
+            getBadgeTypeKey(cachedBadge) == badgeTypeKey
+        }?.index ?: -1
+        if (typeIndex >= 0) {
+            return typeIndex
+        }
+    }
+
+    if (!isOpaqueBadgeValue(badge.text)) {
+        val badgeTextKey = getBadgeTextKey(badge)
+        val textIndex = availableCachedBadgeEntries.firstOrNull { (_, cachedBadge) ->
+            getBadgeTextKey(cachedBadge) == badgeTextKey
+        }?.index ?: -1
+        if (textIndex >= 0) {
+            return textIndex
+        }
+    }
+
+    return if (fallbackIndex in cachedBadges.indices && fallbackIndex !in matchedCachedBadgeIndexes) {
+        fallbackIndex
+    } else {
+        -1
     }
 }
 
@@ -594,5 +974,10 @@ private fun mergeFollowedChannel(
         streamTitle = baseChannel.streamTitle ?: enrichedChannel.streamTitle,
         categoryName = baseChannel.categoryName ?: enrichedChannel.categoryName,
         tags = if (baseChannel.tags.isNotEmpty()) baseChannel.tags else enrichedChannel.tags,
+        subscriberBadgeImageUrlsByMonths = if (baseChannel.subscriberBadgeImageUrlsByMonths.isNotEmpty()) {
+            baseChannel.subscriberBadgeImageUrlsByMonths
+        } else {
+            enrichedChannel.subscriberBadgeImageUrlsByMonths
+        },
     )
 }
