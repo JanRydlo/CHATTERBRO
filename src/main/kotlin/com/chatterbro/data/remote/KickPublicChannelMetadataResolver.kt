@@ -15,6 +15,7 @@ data class KickPublicChannelMetadata(
     val chatroomId: Long? = null,
     val broadcasterUserId: Long? = null,
     val avatarUrl: String? = null,
+    val subscriberBadgeImageUrlsByMonths: Map<Int, String> = emptyMap(),
     val channelUrl: String = "https://kick.com/$channelSlug",
 )
 
@@ -95,6 +96,7 @@ class KickPublicChannelMetadataResolver(
                     else -> null
                 }
             }
+        val subscriberBadgeImageUrlsByMonths = extractSubscriberBadgeImageUrlsByMonths(metadataSegment)
 
         return KickPublicChannelMetadata(
             channelSlug = normalizedChannelSlug,
@@ -104,6 +106,7 @@ class KickPublicChannelMetadataResolver(
             chatroomId = chatroomId,
             broadcasterUserId = broadcasterUserId,
             avatarUrl = avatarUrl,
+            subscriberBadgeImageUrlsByMonths = subscriberBadgeImageUrlsByMonths,
         )
     }
 
@@ -216,6 +219,28 @@ class KickPublicChannelMetadataResolver(
             ?.groupValues
             ?.getOrNull(1)
             ?.takeIf(String::isNotBlank)
+    }
+
+    private fun extractSubscriberBadgeImageUrlsByMonths(value: String): Map<Int, String> {
+        if (!value.contains("\"subscriber_badges\":")) {
+            return emptyMap()
+        }
+
+        val subscriberBadgeSection = findFirstGroup(
+            value,
+            Regex("\"subscriber_badges\":\\[(.*?)]", setOf(RegexOption.DOT_MATCHES_ALL)),
+        ) ?: return emptyMap()
+
+        return Regex(
+            "\"months\":(\\d+),\"badge_image\":\\{[^{}]*\"src\":\"([^\"]+)\"",
+            setOf(RegexOption.DOT_MATCHES_ALL),
+        ).findAll(subscriberBadgeSection)
+            .mapNotNull { matchResult ->
+                val months = matchResult.groupValues.getOrNull(1)?.toIntOrNull() ?: return@mapNotNull null
+                val imageUrl = matchResult.groupValues.getOrNull(2)?.takeIf(String::isNotBlank) ?: return@mapNotNull null
+                months to imageUrl
+            }
+            .toMap()
     }
 
     private fun extractUserIdFromAvatarUrl(avatarUrl: String): Long? {

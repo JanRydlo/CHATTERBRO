@@ -55,4 +55,30 @@ class KickPublicChannelMetadataResolverTest {
         assertEquals(11214657, metadata.broadcasterUserId)
         assertEquals(true, metadata.isLive)
     }
+
+    @Test
+    fun `parseChannelMetadata extracts subscriber badge image urls`() {
+        val resolver = KickPublicChannelMetadataResolver(createTempDirectory("kick-public-metadata-subscriber-badges-test"))
+        val html = """
+            <html>
+            <body>
+            <h1 id="channel-username">opat04</h1>
+            <script type="application/json">
+            {"slug":"opat04","id":10455248,"chatroom":{"id":10297694},"subscriber_badges":[{"id":549190,"channel_id":10455248,"months":1,"badge_image":{"srcset":"","src":"https://files.kick.com/channel_subscriber_badges/549190/original"}},{"id":549191,"channel_id":10455248,"months":3,"badge_image":{"srcset":"","src":"https://files.kick.com/channel_subscriber_badges/549191/original"}}]}
+            </script>
+            </body>
+            </html>
+        """.trimIndent()
+
+        val metadata = resolver.parseChannelMetadata(html, "opat04")
+
+        assertNotNull(metadata)
+        assertEquals(
+            mapOf(
+                1 to "https://files.kick.com/channel_subscriber_badges/549190/original",
+                3 to "https://files.kick.com/channel_subscriber_badges/549191/original",
+            ),
+            metadata.subscriberBadgeImageUrlsByMonths,
+        )
+    }
 }

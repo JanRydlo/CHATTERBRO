@@ -17,4 +17,5 @@ data class FollowedChannel(
     val streamTitle: String? = null,
     val categoryName: String? = null,
     val tags: List<String> = emptyList(),
+    val subscriberBadgeImageUrlsByMonths: Map<Int, String> = emptyMap(),
 )

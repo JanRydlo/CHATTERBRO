@@ -1192,20 +1192,85 @@ async function fetchChannelChatFromApi(page, chatRequest) {
 
       const kickPlaceholderPattern = /\[emote:\d+:[^\]]+\]/;
 
+      const normalizeBadgeImageUrlCandidate = (value) => {
+        if (typeof value !== 'string') {
+          return null;
+        }
+
+        const trimmedValue = value.trim();
+        if (!trimmedValue) {
+          return null;
+        }
+
+        if (!trimmedValue.startsWith('data:') && (trimmedValue.includes(',') || /\s\d+[wx](?:\s|$)/i.test(trimmedValue))) {
+          const firstSrcsetEntry = trimmedValue
+            .split(',')
+            .map((entry) => entry.trim())
+            .find((entry) => entry.length > 0);
+
+          if (!firstSrcsetEntry) {
+            return null;
+          }
+
+          const [firstUrl] = firstSrcsetEntry.split(/\s+/);
+          return firstUrl || null;
+        }
+
+        return trimmedValue;
+      };
+
+      const resolveNestedBadgeImageUrl = (value) => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) {
+          return null;
+        }
+
+        const candidates = [
+          value?.url,
+          value?.src,
+          value?.srcUrl,
+          value?.src_url,
+          value?.original,
+          value?.originalUrl,
+          value?.original_url,
+          value?.fullsize,
+          value?.fullSize,
+          value?.full_size,
+          value?.srcset,
+          value?.srcSet
+        ];
+
+        const match = candidates
+          .map((candidate) => normalizeBadgeImageUrlCandidate(candidate))
+          .find((candidate) => typeof candidate === 'string' && candidate.length > 0);
+
+        return match || null;
+      };
+
       const resolveBadgeImageUrl = (badge) => {
         const candidates = [
           badge?.image,
+          resolveNestedBadgeImageUrl(badge?.image),
           badge?.image_url,
+          badge?.badgeImage,
+          badge?.badgeImageUrl,
+          badge?.badge_image,
+          badge?.badge_image_url,
+          resolveNestedBadgeImageUrl(badge?.badgeImage),
+          resolveNestedBadgeImageUrl(badge?.badge_image),
           badge?.icon,
+          resolveNestedBadgeImageUrl(badge?.icon),
           badge?.icon_url,
           badge?.src,
+          badge?.srcset,
           badge?.url,
-          badge?.badge_image,
           badge?.small_icon_url,
-          badge?.thumbnail
+          badge?.thumbnail,
+          resolveNestedBadgeImageUrl(badge?.thumbnail)
         ];
 
-        const match = candidates.find((candidate) => typeof candidate === 'string' && candidate.length > 0);
+        const match = candidates
+          .map((candidate) => normalizeBadgeImageUrlCandidate(candidate))
+          .find((candidate) => typeof candidate === 'string' && candidate.length > 0);
         return match || null;
       };
 
@@ -1214,7 +1279,7 @@ async function fetchChannelChatFromApi(page, chatRequest) {
           const typeMatch = badge.match(/type=([^;}]*)/i);
           const textMatch = badge.match(/text=([^;}]*)/i);
           const countMatch = badge.match(/count=([^;}]*)/i);
-          const imageMatch = badge.match(/(?:imageUrl|image_url|image|iconUrl|icon|icon_url|src|url|badgeImageUrl|badge_image_url|badgeUrl|badge_url)=([^;}]*)/i);
+          const imageMatch = badge.match(/(?:imageUrl|image_url|image|iconUrl|icon|icon_url|src|srcset|url|badgeImageUrl|badge_image_url|badgeUrl|badge_url|original|originalUrl|original_url|fullsize|fullSize|full_size)=([^;}]*)/i);
           const parsedCount = Number(countMatch?.[1]);
           const type = typeMatch?.[1]?.trim() || '';
           const text = textMatch?.[1]?.trim() || type;
@@ -1227,7 +1292,7 @@ async function fetchChannelChatFromApi(page, chatRequest) {
             type,
             text,
             count: Number.isFinite(parsedCount) ? parsedCount : null,
-            imageUrl: imageMatch?.[1]?.trim() || null
+            imageUrl: normalizeBadgeImageUrlCandidate(imageMatch?.[1] ?? null)
           };
         }
 

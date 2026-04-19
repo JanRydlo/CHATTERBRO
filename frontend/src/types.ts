@@ -36,6 +36,7 @@ export interface FollowedChannel {
   streamTitle: string | null;
   categoryName: string | null;
   tags: string[];
+  subscriberBadgeImageUrlsByMonths?: Record<string, string> | null;
 }
 
 export interface PostedChatMessage {
@@ -79,6 +80,7 @@ export interface ChannelChat {
   messages: ChannelChatMessage[];
   pinnedMessage: ChannelChatMessage | null;
   updatedAt: string;
+  subscriberBadgeImageUrlsByMonths?: Record<string, string> | null;
 }
 
 export interface ChannelChatEmote {

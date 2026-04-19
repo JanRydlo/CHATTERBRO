@@ -395,8 +395,102 @@ class KickBridgeRunner(
         runCatching {
             paths.chatCacheDirectory.createDirectories()
             val chatCacheFile = paths.chatCacheDirectory.resolve("$normalizedSlug.json")
-            chatCacheFile.writeText(json.encodeToString(ChannelChat.serializer(), chat))
+            val mergedChat = if (chatCacheFile.exists()) {
+                runCatching {
+                    mergeCachedChannelChat(
+                        json.decodeFromString(ChannelChat.serializer(), chatCacheFile.readText()),
+                        chat,
+                    )
+                }.getOrDefault(chat)
+            } else {
+                chat
+            }
+            chatCacheFile.writeText(json.encodeToString(ChannelChat.serializer(), mergedChat))
         }
+    }
+
+    private fun mergeCachedChannelChat(existingChat: ChannelChat, nextChat: ChannelChat): ChannelChat {
+        if (!existingChat.channelSlug.equals(nextChat.channelSlug, ignoreCase = true)) {
+            return nextChat
+        }
+
+        val mergedMessagesById = linkedMapOf<String, com.chatterbro.domain.model.ChannelChatMessage>()
+        for (message in existingChat.messages + nextChat.messages) {
+            val existingMessage = mergedMessagesById[message.id]
+            mergedMessagesById[message.id] = if (existingMessage == null) {
+                message
+            } else {
+                preferRicherCachedMessage(existingMessage, message)
+            }
+        }
+
+        val mergedMessages = mergedMessagesById.values.toList().takeLast(400)
+        val mergedPinnedMessage = when {
+            existingChat.pinnedMessage == null -> nextChat.pinnedMessage
+            nextChat.pinnedMessage == null -> existingChat.pinnedMessage
+            else -> preferRicherCachedMessage(existingChat.pinnedMessage, nextChat.pinnedMessage)
+        }
+
+        return nextChat.copy(
+            channelId = nextChat.channelId ?: existingChat.channelId,
+            channelUserId = nextChat.channelUserId ?: existingChat.channelUserId,
+            chatroomId = nextChat.chatroomId ?: existingChat.chatroomId,
+            displayName = nextChat.displayName.ifBlank { existingChat.displayName },
+            channelUrl = nextChat.channelUrl.ifBlank { existingChat.channelUrl },
+            avatarUrl = nextChat.avatarUrl ?: existingChat.avatarUrl,
+            cursor = nextChat.cursor ?: existingChat.cursor,
+            messages = mergedMessages,
+            pinnedMessage = mergedPinnedMessage,
+            subscriberBadgeImageUrlsByMonths = if (nextChat.subscriberBadgeImageUrlsByMonths.isNotEmpty()) {
+                nextChat.subscriberBadgeImageUrlsByMonths
+            } else {
+                existingChat.subscriberBadgeImageUrlsByMonths
+            },
+            updatedAt = nextChat.updatedAt.ifBlank { existingChat.updatedAt },
+        )
+    }
+
+    private fun preferRicherCachedMessage(
+        existingMessage: com.chatterbro.domain.model.ChannelChatMessage,
+        nextMessage: com.chatterbro.domain.model.ChannelChatMessage,
+    ): com.chatterbro.domain.model.ChannelChatMessage {
+        val preferredMessage = if (scoreCachedBadges(nextMessage.sender.badges) >= scoreCachedBadges(existingMessage.sender.badges)) {
+            nextMessage
+        } else {
+            existingMessage
+        }
+        val fallbackMessage = if (preferredMessage === nextMessage) existingMessage else nextMessage
+
+        return preferredMessage.copy(
+            content = if (preferredMessage.content.length >= fallbackMessage.content.length) preferredMessage.content else fallbackMessage.content,
+            createdAt = preferredMessage.createdAt ?: fallbackMessage.createdAt,
+            threadParentId = preferredMessage.threadParentId ?: fallbackMessage.threadParentId,
+            sender = preferredMessage.sender.copy(
+                id = preferredMessage.sender.id ?: fallbackMessage.sender.id,
+                username = preferredMessage.sender.username.ifBlank { fallbackMessage.sender.username },
+                slug = preferredMessage.sender.slug.ifBlank { fallbackMessage.sender.slug },
+                color = preferredMessage.sender.color ?: fallbackMessage.sender.color,
+                badges = if (scoreCachedBadges(preferredMessage.sender.badges) >= scoreCachedBadges(fallbackMessage.sender.badges)) {
+                    preferredMessage.sender.badges
+                } else {
+                    fallbackMessage.sender.badges
+                },
+            ),
+        )
+    }
+
+    private fun scoreCachedBadges(badges: List<com.chatterbro.domain.model.ChannelChatBadge>): Int {
+        return badges.mapIndexed { index, badge ->
+            (if (!badge.imageUrl.isNullOrBlank()) 100 else 0) +
+                (if (!isOpaqueCachedBadgeValue(badge.type)) 10 else 0) +
+                (if (!isOpaqueCachedBadgeValue(badge.text)) 5 else 0) +
+                maxOf(0, badges.size - index)
+        }.sum()
+    }
+
+    private fun isOpaqueCachedBadgeValue(value: String): Boolean {
+        val normalizedValue = value.trim().lowercase()
+        return normalizedValue.isBlank() || normalizedValue.startsWith("size-[") || normalizedValue.contains("calc(")
     }
 
     private fun resolveServiceStartupFailureMessage(fallback: String): String {
