@@ -20,10 +20,13 @@ const REMOTE_DEBUGGING_STARTUP_TIMEOUT_MS = 30_000;
 const REMOTE_DEBUGGING_POLL_INTERVAL_MS = 500;
 const LOGIN_CAPTURE_TIMEOUT_MS = 10 * 60_000;
 const LOGIN_CAPTURE_POLL_INTERVAL_MS = 1_000;
+const BRIDGE_PAGE_WAIT_TIMEOUT_MS = 10_000;
+const BROWSER_FETCH_TIMEOUT_MS = 10_000;
 const BACKGROUND_FETCH_WARMUP_MS = 1_500;
 const CHANNEL_CHAT_DOM_WARMUP_MS = 2_500;
 const MAX_FOLLOWED_CURSOR_PAGES = 25;
-const BROWSER_RECONNECT_REQUIRED_MESSAGE = 'Refresh the Kick website session to restore website-only reads.';
+const CHANNEL_HTML_FETCH_TIMEOUT_SECONDS = 20;
+const BROWSER_RECONNECT_REQUIRED_MESSAGE = 'Reconnect Kick browser and keep that window open to restore website-only reads.';
 
 const SYSTEM_BROWSER_CANDIDATES = [
   {
@@ -137,7 +140,8 @@ async function loginFlow(cliArgs) {
       preferredBrowserPath: existingMetadata?.browserPath || process.env.KICK_BROWSER_PATH,
       profileDir: resolvedProfileDir,
       startUrl: KICK_HOME_URL,
-      startMinimized: false
+      startMinimized: false,
+      detachProcess: true
     });
   }
 
@@ -164,10 +168,7 @@ async function loginFlow(cliArgs) {
   );
 
   try {
-    await page.goto(KICK_HOME_URL, {
-      waitUntil: 'domcontentloaded',
-      timeout: 60_000
-    }).catch(() => undefined);
+    await ensureKickHomePage(page).catch(() => undefined);
 
     const session = await waitForAuthenticatedSession({
       context,
@@ -179,11 +180,15 @@ async function loginFlow(cliArgs) {
     await safeUpdateStatus(
       statusFile,
       'READY',
-      `Connected as ${session.profile.username}.`,
+      `Captured Kick browser session for ${session.profile.username}. Keep that browser window open, then load followings or chat to verify live sync.`,
       session
     );
   } finally {
-    await closeBrowserBridge(page, browser, browserProcess, loginBridge.ownsBrowserProcess);
+    if (loginBridge.ownsBrowserProcess) {
+      await disconnectBrowserBridge(browser);
+    } else {
+      await closeBrowserBridge(page, browser, browserProcess, loginBridge.ownsBrowserProcess, loginBridge.ownsPage);
+    }
   }
 }
 
@@ -220,7 +225,7 @@ async function fetchLiveFollowing(cliArgs) {
       await context.addCookies(storedCookies).catch(() => undefined);
     }
 
-    const channels = await fetchFollowedChannelsFromBrowser(page, storedSession.token);
+    const channels = await fetchFollowedChannelsFromBrowser(page);
 
     await writeJson(outputFile, channels);
     const refreshedCookies = await context.cookies(KICK_HOME_URL).catch(() => []);
@@ -248,8 +253,50 @@ async function fetchLiveFollowing(cliArgs) {
 
     throw error;
   } finally {
-    await closeBrowserBridge(page, browser, browserProcess, ownsBrowserProcess);
+    await closeBrowserBridge(page, browser, browserProcess, ownsBrowserProcess, session.ownsPage);
   }
+}
+
+function parseOptionalNumber(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const normalized = value.trim();
+  if (!normalized) {
+    return null;
+  }
+
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseOptionalBoolean(value) {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value !== 'string') {
+    return false;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes';
+}
+
+function normalizeChannelChatRequest({ channelSlug, channelId = null, channelUserId = null, displayName = null, avatarUrl = null, fast = false }) {
+  return {
+    channelSlug: String(channelSlug || '').trim().toLowerCase(),
+    channelId: parseOptionalNumber(channelId),
+    channelUserId: parseOptionalNumber(channelUserId),
+    displayName: typeof displayName === 'string' && displayName.trim() ? displayName.trim() : null,
+    avatarUrl: typeof avatarUrl === 'string' && avatarUrl.trim() ? avatarUrl.trim() : null,
+    fast: parseOptionalBoolean(fast)
+  };
 }
 
 async function fetchChannelChat(cliArgs) {
@@ -259,9 +306,16 @@ async function fetchChannelChat(cliArgs) {
   const metaFile = requireArg(cliArgs, 'meta-file');
   const outputFile = requireArg(cliArgs, 'output-file');
   const profileDir = requireArg(cliArgs, 'profile-dir');
-  const channelSlug = requireArg(cliArgs, 'channel-slug').trim().toLowerCase();
+  const chatRequest = normalizeChannelChatRequest({
+    channelSlug: requireArg(cliArgs, 'channel-slug'),
+    channelId: cliArgs['channel-id'],
+    channelUserId: cliArgs['channel-user-id'],
+    displayName: cliArgs['display-name'],
+    avatarUrl: cliArgs['avatar-url'],
+    fast: cliArgs.fast
+  });
 
-  if (!channelSlug) {
+  if (!chatRequest.channelSlug) {
     throw new Error('Kick channel slug is required.');
   }
 
@@ -290,7 +344,7 @@ async function fetchChannelChat(cliArgs) {
       await context.addCookies(storedCookies).catch(() => undefined);
     }
 
-    const chat = await fetchChannelChatFromBrowser(page, channelSlug, storedSession.token);
+    const chat = await fetchChannelChatFromBrowser(page, chatRequest);
     await writeJson(outputFile, chat);
 
     const refreshedCookies = await context.cookies(KICK_HOME_URL).catch(() => []);
@@ -306,7 +360,7 @@ async function fetchChannelChat(cliArgs) {
 
     throw error;
   } finally {
-    await closeBrowserBridge(page, browser, browserProcess, ownsBrowserProcess);
+    await closeBrowserBridge(page, browser, browserProcess, ownsBrowserProcess, session.ownsPage);
   }
 }
 
@@ -368,10 +422,10 @@ async function handleServiceRequest(line, state) {
       }
 
       const session = await openServiceBridge(state, storedSession);
-      const { browser, context, page, browserProcess, ownsBrowserProcess } = session;
+      const { browser, context, page, browserInfo, browserProcess, ownsBrowserProcess } = session;
 
       try {
-        const channels = await fetchFollowedChannelsFromBrowser(page, storedSession.token);
+        const channels = await fetchFollowedChannelsFromBrowser(page);
         await persistServiceCookies(context, state.cookieFile);
         await safeUpdateStatus(
           state.statusFile,
@@ -387,15 +441,34 @@ async function handleServiceRequest(line, state) {
           ok: true,
           result: channels
         });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Kick bridge failed to load channels.';
+
+        if (message.toLowerCase().includes('sign in again')) {
+          await invalidateSavedSession(state.sessionFile, state.cookieFile);
+          await safeUpdateStatus(state.statusFile, 'IDLE', message, null);
+        } else {
+          await safeUpdateStatus(state.statusFile, 'ERROR', `${browserInfo.label} failed while loading followings: ${message}`, storedSession);
+        }
+
+        throw error;
       } finally {
-        await closeBrowserBridge(page, browser, browserProcess, ownsBrowserProcess);
+        await closeBrowserBridge(page, browser, browserProcess, ownsBrowserProcess, session.ownsPage);
       }
       return;
     }
 
     if (request?.command === 'fetch-channel-chat') {
-      const channelSlug = typeof request.channelSlug === 'string' ? request.channelSlug.trim().toLowerCase() : '';
-      if (!channelSlug) {
+      const chatRequest = normalizeChannelChatRequest({
+        channelSlug: request.channelSlug,
+        channelId: request.channelId,
+        channelUserId: request.channelUserId,
+        displayName: request.displayName,
+        avatarUrl: request.avatarUrl,
+        fast: request.fast
+      });
+
+      if (!chatRequest.channelSlug) {
         throw new Error('Kick channel slug is required.');
       }
 
@@ -407,17 +480,17 @@ async function handleServiceRequest(line, state) {
       }
 
       const session = await openServiceBridge(state, storedSession);
-      const { browser, context, page, browserProcess, ownsBrowserProcess } = session;
+      const { browser, context, page, browserInfo, browserProcess, ownsBrowserProcess } = session;
 
       try {
-        const chat = await fetchChannelChatFromBrowser(page, channelSlug, storedSession.token);
+        const chat = await fetchChannelChatFromBrowser(page, chatRequest);
         await persistServiceCookies(context, state.cookieFile);
         await safeUpdateStatus(
           state.statusFile,
           'READY',
           chat.messages.length === 0
-            ? `Connected as ${storedSession.profile.username}, but Kick returned no recent chat messages for ${channelSlug}.`
-            : `Loaded ${chat.messages.length} recent chat messages for ${channelSlug}.`,
+            ? `Connected as ${storedSession.profile.username}, but Kick returned no recent chat messages for ${chatRequest.channelSlug}.`
+            : `Loaded ${chat.messages.length} recent chat messages for ${chatRequest.channelSlug}.`,
           storedSession
         );
 
@@ -426,8 +499,19 @@ async function handleServiceRequest(line, state) {
           ok: true,
           result: chat
         });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Kick bridge failed to load channel chat.';
+
+        if (message.toLowerCase().includes('sign in again')) {
+          await invalidateSavedSession(state.sessionFile, state.cookieFile);
+          await safeUpdateStatus(state.statusFile, 'IDLE', message, null);
+        } else {
+          await safeUpdateStatus(state.statusFile, 'ERROR', `${browserInfo.label} failed while loading chat for ${chatRequest.channelSlug}: ${message}`, storedSession);
+        }
+
+        throw error;
       } finally {
-        await closeBrowserBridge(page, browser, browserProcess, ownsBrowserProcess);
+        await closeBrowserBridge(page, browser, browserProcess, ownsBrowserProcess, session.ownsPage);
       }
       return;
     }
@@ -473,9 +557,24 @@ function writeProtocolLine(payload) {
 
 async function waitForAuthenticatedSession({ context, page, cookieFile, sessionFile }) {
   const deadline = Date.now() + LOGIN_CAPTURE_TIMEOUT_MS;
+  let activePage = page;
 
   while (Date.now() < deadline) {
-    const session = await captureKickSession(context, page);
+    activePage = await ensureActiveBridgePage(context, activePage);
+
+    let session = null;
+    try {
+      session = await captureKickSession(context, activePage);
+    } catch (error) {
+      if (isClosedTargetError(error)) {
+        activePage = null;
+        await delay(LOGIN_CAPTURE_POLL_INTERVAL_MS);
+        continue;
+      }
+
+      throw error;
+    }
+
     if (session) {
       await writeJson(sessionFile, session);
       const refreshedCookies = await context.cookies(KICK_HOME_URL).catch(() => []);
@@ -485,7 +584,7 @@ async function waitForAuthenticatedSession({ context, page, cookieFile, sessionF
       return session;
     }
 
-    await page.waitForTimeout(LOGIN_CAPTURE_POLL_INTERVAL_MS);
+    await delay(LOGIN_CAPTURE_POLL_INTERVAL_MS);
   }
 
   throw new Error('Kick login timed out before a session token was captured.');
@@ -500,7 +599,7 @@ async function captureKickSession(context, page) {
 
   const tokenValue = decodeURIComponent(sessionCookie.value);
   const token = `Bearer ${tokenValue}`;
-  const profile = await extractAuthenticatedProfile(page, token);
+  const profile = await extractAuthenticatedProfile(page);
   if (!profile) {
     return null;
   }
@@ -513,8 +612,22 @@ async function captureKickSession(context, page) {
   };
 }
 
-async function extractAuthenticatedProfile(page, authToken) {
-  return page.evaluate(async ({ token, kickApiBaseUrl }) => {
+async function extractAuthenticatedProfile(page) {
+  return page.evaluate(async ({ kickApiBaseUrl, fetchTimeoutMs }) => {
+    const fetchWithTimeout = async (input, init = {}) => {
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), fetchTimeoutMs);
+
+      try {
+        return await fetch(input, {
+          ...init,
+          signal: controller.signal
+        }).catch(() => null);
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
+    };
+
     const authenticatedKey = Object.keys(localStorage).find((key) => key.includes('"authStatus":"authenticated"') && key.includes('"username":"'));
     if (!authenticatedKey) {
       return null;
@@ -529,13 +642,13 @@ async function extractAuthenticatedProfile(page, authToken) {
       return null;
     }
 
-    const profileResponse = await fetch(`${kickApiBaseUrl}/api/v2/channels/${encodeURIComponent(username)}`, {
+    const profileResponse = await fetchWithTimeout(`${kickApiBaseUrl}/api/v2/channels/${encodeURIComponent(username)}`, {
+      cache: 'no-store',
+      credentials: 'include',
       headers: {
-        authorization: token,
-        'x-app-platform': 'web',
         accept: 'application/json'
       }
-    }).catch(() => null);
+    });
 
     if (!profileResponse || !profileResponse.ok) {
       return {
@@ -556,8 +669,8 @@ async function extractAuthenticatedProfile(page, authToken) {
       channelUrl: `https://kick.com/${slug}`
     };
   }, {
-    token: authToken,
-    kickApiBaseUrl: KICK_API_BASE_URL
+    kickApiBaseUrl: KICK_API_BASE_URL,
+    fetchTimeoutMs: BROWSER_FETCH_TIMEOUT_MS
   });
 }
 
@@ -569,23 +682,38 @@ function parseFollowedChannelsPayload(payloadText) {
   };
 }
 
-async function fetchFollowedChannelsFromBrowser(page, authToken) {
+async function fetchFollowedChannelsFromBrowser(page) {
   await ensureKickHomePage(page);
+  await dismissKickConsent(page);
 
-  const result = await page.evaluate(async ({ endpoint, token, maxPages }) => {
+  const result = await page.evaluate(async ({ endpoint, maxPages, fetchTimeoutMs }) => {
+    const fetchWithTimeout = async (input, init = {}) => {
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), fetchTimeoutMs);
+
+      try {
+        return await fetch(input, {
+          ...init,
+          signal: controller.signal
+        }).catch(() => null);
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
+    };
+
     const collectedChannels = [];
     const seenCursors = new Set();
     let nextCursor = null;
 
     for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
       const query = nextCursor === null ? '' : `?cursor=${encodeURIComponent(String(nextCursor))}`;
-      const response = await fetch(`${endpoint}${query}`, {
+      const response = await fetchWithTimeout(`${endpoint}${query}`, {
+        cache: 'no-store',
+        credentials: 'include',
         headers: {
-          authorization: token,
-          'x-app-platform': 'web',
           accept: 'application/json'
         }
-      }).catch(() => null);
+      });
 
       if (!response) {
         return {
@@ -634,13 +762,33 @@ async function fetchFollowedChannelsFromBrowser(page, authToken) {
     };
   }, {
     endpoint: FOLLOWED_CHANNELS_ENDPOINT,
-    token: authToken,
-    maxPages: MAX_FOLLOWED_CURSOR_PAGES
+    maxPages: MAX_FOLLOWED_CURSOR_PAGES,
+    fetchTimeoutMs: BROWSER_FETCH_TIMEOUT_MS
   });
 
   if (!result?.ok) {
-    if (result?.status === 401 || result?.status === 403) {
+    const securityPolicyBlocked =
+      result?.status === 403 &&
+      String(result?.bodySnippet || '').toLowerCase().includes('security policy');
+
+    if (result?.status === 401 || (result?.status === 403 && !securityPolicyBlocked)) {
       throw new Error('Kick rejected the saved session. Sign in again.');
+    }
+
+    if (securityPolicyBlocked || result?.status === 0) {
+      let fallbackChannels = [];
+
+      try {
+        fallbackChannels = await fetchFollowedChannelsFromDom(page);
+      } catch (error) {
+        if (error instanceof Error && error.message.toLowerCase().includes('sign in again')) {
+          throw error;
+        }
+      }
+
+      if (fallbackChannels.length > 0) {
+        return fallbackChannels;
+      }
     }
 
     throw new Error(result?.bodySnippet || 'Kick browser request failed while loading followings.');
@@ -649,129 +797,415 @@ async function fetchFollowedChannelsFromBrowser(page, authToken) {
   return dedupeChannels(normalizeFollowedChannels(result.channels));
 }
 
-async function fetchChannelChatFromBrowser(page, channelSlug, authToken) {
+async function fetchFollowedChannelsFromDom(page) {
+  const tryExtraction = async () => {
+    await dismissKickConsent(page);
+
+    const channels = await extractChannels(page, { requireFollowingContext: true }).catch(() => []);
+    if (channels.length > 0) {
+      return dedupeChannels(channels);
+    }
+
+    const inspection = await inspectKickPage(page);
+    if (looksUnauthenticated(inspection.bodySnippet)) {
+      throw new Error('Kick rejected the saved session. Sign in again.');
+    }
+
+    return [];
+  };
+
+  await ensureKickHomePage(page);
+
+  const homeChannels = await tryExtraction();
+  if (homeChannels.length > 0) {
+    return homeChannels;
+  }
+
+  const openedFollowingPage = await openKickFollowingPage(page);
+  if (!openedFollowingPage) {
+    return [];
+  }
+
+  return await tryExtraction();
+}
+
+function escapeRegex(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function decodeKickNextFlightData(value) {
+  if (!value.includes('self.__next_f.push')) {
+    return value;
+  }
+
+  const segments = Array.from(value.matchAll(/push\(\[\d+,"([\s\S]*?)"\]\)/g))
+    .map((match) => match[1]);
+
+  if (segments.length === 0) {
+    return value;
+  }
+
+  return segments
+    .map((segment) => {
+      try {
+        return JSON.parse(`"${segment}"`);
+      } catch {
+        return '';
+      }
+    })
+    .filter((segment) => segment.length > 0)
+    .join('\n');
+}
+
+function findFirstNumericMatch(value, pattern) {
+  const match = value.match(pattern);
+  if (!match) {
+    return null;
+  }
+
+  const parsedValue = Number(match[1]);
+  return Number.isFinite(parsedValue) ? parsedValue : null;
+}
+
+function findFirstStringMatch(value, pattern) {
+  const match = value.match(pattern);
+  if (!match) {
+    return null;
+  }
+
+  return typeof match[1] === 'string' && match[1].length > 0
+    ? match[1]
+    : typeof match[0] === 'string' && match[0].length > 0
+      ? match[0]
+      : null;
+}
+
+function decodeBasicHtmlEntities(value) {
+  return String(value || '')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .trim();
+}
+
+function selectChannelMetadataSegment(decodedHtml, channelSlug) {
+  const normalizedChannelSlug = String(channelSlug || '').trim().toLowerCase();
+  if (!normalizedChannelSlug || !decodedHtml) {
+    return decodedHtml;
+  }
+
+  const slugPattern = new RegExp(`"slug":"${escapeRegex(normalizedChannelSlug)}"`, 'gi');
+  let bestSegment = '';
+  let bestScore = -1;
+
+  for (const match of decodedHtml.matchAll(slugPattern)) {
+    const start = Math.max(0, (match.index ?? 0) - 3_000);
+    const end = Math.min(decodedHtml.length, (match.index ?? 0) + 12_000);
+    const candidate = decodedHtml.slice(start, end);
+    const score = (candidate.includes('"chatroom":{"id":') ? 100 : 0)
+      + (candidate.includes('"channel_id":') ? 60 : 0)
+      + (candidate.includes('"broadcaster_user_id":') ? 20 : 0)
+      + (candidate.includes('"profile_pic":"') ? 10 : 0)
+      + (candidate.includes('"is_live":true') ? 10 : 0);
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestSegment = candidate;
+    }
+  }
+
+  return bestSegment || decodedHtml;
+}
+
+function getSystemCurlCommands() {
+  return process.platform === 'win32'
+    ? ['curl.exe', 'curl']
+    : ['curl'];
+}
+
+async function runCommandCaptureStdout(command, args) {
+  await mkdir(path.join(process.cwd(), 'tmp'), { recursive: true }).catch(() => undefined);
+
+  return await new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true
+    });
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    const timeoutId = setTimeout(() => {
+      child.kill();
+      reject(new Error(`${command} timed out while fetching Kick channel HTML.`));
+    }, CHANNEL_HTML_FETCH_TIMEOUT_SECONDS * 1_000 + 2_000);
+
+    child.stdout.on('data', (chunk) => {
+      stdoutChunks.push(Buffer.from(chunk));
+    });
+
+    child.stderr.on('data', (chunk) => {
+      stderrChunks.push(Buffer.from(chunk));
+    });
+
+    child.once('error', (error) => {
+      clearTimeout(timeoutId);
+      reject(error);
+    });
+
+    child.once('close', (code) => {
+      clearTimeout(timeoutId);
+
+      if (code === 0) {
+        resolve(Buffer.concat(stdoutChunks).toString('utf8'));
+        return;
+      }
+
+      const stderr = Buffer.concat(stderrChunks).toString('utf8').trim();
+      reject(new Error(stderr || `${command} exited with code ${code}.`));
+    });
+  });
+}
+
+async function fetchKickChannelPageHtml(channelSlug) {
+  const targetUrl = `https://kick.com/${encodeURIComponent(channelSlug)}`;
+  let lastError = null;
+
+  for (const command of getSystemCurlCommands()) {
+    try {
+      const html = await runCommandCaptureStdout(command, [
+        '--max-time',
+        String(CHANNEL_HTML_FETCH_TIMEOUT_SECONDS),
+        '-L',
+        '-sS',
+        '--compressed',
+        '-H',
+        `User-Agent: ${DEFAULT_USER_AGENT}`,
+        '-H',
+        'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        '-H',
+        'Accept-Language: cs-CZ,cs;q=0.9,en;q=0.8',
+        targetUrl
+      ]);
+
+      if (typeof html === 'string' && html.trim().length > 0) {
+        return html;
+      }
+
+      throw new Error('Kick returned an empty HTML response.');
+    } catch (error) {
+      lastError = error;
+      if (error?.code !== 'ENOENT') {
+        break;
+      }
+    }
+  }
+
+  throw new Error(
+    lastError instanceof Error
+      ? lastError.message
+      : `Kick channel HTML fetch failed for ${channelSlug}.`
+  );
+}
+
+async function fetchChannelChatMetadataFromHtml(chatRequest) {
+  const html = await fetchKickChannelPageHtml(chatRequest.channelSlug);
+  const decodedHtml = decodeKickNextFlightData(html);
+  const metadataSegment = selectChannelMetadataSegment(decodedHtml, chatRequest.channelSlug);
+  const normalizedChannelSlug = chatRequest.channelSlug;
+  const slugIdPattern = new RegExp(`"id":(\\d+),"slug":"${escapeRegex(normalizedChannelSlug)}"`, 'i');
+
+  const channelId = findFirstNumericMatch(metadataSegment, slugIdPattern)
+    ?? findFirstNumericMatch(metadataSegment, /"channel_id":(\d+)/i);
+  const chatroomId = findFirstNumericMatch(metadataSegment, /"chatroom":\{"id":(\d+)\}/i)
+    ?? findFirstNumericMatch(metadataSegment, /"chatroom_id":(\d+)/i);
+
+  if (channelId === null && chatroomId === null) {
+    throw new Error(`Kick HTML fallback did not expose channel metadata for ${normalizedChannelSlug}.`);
+  }
+
+  const avatarUrl = findFirstStringMatch(metadataSegment, /"profile_pic":"([^"]+)"/i)
+    ?? findFirstStringMatch(html, /(https:\/\/files\.kick\.com\/images\/user\/\d+\/profile_image\/[^"'\s<]+)/i)
+    ?? chatRequest.avatarUrl
+    ?? null;
+  const avatarUserIdMatch = avatarUrl?.match(/\/images\/user\/(\d+)\//i) || null;
+  const channelUserId = findFirstNumericMatch(metadataSegment, /"broadcaster_user_id":(\d+)/i)
+    ?? findFirstNumericMatch(metadataSegment, /"user":\{"id":(\d+)/i)
+    ?? (avatarUserIdMatch ? Number(avatarUserIdMatch[1]) : null)
+    ?? chatRequest.channelUserId
+    ?? null;
+  const displayName = decodeBasicHtmlEntities(
+    findFirstStringMatch(html, /<h1 id="channel-username">([^<]+)</i)
+      ?? chatRequest.displayName
+      ?? normalizedChannelSlug
+  ) || normalizedChannelSlug;
+
+  return {
+    channelSlug: normalizedChannelSlug,
+    channelId,
+    channelUserId,
+    chatroomId,
+    displayName,
+    channelUrl: `https://kick.com/${normalizedChannelSlug}`,
+    avatarUrl,
+    cursor: null,
+    messages: [],
+    pinnedMessage: null,
+    updatedAt: new Date().toISOString()
+  };
+}
+
+async function fetchChannelChatFromBrowser(page, chatRequest) {
+  let metadataFallback = null;
+  let metadataFallbackError = null;
   let pageSnapshot = null;
   let pageSnapshotError = null;
+  let fastPathError = null;
 
   try {
-    pageSnapshot = await fetchChannelChatPageSnapshot(page, channelSlug);
+    metadataFallback = await fetchChannelChatMetadataFromHtml(chatRequest);
+  } catch (error) {
+    metadataFallbackError = error;
+  }
+
+  const resolvedChannelId = metadataFallback?.channelId ?? chatRequest.channelId;
+  const resolvedChannelUserId = metadataFallback?.channelUserId ?? chatRequest.channelUserId;
+  const resolvedDisplayName = metadataFallback?.displayName || chatRequest.displayName;
+  const resolvedAvatarUrl = metadataFallback?.avatarUrl ?? chatRequest.avatarUrl;
+
+  if (chatRequest.fast && resolvedChannelId !== null) {
+    try {
+      return await fetchChannelChatFromApi(page, {
+        ...chatRequest,
+        channelId: resolvedChannelId,
+        channelUserId: resolvedChannelUserId,
+        displayName: resolvedDisplayName,
+        avatarUrl: resolvedAvatarUrl
+      });
+    } catch (error) {
+      fastPathError = error;
+    }
+  }
+
+  try {
+    pageSnapshot = await fetchChannelChatPageSnapshot(page, chatRequest.channelSlug);
     if (pageSnapshot.messages.length > 0) {
-      return pageSnapshot;
+      return metadataFallback
+        ? {
+          ...pageSnapshot,
+          channelId: pageSnapshot.channelId ?? metadataFallback.channelId,
+          channelUserId: pageSnapshot.channelUserId ?? metadataFallback.channelUserId,
+          chatroomId: pageSnapshot.chatroomId ?? metadataFallback.chatroomId,
+          displayName: pageSnapshot.displayName || metadataFallback.displayName,
+          channelUrl: pageSnapshot.channelUrl || metadataFallback.channelUrl,
+          avatarUrl: pageSnapshot.avatarUrl || metadataFallback.avatarUrl,
+          updatedAt: new Date().toISOString()
+        }
+        : pageSnapshot;
     }
   } catch (error) {
     pageSnapshotError = error;
   }
 
   try {
-    const apiSnapshot = await fetchChannelChatFromApi(page, channelSlug, authToken);
+    const apiSnapshot = await fetchChannelChatFromApi(page, {
+      ...chatRequest,
+      channelId: pageSnapshot?.channelId ?? resolvedChannelId,
+      channelUserId: pageSnapshot?.channelUserId ?? resolvedChannelUserId,
+      displayName: pageSnapshot?.displayName || resolvedDisplayName,
+      avatarUrl: pageSnapshot?.avatarUrl ?? resolvedAvatarUrl
+    });
 
-    if (!pageSnapshot) {
+    if (!pageSnapshot && !metadataFallback) {
       return apiSnapshot;
     }
 
     return {
       ...apiSnapshot,
-      channelId: pageSnapshot.channelId ?? apiSnapshot.channelId,
-      channelUserId: pageSnapshot.channelUserId ?? apiSnapshot.channelUserId,
-      chatroomId: pageSnapshot.chatroomId ?? apiSnapshot.chatroomId,
-      displayName: pageSnapshot.displayName || apiSnapshot.displayName,
-      channelUrl: pageSnapshot.channelUrl || apiSnapshot.channelUrl,
-      avatarUrl: pageSnapshot.avatarUrl || apiSnapshot.avatarUrl,
+      channelId: pageSnapshot?.channelId ?? metadataFallback?.channelId ?? apiSnapshot.channelId,
+      channelUserId: pageSnapshot?.channelUserId ?? metadataFallback?.channelUserId ?? apiSnapshot.channelUserId,
+      chatroomId: pageSnapshot?.chatroomId ?? metadataFallback?.chatroomId ?? apiSnapshot.chatroomId,
+      displayName: pageSnapshot?.displayName || metadataFallback?.displayName || apiSnapshot.displayName,
+      channelUrl: pageSnapshot?.channelUrl || metadataFallback?.channelUrl || apiSnapshot.channelUrl,
+      avatarUrl: pageSnapshot?.avatarUrl || metadataFallback?.avatarUrl || apiSnapshot.avatarUrl,
       updatedAt: new Date().toISOString()
     };
   } catch (error) {
     if (pageSnapshot) {
-      return pageSnapshot;
+      return metadataFallback
+        ? {
+          ...pageSnapshot,
+          channelId: pageSnapshot.channelId ?? metadataFallback.channelId,
+          channelUserId: pageSnapshot.channelUserId ?? metadataFallback.channelUserId,
+          chatroomId: pageSnapshot.chatroomId ?? metadataFallback.chatroomId,
+          displayName: pageSnapshot.displayName || metadataFallback.displayName,
+          channelUrl: pageSnapshot.channelUrl || metadataFallback.channelUrl,
+          avatarUrl: pageSnapshot.avatarUrl || metadataFallback.avatarUrl,
+          updatedAt: new Date().toISOString()
+        }
+        : pageSnapshot;
     }
 
-    if (pageSnapshotError instanceof Error && error instanceof Error) {
-      throw new Error(`${pageSnapshotError.message} ${error.message}`.trim());
+    if (metadataFallback) {
+      return metadataFallback;
     }
 
-    if (pageSnapshotError instanceof Error) {
-      throw pageSnapshotError;
+    const combinedErrors = [metadataFallbackError, pageSnapshotError, fastPathError, error]
+      .filter((entry) => entry instanceof Error)
+      .map((entry) => entry.message.trim())
+      .filter((message, index, messages) => message.length > 0 && messages.indexOf(message) === index);
+
+    if (combinedErrors.length > 0) {
+      throw new Error(combinedErrors.join(' '));
     }
 
     throw error;
   }
 }
 
-async function fetchChannelChatFromApi(page, channelSlug, authToken) {
+async function fetchChannelChatFromApi(page, chatRequest) {
   await ensureKickHomePage(page);
+
+  const normalizedChannelSlug = chatRequest.channelSlug;
 
   let lastResult = null;
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const result = await page.evaluate(async ({ normalizedChannelSlug, kickApiBaseUrl, kickWebUrl, token }) => {
+    const result = await page.evaluate(async ({ normalizedChannelSlug, kickApiBaseUrl, kickWebUrl, providedChannelId, providedChannelUserId, providedDisplayName, providedAvatarUrl, fetchTimeoutMs }) => {
+      const fetchWithTimeout = async (input, init = {}) => {
+        const controller = new AbortController();
+        const timeoutId = window.setTimeout(() => controller.abort(), fetchTimeoutMs);
+
+        try {
+          return await fetch(input, {
+            ...init,
+            signal: controller.signal
+          }).catch(() => null);
+        } finally {
+          window.clearTimeout(timeoutId);
+        }
+      };
+
       const jsonHeaders = {
-        accept: 'application/json',
-        authorization: token,
-        'x-app-platform': 'web'
+        accept: 'application/json'
       };
 
       const kickPlaceholderPattern = /\[emote:\d+:[^\]]+\]/;
 
-      const readBadgeUrlCandidate = (value) => {
-        if (typeof value === 'string' && value.length > 0) {
-          return value;
-        }
-
-        if (!value || typeof value !== 'object' || Array.isArray(value)) {
-          return null;
-        }
-
-        const candidates = [
-          value?.url,
-          value?.src,
-          value?.original,
-          value?.original_url,
-          value?.originalUrl,
-          value?.full,
-          value?.full_url,
-          value?.fullUrl,
-          value?.medium,
-          value?.medium_url,
-          value?.mediumUrl,
-          value?.small,
-          value?.small_url,
-          value?.smallUrl,
-          value?.image,
-          value?.image_url,
-          value?.imageUrl,
-          value?.icon,
-          value?.icon_url,
-          value?.iconUrl,
-          value?.thumbnail
-        ];
-
-        return candidates.find((candidate) => typeof candidate === 'string' && candidate.length > 0) || null;
-      };
-
       const resolveBadgeImageUrl = (badge) => {
         const candidates = [
-          badge?.imageUrl,
           badge?.image,
           badge?.image_url,
-          badge?.iconUrl,
           badge?.icon,
           badge?.icon_url,
           badge?.src,
           badge?.url,
-          badge?.badgeImageUrl,
-          badge?.badge_image_url,
           badge?.badge_image,
-          badge?.badgeUrl,
-          badge?.badge_url,
-          badge?.smallIconUrl,
           badge?.small_icon_url,
-          badge?.thumbnail,
-          badge?.asset,
-          badge?.badge
+          badge?.thumbnail
         ];
 
-        const match = candidates
-          .map((candidate) => readBadgeUrlCandidate(candidate))
-          .find((candidate) => typeof candidate === 'string' && candidate.length > 0);
+        const match = candidates.find((candidate) => typeof candidate === 'string' && candidate.length > 0);
         return match || null;
       };
 
@@ -875,44 +1309,49 @@ async function fetchChannelChatFromApi(page, channelSlug, authToken) {
         };
       };
 
-      const channelResponse = await fetch(`${kickApiBaseUrl}/api/v2/channels/${encodeURIComponent(normalizedChannelSlug)}`, {
-        cache: 'no-store',
-        headers: jsonHeaders
-      }).catch(() => null);
+      let channelPayload = null;
+      let channelId = Number.isFinite(Number(providedChannelId)) ? Number(providedChannelId) : null;
 
-      if (!channelResponse) {
-        return {
-          ok: false,
-          status: 0,
-          bodySnippet: 'Background Kick channel request failed.'
-        };
+      if (channelId === null) {
+        const channelResponse = await fetchWithTimeout(`${kickApiBaseUrl}/api/v2/channels/${encodeURIComponent(normalizedChannelSlug)}`, {
+          cache: 'no-store',
+          credentials: 'include',
+          headers: jsonHeaders
+        });
+
+        if (!channelResponse) {
+          return {
+            ok: false,
+            status: 0,
+            bodySnippet: 'Background Kick channel request failed.'
+          };
+        }
+
+        const channelPayloadText = await channelResponse.text();
+        if (!channelResponse.ok) {
+          return {
+            ok: false,
+            status: channelResponse.status,
+            bodySnippet: channelPayloadText.slice(0, 500)
+          };
+        }
+
+        try {
+          channelPayload = JSON.parse(channelPayloadText);
+        } catch {
+          return {
+            ok: false,
+            status: channelResponse.status,
+            bodySnippet: channelPayloadText.slice(0, 500)
+          };
+        }
+
+        channelId =
+          channelPayload?.id ||
+          channelPayload?.chatroom?.channel_id ||
+          channelPayload?.chatroom?.id ||
+          null;
       }
-
-      const channelPayloadText = await channelResponse.text();
-      if (!channelResponse.ok) {
-        return {
-          ok: false,
-          status: channelResponse.status,
-          bodySnippet: channelPayloadText.slice(0, 500)
-        };
-      }
-
-      let channelPayload;
-      try {
-        channelPayload = JSON.parse(channelPayloadText);
-      } catch {
-        return {
-          ok: false,
-          status: channelResponse.status,
-          bodySnippet: channelPayloadText.slice(0, 500)
-        };
-      }
-
-      const channelId =
-        channelPayload?.id ||
-        channelPayload?.chatroom?.channel_id ||
-        channelPayload?.chatroom?.id ||
-        null;
 
       if (!channelId) {
         return {
@@ -925,16 +1364,18 @@ async function fetchChannelChatFromApi(page, channelSlug, authToken) {
       const historyUrl = new URL(`${kickWebUrl}/api/v1/chat/${encodeURIComponent(String(channelId))}/history`);
       historyUrl.searchParams.set('_cb', String(Date.now()));
 
-      const historyResponse = await fetch(historyUrl.toString(), {
+      const historyResponse = await fetchWithTimeout(historyUrl.toString(), {
         cache: 'no-store',
+        credentials: 'include',
         headers: jsonHeaders
-      }).catch(() => null);
+      });
 
       let historyPayload = null;
       let historyData = null;
       let messages = [];
       let pinnedMessage = null;
       let cursor = null;
+      let historyFailure = null;
 
       if (historyResponse && historyResponse.ok) {
         const historyPayloadText = await historyResponse.text();
@@ -952,7 +1393,22 @@ async function fetchChannelChatFromApi(page, channelSlug, authToken) {
         } catch {
           historyPayload = null;
           historyData = null;
+          historyFailure = {
+            status: historyResponse.status,
+            bodySnippet: historyPayloadText.slice(0, 500)
+          };
         }
+      } else if (historyResponse) {
+        const historyPayloadText = await historyResponse.text().catch(() => '');
+        historyFailure = {
+          status: historyResponse.status,
+          bodySnippet: historyPayloadText.slice(0, 500)
+        };
+      } else {
+        historyFailure = {
+          status: 0,
+          bodySnippet: 'Kick chat history request failed.'
+        };
       }
 
       const resolvedChatroomId =
@@ -963,16 +1419,34 @@ async function fetchChannelChatFromApi(page, channelSlug, authToken) {
         null;
       const resolvedChannelSlug = typeof channelPayload?.slug === 'string' ? channelPayload.slug : normalizedChannelSlug;
 
+      if (historyFailure && resolvedChatroomId === null) {
+        return {
+          ok: false,
+          status: historyFailure.status,
+          bodySnippet: historyFailure.bodySnippet || `Kick did not return chat history for ${resolvedChannelSlug}.`
+        };
+      }
+
       return {
         ok: true,
         chat: {
           channelSlug: resolvedChannelSlug,
           channelId: Number(channelId),
-          channelUserId: Number.isFinite(Number(channelPayload?.user?.id)) ? Number(channelPayload.user.id) : null,
+          channelUserId: Number.isFinite(Number(channelPayload?.user?.id))
+            ? Number(channelPayload.user.id)
+            : Number.isFinite(Number(providedChannelUserId))
+              ? Number(providedChannelUserId)
+              : null,
           chatroomId: resolvedChatroomId !== null ? Number(resolvedChatroomId) : null,
-          displayName: typeof channelPayload?.user?.username === 'string' ? channelPayload.user.username : resolvedChannelSlug,
+          displayName: typeof channelPayload?.user?.username === 'string'
+            ? channelPayload.user.username
+            : (typeof providedDisplayName === 'string' && providedDisplayName.length > 0 ? providedDisplayName : resolvedChannelSlug),
           channelUrl: `https://kick.com/${resolvedChannelSlug}`,
-          avatarUrl: channelPayload?.user?.profile_pic || channelPayload?.user?.profile_picture || channelPayload?.profile_picture || null,
+          avatarUrl:
+            channelPayload?.user?.profile_pic ||
+            channelPayload?.user?.profile_picture ||
+            channelPayload?.profile_picture ||
+            (typeof providedAvatarUrl === 'string' && providedAvatarUrl.length > 0 ? providedAvatarUrl : null),
           cursor,
           messages,
           pinnedMessage,
@@ -980,10 +1454,14 @@ async function fetchChannelChatFromApi(page, channelSlug, authToken) {
         }
       };
     }, {
-      normalizedChannelSlug: channelSlug,
+      normalizedChannelSlug,
       kickApiBaseUrl: KICK_API_BASE_URL,
       kickWebUrl: KICK_WEB_URL,
-      token: authToken
+      providedChannelId: chatRequest.channelId,
+      providedChannelUserId: chatRequest.channelUserId,
+      providedDisplayName: chatRequest.displayName,
+      providedAvatarUrl: chatRequest.avatarUrl,
+      fetchTimeoutMs: BROWSER_FETCH_TIMEOUT_MS
     });
 
     if (result?.ok) {
@@ -1009,19 +1487,16 @@ async function fetchChannelChatFromApi(page, channelSlug, authToken) {
   }
 
   if (lastResult?.status === 404) {
-    throw new Error(`Kick could not find chat for channel ${channelSlug}.`);
+    throw new Error(`Kick could not find chat for channel ${normalizedChannelSlug}.`);
   }
 
-  throw new Error(lastResult?.bodySnippet || `Kick browser request failed while loading chat for ${channelSlug}.`);
+  throw new Error(lastResult?.bodySnippet || `Kick browser request failed while loading chat for ${normalizedChannelSlug}.`);
 }
 
 async function fetchChannelChatPageSnapshot(page, channelSlug) {
   await openKickChannelPage(page, channelSlug);
 
-  const acceptAllButton = page.getByRole('button', { name: /accept all/i });
-  if (await acceptAllButton.isVisible().catch(() => false)) {
-    await acceptAllButton.click().catch(() => undefined);
-  }
+  await dismissKickConsent(page);
 
   const chatTab = page.getByText(/^Chat$/).last();
   if (await chatTab.isVisible().catch(() => false)) {
@@ -1453,9 +1928,80 @@ async function openKickChannelPage(page, channelSlug) {
   throw new Error(lastSnippet || `Kick returned a security policy block while opening ${channelSlug}.`);
 }
 
+async function dismissKickConsent(page) {
+  const acceptAllButton = page.getByRole('button', { name: /accept all/i }).first();
+  if (await acceptAllButton.isVisible().catch(() => false)) {
+    await acceptAllButton.click().catch(() => undefined);
+    await page.waitForTimeout(250).catch(() => undefined);
+  }
+}
+
+async function inspectKickPage(page) {
+  return page.evaluate(() => ({
+    title: document.title || '',
+    bodySnippet: (document.body?.innerText || '').slice(0, 500),
+    pathname: window.location.pathname || '/'
+  })).catch(() => ({
+    title: '',
+    bodySnippet: '',
+    pathname: '/'
+  }));
+}
+
+async function openKickFollowingPage(page) {
+  await ensureKickHomePage(page);
+  await dismissKickConsent(page);
+
+  const clickedFollowingLink = await page.evaluate(() => {
+    const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const followingLink = Array.from(document.querySelectorAll('a[href], button'))
+      .find((element) => {
+        if (!(element instanceof HTMLElement)) {
+          return false;
+        }
+
+        const href = element instanceof HTMLAnchorElement ? element.getAttribute('href') || '' : '';
+        const label = normalize(
+          element.getAttribute('aria-label')
+            || element.getAttribute('title')
+            || element.textContent
+            || ''
+        );
+
+        return /\/following(?:\/|$)/i.test(href) || label === 'following' || label.startsWith('following ');
+      });
+
+    if (!followingLink) {
+      return false;
+    }
+
+    followingLink.click();
+    return true;
+  }).catch(() => false);
+
+  if (clickedFollowingLink) {
+    await page.waitForTimeout(BACKGROUND_FETCH_WARMUP_MS * 2).catch(() => undefined);
+    const inspection = await inspectKickPage(page);
+    if (!looksKickNotFound(inspection.bodySnippet) && !looksSecurityBlocked(inspection.bodySnippet)) {
+      return true;
+    }
+
+    await ensureKickHomePage(page);
+  }
+
+  await page.goto(`${KICK_API_BASE_URL}/following`, {
+    waitUntil: 'domcontentloaded',
+    timeout: 60_000
+  }).catch(() => undefined);
+  await page.waitForTimeout(BACKGROUND_FETCH_WARMUP_MS * 2).catch(() => undefined);
+
+  const inspection = await inspectKickPage(page);
+  return !looksKickNotFound(inspection.bodySnippet) && !looksSecurityBlocked(inspection.bodySnippet);
+}
+
 async function ensureKickHomePage(page) {
   const currentUrl = typeof page.url === 'function' ? page.url() : '';
-  if (currentUrl.startsWith(KICK_HOME_URL)) {
+  if (isKickHomePageUrl(currentUrl)) {
     return;
   }
 
@@ -1464,6 +2010,20 @@ async function ensureKickHomePage(page) {
     timeout: 60_000
   }).catch(() => undefined);
   await page.waitForTimeout(BACKGROUND_FETCH_WARMUP_MS);
+}
+
+function isKickHomePageUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.origin === 'https://kick.com' && (url.pathname === '/' || url.pathname === '');
+  } catch {
+    return false;
+  }
+}
+
+function looksKickNotFound(pageText) {
+  const normalized = (pageText || '').toLowerCase();
+  return normalized.includes("we can't find the page you're looking for") || normalized.includes('oops, something went wrong');
 }
 
 async function readKickSession(filePath) {
@@ -1493,15 +2053,88 @@ async function invalidateSavedSession(sessionFile, cookieFile) {
   await rm(cookieFile, { force: true }).catch(() => undefined);
 }
 
+function normalizeChannelTags(tags) {
+  if (!Array.isArray(tags)) {
+    return [];
+  }
+
+  return [...new Set(tags
+    .map((tag) => {
+      if (typeof tag === 'string') {
+        return tag.trim();
+      }
+
+      if (tag && typeof tag === 'object' && typeof tag.name === 'string') {
+        return tag.name.trim();
+      }
+
+      return '';
+    })
+    .filter((tag) => tag.length > 0))];
+}
+
+function resolveChannelThumbnailUrl(channel) {
+  return channel.profile_picture
+    || channel.user?.profile_pic
+    || channel.user?.profile_picture
+    || channel.thumbnail?.url
+    || channel.thumbnail
+    || channel.stream?.thumbnail
+    || channel.livestream?.thumbnail
+    || null;
+}
+
 function normalizeFollowedChannels(channels) {
-  return channels.map((channel) => ({
-    channelSlug: channel.channel_slug || channel.user_username || channel.slug || '',
-    displayName: channel.user_username || channel.channel_slug || channel.slug || 'unknown',
-    isLive: channel.is_live === true,
-    thumbnailUrl: channel.profile_picture || null,
-    channelUrl: `https://kick.com/${channel.channel_slug || channel.user_username || channel.slug || ''}`,
-    chatUrl: `https://kick.com/${channel.channel_slug || channel.user_username || channel.slug || ''}`
-  })).filter((channel) => channel.channelSlug && channel.isLive);
+  return channels.map((channel) => {
+    const channelSlug = String(channel.channel_slug || channel.user_username || channel.slug || '').trim().toLowerCase();
+    const displayName = String(
+      channel.user?.username
+      || channel.user?.name
+      || channel.display_name
+      || channel.user_username
+      || channel.channel_slug
+      || channel.slug
+      || channelSlug
+    ).trim() || 'unknown';
+    const parsedViewerCount = parseOptionalNumber(
+      channel.viewer_count
+      ?? channel.stream?.viewer_count
+      ?? channel.livestream?.viewer_count
+      ?? null
+    );
+
+    return {
+      channelSlug,
+      displayName,
+      isLive: channel.is_live === true || channel.isLive === true || channel.stream?.is_live === true || channel.livestream?.is_live === true,
+      thumbnailUrl: resolveChannelThumbnailUrl(channel),
+      channelUrl: `https://kick.com/${channelSlug}`,
+      chatUrl: `https://kick.com/${channelSlug}`,
+      broadcasterUserId: parseOptionalNumber(channel.broadcaster_user_id ?? channel.user_id ?? channel.user?.id ?? null),
+      channelId: parseOptionalNumber(channel.channel_id ?? channel.id ?? channel.chatroom?.channel_id ?? channel.livestream?.channel_id ?? null),
+      chatroomId: parseOptionalNumber(channel.chatroom_id ?? channel.chatroom?.id ?? channel.livestream?.chatroom_id ?? null),
+      viewerCount: parsedViewerCount !== null ? Math.round(parsedViewerCount) : null,
+      streamTitle: typeof (channel.session_title ?? channel.stream_title ?? channel.livestream?.session_title) === 'string'
+        ? (channel.session_title ?? channel.stream_title ?? channel.livestream?.session_title).trim() || null
+        : null,
+      categoryName: typeof (channel.category?.name ?? channel.recent_categories?.[0]?.name ?? channel.livestream?.categories?.[0]?.name) === 'string'
+        ? (channel.category?.name ?? channel.recent_categories?.[0]?.name ?? channel.livestream?.categories?.[0]?.name).trim() || null
+        : null,
+      tags: normalizeChannelTags(channel.custom_tags ?? channel.tags ?? channel.stream?.custom_tags ?? channel.livestream?.tags ?? [])
+    };
+  }).filter((channel) => channel.channelSlug && channel.isLive);
+}
+
+function scoreFollowedChannel(channel) {
+  return (channel.isLive ? 100 : 0)
+    + (channel.chatroomId !== null ? 40 : 0)
+    + (channel.channelId !== null ? 30 : 0)
+    + (channel.broadcasterUserId !== null ? 20 : 0)
+    + (channel.viewerCount !== null ? 10 : 0)
+    + (channel.thumbnailUrl ? 5 : 0)
+    + (channel.streamTitle ? 3 : 0)
+    + (channel.categoryName ? 2 : 0)
+    + Math.min(channel.tags.length, 5);
 }
 
 function dedupeChannels(channels) {
@@ -1509,7 +2142,7 @@ function dedupeChannels(channels) {
 
   for (const channel of channels) {
     const existing = deduped.get(channel.channelSlug);
-    if (!existing || (!existing.isLive && channel.isLive)) {
+    if (!existing || scoreFollowedChannel(channel) > scoreFollowedChannel(existing)) {
       deduped.set(channel.channelSlug, channel);
     }
   }
@@ -1517,10 +2150,56 @@ function dedupeChannels(channels) {
   return Array.from(deduped.values());
 }
 
-async function extractChannels(page) {
-  return page.evaluate((reservedValues) => {
+async function extractChannels(page, options = {}) {
+  return page.evaluate(({ reservedValues, requireFollowingContext }) => {
     const reservedPaths = new Set(reservedValues);
     const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+    const currentPathHasFollowingContext = /\/following(?:\/|$)/i.test(window.location.pathname || '/');
+    const toFiniteNumber = (value) => {
+      const parsedValue = Number(value);
+      return Number.isFinite(parsedValue) ? parsedValue : null;
+    };
+    const normalizeTags = (value) => {
+      if (!Array.isArray(value)) {
+        return [];
+      }
+
+      return [...new Set(value
+        .map((entry) => {
+          if (typeof entry === 'string') {
+            return normalize(entry);
+          }
+
+          if (entry && typeof entry === 'object' && typeof entry.name === 'string') {
+            return normalize(entry.name);
+          }
+
+          return '';
+        })
+        .filter((entry) => entry.length > 0))];
+    };
+    const decodeNextDataScript = (value) => {
+      if (!value.includes('self.__next_f.push')) {
+        return value;
+      }
+
+      const segments = Array.from(value.matchAll(/push\(\[\d+,"([\s\S]*?)"\]\)/g))
+        .map((match) => match[1]);
+      if (segments.length === 0) {
+        return value;
+      }
+
+      return segments
+        .map((segment) => {
+          try {
+            return JSON.parse(`"${segment}"`);
+          } catch {
+            return '';
+          }
+        })
+        .filter((segment) => segment.length > 0)
+        .join('\n');
+    };
     const candidates = new Map();
 
     const addCandidate = (candidate) => {
@@ -1539,18 +2218,19 @@ async function extractChannels(page) {
         channelSlug: slug,
         displayName: normalize(candidate.displayName) || slug,
         channelUrl: `https://kick.com/${slug}`,
-        chatUrl: `https://kick.com/${slug}`
+        chatUrl: `https://kick.com/${slug}`,
+        tags: Array.isArray(candidate.tags) ? candidate.tags.filter((tag) => normalize(tag).length > 0) : []
       });
     };
 
-    const walk = (value) => {
+    const walk = (value, path = []) => {
       if (!value) {
         return;
       }
 
       if (Array.isArray(value)) {
         for (const item of value) {
-          walk(item);
+          walk(item, path);
         }
         return;
       }
@@ -1560,6 +2240,7 @@ async function extractChannels(page) {
       }
 
       const objectValue = value;
+      const hasFollowingContext = currentPathHasFollowingContext || path.some((segment) => /follow(?:ing|ed)/i.test(String(segment || '')));
       const slug =
         objectValue.slug ||
         objectValue.channel_slug ||
@@ -1577,6 +2258,26 @@ async function extractChannels(page) {
         objectValue.broadcast?.isLive === true;
 
       if (slug && isLive) {
+        const channelId =
+          toFiniteNumber(objectValue.channel_id)
+          ?? toFiniteNumber(objectValue.livestream?.channel_id)
+          ?? toFiniteNumber(objectValue.chatroom?.channel_id)
+          ?? toFiniteNumber(objectValue.id);
+        const chatroomId =
+          toFiniteNumber(objectValue.chatroom_id)
+          ?? toFiniteNumber(objectValue.chatroom?.id)
+          ?? toFiniteNumber(objectValue.livestream?.chatroom_id);
+        const broadcasterUserId =
+          toFiniteNumber(objectValue.broadcaster_user_id)
+          ?? toFiniteNumber(objectValue.user_id)
+          ?? toFiniteNumber(objectValue.user?.id)
+          ?? toFiniteNumber(objectValue.broadcaster?.id);
+        const viewerCount =
+          toFiniteNumber(objectValue.viewer_count)
+          ?? toFiniteNumber(objectValue.stream?.viewer_count)
+          ?? toFiniteNumber(objectValue.livestream?.viewer_count)
+          ?? toFiniteNumber(objectValue.broadcast?.viewer_count);
+
         addCandidate({
           channelSlug: slug,
           displayName:
@@ -1584,24 +2285,63 @@ async function extractChannels(page) {
             objectValue.displayName ||
             objectValue.name ||
             objectValue.user?.username ||
+            objectValue.user?.name ||
             slug,
           thumbnailUrl:
             objectValue.thumbnail?.url ||
             objectValue.user?.profile_pic ||
+            objectValue.user?.profile_picture ||
             objectValue.user?.profilePicture ||
+            objectValue.profile_picture ||
+            objectValue.thumbnail ||
             null,
+          broadcasterUserId,
+          channelId,
+          chatroomId,
+          viewerCount: viewerCount !== null ? Math.round(viewerCount) : null,
+          streamTitle: normalize(
+            objectValue.stream_title ||
+            objectValue.session_title ||
+            objectValue.stream?.stream_title ||
+            objectValue.livestream?.stream_title ||
+            objectValue.livestream?.session_title ||
+            ''
+          ) || null,
+          categoryName: normalize(
+            objectValue.category?.name ||
+            objectValue.categories?.[0]?.name ||
+            objectValue.recent_categories?.[0]?.name ||
+            objectValue.livestream?.category?.name ||
+            objectValue.livestream?.categories?.[0]?.name ||
+            ''
+          ) || null,
+          tags: normalizeTags(
+            objectValue.custom_tags
+            || objectValue.tags
+            || objectValue.stream?.custom_tags
+            || objectValue.stream?.tags
+            || objectValue.livestream?.custom_tags
+            || objectValue.livestream?.tags
+            || []
+          ),
           isLive: true,
+          fromFollowingContext: hasFollowingContext,
           score: 100
+            + (hasFollowingContext ? 200 : 0)
+            + (chatroomId !== null ? 40 : 0)
+            + (channelId !== null ? 30 : 0)
+            + (broadcasterUserId !== null ? 20 : 0)
+            + (viewerCount !== null ? 10 : 0)
         });
       }
 
-      for (const nestedValue of Object.values(objectValue)) {
-        walk(nestedValue);
+      for (const [key, nestedValue] of Object.entries(objectValue)) {
+        walk(nestedValue, [...path, key]);
       }
     };
 
     for (const script of Array.from(document.querySelectorAll('script'))) {
-      const content = script.textContent?.trim();
+      const content = decodeNextDataScript(script.textContent?.trim() || '');
       if (!content || content.length < 2 || content.length > 2_000_000) {
         continue;
       }
@@ -1611,16 +2351,10 @@ async function extractChannels(page) {
       }
 
       try {
-        walk(JSON.parse(content));
+        walk(JSON.parse(content), ['script']);
       } catch {
         // Ignore non-JSON script blocks.
       }
-    }
-
-    if (candidates.size > 0) {
-      return Array.from(candidates.values())
-        .sort((left, right) => right.score - left.score)
-        .map(({ score, ...candidate }) => candidate);
     }
 
     for (const anchor of Array.from(document.querySelectorAll('a[href]'))) {
@@ -1643,6 +2377,7 @@ async function extractChannels(page) {
       const container = anchor.closest('article, li, section, div') || anchor;
       const blob = normalize(`${container.textContent || ''} ${anchor.textContent || ''}`);
       const isLive = /\blive\b/i.test(blob);
+      const hasFollowingContext = currentPathHasFollowingContext || /\bfollow(?:ing|ed)\b/i.test(blob);
       if (!isLive) {
         continue;
       }
@@ -1652,14 +2387,28 @@ async function extractChannels(page) {
         displayName: normalize(anchor.getAttribute('aria-label') || anchor.textContent || slug),
         isLive: true,
         thumbnailUrl: anchor.querySelector('img')?.getAttribute('src') || null,
-        score: 50 + (anchor.querySelector('img') ? 15 : 0) + Math.min(blob.length, 25)
+        fromFollowingContext: hasFollowingContext,
+        score: 50
+          + (hasFollowingContext ? 200 : 0)
+          + (anchor.querySelector('img') ? 15 : 0)
+          + Math.min(blob.length, 25)
       });
     }
 
-    return Array.from(candidates.values())
+    const resolvedCandidates = Array.from(candidates.values())
       .sort((left, right) => right.score - left.score)
-      .map(({ score, ...candidate }) => candidate);
-  }, Array.from(RESERVED_PATHS));
+    const followingCandidates = resolvedCandidates.filter((candidate) => candidate.fromFollowingContext);
+    const preferredCandidates = followingCandidates.length > 0
+      ? followingCandidates
+      : requireFollowingContext
+        ? []
+        : resolvedCandidates;
+
+    return preferredCandidates.map(({ score, fromFollowingContext, ...candidate }) => candidate);
+  }, {
+    reservedValues: Array.from(RESERVED_PATHS),
+    requireFollowingContext: options.requireFollowingContext === true
+  });
 }
 
 function looksUnauthenticated(pageText) {
@@ -1692,6 +2441,84 @@ function launchLoginBrowser({ browserInfo, profileDir, startUrl, debuggingPort }
   browserProcess.unref();
 }
 
+function isKickOriginUrl(value) {
+  try {
+    return new URL(value).origin === 'https://kick.com';
+  } catch {
+    return false;
+  }
+}
+
+function selectBridgePage(context) {
+  const existingPages = context.pages().filter((candidate) => {
+    if (typeof candidate.isClosed !== 'function') {
+      return true;
+    }
+
+    return !candidate.isClosed();
+  });
+
+  const page =
+    existingPages.find((candidate) => isKickHomePageUrl(candidate.url())) ||
+    existingPages.find((candidate) => isKickOriginUrl(candidate.url())) ||
+    existingPages[0] ||
+    null;
+
+  return {
+    page,
+    ownsPage: false
+  };
+}
+
+async function resolveBridgePage(context) {
+  const selectedPage = selectBridgePage(context);
+  if (selectedPage.page) {
+    return selectedPage;
+  }
+
+  const deadline = Date.now() + BRIDGE_PAGE_WAIT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const nextSelection = selectBridgePage(context);
+    if (nextSelection.page) {
+      return nextSelection;
+    }
+
+    const remaining = Math.max(1, deadline - Date.now());
+    try {
+      const nextPage = await context.waitForEvent('page', { timeout: Math.min(remaining, 1_000) });
+      if (nextPage && (typeof nextPage.isClosed !== 'function' || !nextPage.isClosed())) {
+        return {
+          page: nextPage,
+          ownsPage: false
+        };
+      }
+    } catch {
+      // Keep polling until timeout before creating a dedicated page.
+    }
+  }
+
+  const page = await context.newPage();
+
+  return {
+    page,
+    ownsPage: true
+  };
+}
+
+async function ensureActiveBridgePage(context, page) {
+  if (page && (typeof page.isClosed !== 'function' || !page.isClosed())) {
+    return page;
+  }
+
+  const resolved = await resolveBridgePage(context);
+  return resolved.page;
+}
+
+function isClosedTargetError(error) {
+  const message = error instanceof Error ? error.message : String(error || '');
+  return message.toLowerCase().includes('target page, context or browser has been closed');
+}
+
 async function openExistingBrowserBridge({ debuggingPort }) {
   const normalizedPort = Number(debuggingPort);
   if (!Number.isInteger(normalizedPort) || normalizedPort <= 0) {
@@ -1706,41 +2533,34 @@ async function openExistingBrowserBridge({ debuggingPort }) {
     userAgent: DEFAULT_USER_AGENT,
     viewport: { width: 1440, height: 960 }
   }));
+  const { page, ownsPage } = await resolveBridgePage(context);
 
   return {
     browser,
     context,
-    page: await context.newPage(),
+    page,
     browserInfo: {
       label: 'Existing Kick login browser',
       executablePath: 'already-running'
     },
     browserProcess: null,
     ownsBrowserProcess: false,
+    ownsPage,
     debuggingPort: normalizedPort
   };
 }
 
 async function openConnectedBrowserBridge({ debuggingPort, statusFile, storedSession, profileDir, preferredBrowserPath }) {
-  if (debuggingPort) {
-    try {
-      return await openExistingBrowserBridge({ debuggingPort });
-    } catch {
-      // Fall back to a temporary minimized browser when the saved bridge window is no longer running.
-    }
+  if (!debuggingPort) {
+    await safeUpdateStatus(statusFile, 'ERROR', BROWSER_RECONNECT_REQUIRED_MESSAGE, storedSession);
+    throw new Error(BROWSER_RECONNECT_REQUIRED_MESSAGE);
   }
 
   try {
-    return await openBrowserBridge({
-      preferredBrowserPath,
-      profileDir,
-      startUrl: KICK_HOME_URL,
-      startMinimized: true
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : BROWSER_RECONNECT_REQUIRED_MESSAGE;
-    await safeUpdateStatus(statusFile, 'ERROR', message, storedSession);
-    throw error;
+    return await openExistingBrowserBridge({ debuggingPort });
+  } catch {
+    await safeUpdateStatus(statusFile, 'ERROR', BROWSER_RECONNECT_REQUIRED_MESSAGE, storedSession);
+    throw new Error(BROWSER_RECONNECT_REQUIRED_MESSAGE);
   }
 }
 
@@ -1761,7 +2581,7 @@ function resolveChromiumBrowser(preferredBrowserPath) {
   throw new Error('No supported local Chrome or Edge installation was found. Install Chrome or Edge, or set KICK_BROWSER_PATH.');
 }
 
-async function openBrowserBridge({ preferredBrowserPath, profileDir, startUrl, startMinimized }) {
+async function openBrowserBridge({ preferredBrowserPath, profileDir, startUrl, startMinimized, detachProcess = false }) {
   const browserInfo = resolveChromiumBrowser(preferredBrowserPath);
   const resolvedProfileDir = path.resolve(profileDir);
   const debuggingPort = await getAvailablePort();
@@ -1776,9 +2596,14 @@ async function openBrowserBridge({ preferredBrowserPath, profileDir, startUrl, s
       startUrl
     ],
     {
+      detached: detachProcess,
       stdio: 'ignore'
     }
   );
+
+  if (detachProcess) {
+    browserProcess.unref();
+  }
 
   await waitForDevTools(debuggingPort, browserProcess, browserInfo.label);
 
@@ -1796,32 +2621,49 @@ async function openBrowserBridge({ preferredBrowserPath, profileDir, startUrl, s
     browserInfo,
     browserProcess,
     ownsBrowserProcess: true,
+    ownsPage: true,
     debuggingPort
   };
 }
 
-async function closeBrowserBridge(page, browser, browserProcess, ownsBrowserProcess) {
-  await page?.close().catch(() => undefined);
-
+async function closeBrowserBridge(page, browser, browserProcess, ownsBrowserProcess, ownsPage = true) {
   if (!ownsBrowserProcess) {
-    if (browser && typeof browser.newBrowserCDPSession === 'function') {
-      const browserSession = await browser.newBrowserCDPSession().catch(() => null);
-      if (browserSession) {
-        await browserSession.send('Browser.close').catch(() => undefined);
-        await browserSession.detach().catch(() => undefined);
-      }
+    if (ownsPage) {
+      await settleBrowserOperation(() => page?.close(), 1_000);
     }
 
-    await browser?.close().catch(() => undefined);
     return;
   }
 
-  await browser?.close().catch(() => undefined);
+  if (ownsPage) {
+    await settleBrowserOperation(() => page?.close(), 1_000);
+  }
+
+  await settleBrowserOperation(() => browser?.close(), 1_500);
 
   if (ownsBrowserProcess && browserProcess && browserProcess.exitCode === null && !browserProcess.killed) {
     browserProcess.kill();
-    await waitForProcessExit(browserProcess);
+    await settleBrowserOperation(() => waitForProcessExit(browserProcess), 1_500);
   }
+}
+
+async function disconnectBrowserBridge(browser) {
+  // Let the short-lived login bridge process exit instead of explicitly closing the shared Chrome session.
+  return browser;
+}
+
+function settleBrowserOperation(operation, timeoutMs) {
+  return new Promise((resolve) => {
+    const timeoutId = setTimeout(resolve, timeoutMs);
+
+    Promise.resolve()
+      .then(() => operation?.())
+      .catch(() => undefined)
+      .finally(() => {
+        clearTimeout(timeoutId);
+        resolve();
+      });
+  });
 }
 
 async function waitForDevTools(debuggingPort, browserProcess, browserLabel) {
@@ -1829,10 +2671,6 @@ async function waitForDevTools(debuggingPort, browserProcess, browserLabel) {
   const deadline = Date.now() + REMOTE_DEBUGGING_STARTUP_TIMEOUT_MS;
 
   while (Date.now() < deadline) {
-    if (browserProcess.exitCode !== null) {
-      throw new Error(`${browserLabel} closed before its debugging endpoint became available.`);
-    }
-
     try {
       const response = await fetch(endpoint);
       if (response.ok) {
@@ -1843,6 +2681,10 @@ async function waitForDevTools(debuggingPort, browserProcess, browserLabel) {
     }
 
     await delay(REMOTE_DEBUGGING_POLL_INTERVAL_MS);
+  }
+
+  if (browserProcess.exitCode !== null) {
+    throw new Error(`${browserLabel} closed before its debugging endpoint became available.`);
   }
 
   throw new Error(`${browserLabel} did not open its debugging endpoint in time.`);

@@ -12,6 +12,7 @@ data class FollowedChannel(
     val thumbnailUrl: String? = null,
     val broadcasterUserId: Long? = null,
     val channelId: Long? = null,
+    val chatroomId: Long? = null,
     val viewerCount: Int? = null,
     val streamTitle: String? = null,
     val categoryName: String? = null,

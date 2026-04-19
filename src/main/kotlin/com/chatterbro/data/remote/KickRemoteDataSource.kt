@@ -2,6 +2,7 @@ package com.chatterbro.data.remote
 
 import com.chatterbro.data.bridge.KickBridgeStatus
 import com.chatterbro.domain.model.ChannelChat
+import com.chatterbro.domain.model.ChannelChatRequest
 import com.chatterbro.domain.model.FollowedChannel
 
 interface KickRemoteDataSource {
@@ -11,5 +12,5 @@ interface KickRemoteDataSource {
 
     suspend fun getLiveFollowedChannels(): List<FollowedChannel>
 
-    suspend fun getChannelChat(channelSlug: String): ChannelChat
+    suspend fun getChannelChat(request: ChannelChatRequest): ChannelChat
 }

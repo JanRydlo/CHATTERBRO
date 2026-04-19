@@ -31,6 +31,7 @@ export interface FollowedChannel {
   thumbnailUrl: string | null;
   broadcasterUserId: number | null;
   channelId: number | null;
+  chatroomId: number | null;
   viewerCount: number | null;
   streamTitle: string | null;
   categoryName: string | null;
