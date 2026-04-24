@@ -1,5 +1,5 @@
 import Pusher, { type Options as PusherOptions } from 'pusher-js';
-import { Fragment, type ReactNode, startTransition, useEffect, useEffectEvent, useRef, useState } from 'react';
+import { Fragment, type KeyboardEvent, type ReactNode, startTransition, useEffect, useEffectEvent, useRef, useState } from 'react';
 import { fetchChannelChat, fetchChannelChatEmotes, fetchGlobalChatEmotes, fetchLiveFollowedChannels, fetchRecentChannelSlugs, fetchTrackedChannels, getBridgeStatus, getOAuthLoginUrl, sendChannelChatMessage, startBridge } from './api';
 import { KNOWN_KICK_BADGE_IMAGE_URLS_BY_KIND, KNOWN_KICK_CHANNEL_BADGE_IMAGE_URLS_BY_SLUG } from './knownKickBadgeAssets';
 import type { ChannelChat, ChannelChatBadge, ChannelChatEmote, ChannelChatEmoteCatalog, ChannelChatMessage, ChannelChatSender, FollowedChannel, KickBridgeStatus } from './types';
@@ -134,6 +134,21 @@ function formatFollowingsSecurityPolicySessionStatus(trackedChannelCount: number
   return trackedChannelCount === 0
     ? 'Kick browser sync is connected, but Kick blocked the latest live followings read for this website session. Chatterbro will try to seed the local watchlist from recent browser channels, or you can add tracked channel slugs and retry.'
     : 'Kick browser sync is connected, but Kick blocked the latest live followings read for this website session. Chatterbro is using your local watchlist for channel discovery until you refresh channels or reconnect the Kick browser.';
+}
+
+function formatReplyPreviewContent(content: string) {
+  const normalizedContent = normalizeExternalEmoteCode(content)
+    .replace(KICK_PLACEHOLDER_PATTERN, (_, __, emoteCode: string) => `:${emoteCode}:`)
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!normalizedContent) {
+    return 'Original message';
+  }
+
+  return normalizedContent.length > 160
+    ? `${normalizedContent.slice(0, 157)}...`
+    : normalizedContent;
 }
 
 function getTokenOnlyLiveCountLabel({
@@ -924,6 +939,67 @@ function getKickPlaceholderEmoteUrl(emoteId: string) {
   return `https://files.kick.com/emotes/${emoteId}/fullsize`;
 }
 
+const CHAT_MENTION_PATTERN = /(^|[^0-9A-Za-z_])(@[0-9A-Za-z_]{2,})(?=$|[^0-9A-Za-z_])/g;
+
+function renderTextTokenWithMentions(
+  text: string,
+  messageId: string,
+  segmentKey: string,
+  tokenIndex: number
+) {
+  const renderedParts: ReactNode[] = [];
+
+  let lastIndex = 0;
+  let match = CHAT_MENTION_PATTERN.exec(text);
+
+  while (match) {
+    const prefix = match[1];
+    const mention = match[2];
+    const matchStart = match.index;
+
+    if (matchStart > lastIndex) {
+      renderedParts.push(
+        <Fragment key={`${messageId}-${segmentKey}-text-${tokenIndex}-${lastIndex}`}>
+          {text.slice(lastIndex, matchStart)}
+        </Fragment>
+      );
+    }
+
+    if (prefix) {
+      renderedParts.push(
+        <Fragment key={`${messageId}-${segmentKey}-prefix-${tokenIndex}-${matchStart}`}>
+          {prefix}
+        </Fragment>
+      );
+    }
+
+    renderedParts.push(
+      <span className="chat-mention" key={`${messageId}-${segmentKey}-mention-${tokenIndex}-${matchStart}`}>
+        {mention}
+      </span>
+    );
+
+    lastIndex = matchStart + prefix.length + mention.length;
+    match = CHAT_MENTION_PATTERN.exec(text);
+  }
+
+  CHAT_MENTION_PATTERN.lastIndex = 0;
+
+  if (renderedParts.length === 0) {
+    return [<Fragment key={`${messageId}-${segmentKey}-text-${tokenIndex}`}>{text}</Fragment>];
+  }
+
+  if (lastIndex < text.length) {
+    renderedParts.push(
+      <Fragment key={`${messageId}-${segmentKey}-suffix-${tokenIndex}-${lastIndex}`}>
+        {text.slice(lastIndex)}
+      </Fragment>
+    );
+  }
+
+  return renderedParts;
+}
+
 function renderTextSegmentWithExternalEmotes(
   text: string,
   messageId: string,
@@ -940,7 +1016,7 @@ function renderTextSegmentWithExternalEmotes(
 
       const matchedEmote = matchInlineEmoteToken(part, emoteIndex);
       if (!matchedEmote) {
-        return <Fragment key={`${messageId}-${segmentKey}-text-${index}`}>{part}</Fragment>;
+        return renderTextTokenWithMentions(part, messageId, segmentKey, index);
       }
 
       return (
@@ -1755,6 +1831,9 @@ export default function App() {
   };
   const badgeImageUrlIndex = buildBadgeImageUrlIndex(channelChat?.messages ?? []);
   const displayedChatMessages = channelChat ? [...channelChat.messages].reverse() : [];
+  const chatMessagesById = channelChat
+    ? new Map(channelChat.messages.map((message) => [message.id, message]))
+    : new Map<string, ChannelChatMessage>();
   const newestVisibleMessageId = displayedChatMessages[0]?.id ?? null;
   const activeChatroomId = channelChat?.chatroomId ?? selectedChannel?.chatroomId ?? null;
   const activeRealtimeChannelId = channelChat?.channelId ?? selectedChannel?.channelId ?? null;
@@ -2739,6 +2818,20 @@ export default function App() {
     }
   }
 
+  function handleChatComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) {
+      return;
+    }
+
+    event.preventDefault();
+
+    if (!hasChatWriteScope || !canSendSelectedChannelChat || isSendingChat || chatDraft.trim().length === 0) {
+      return;
+    }
+
+    void handleSendChatMessage();
+  }
+
   function formatChatTimestamp(value: string | null) {
     if (!value) {
       return 'Unknown time';
@@ -2765,6 +2858,9 @@ export default function App() {
 
   function renderChatMessage(message: ChannelChatMessage) {
     const senderBadges = message.sender.badges || [];
+    const replyTargetMessage = message.threadParentId
+      ? chatMessagesById.get(message.threadParentId) ?? null
+      : null;
     const renderedSenderBadges = senderBadges.flatMap((badge, index) => {
       const renderedBadge = renderSenderBadge(
         badge,
@@ -2779,11 +2875,27 @@ export default function App() {
     const timeLabel = formatChatClockTime(message.createdAt);
     const timeTitle = formatChatTimestamp(message.createdAt);
     const renderedMessageContent = renderMessageContent(message.content, message.id, activeEmoteIndex);
+    const replyPreviewText = replyTargetMessage ? formatReplyPreviewContent(replyTargetMessage.content) : null;
 
     return (
       <article className={`chat-message${message.threadParentId ? ' chat-message-reply' : ''}`} key={message.id}>
         <span className="chat-message-time" title={timeTitle}>{timeLabel}</span>
         <div className="chat-message-main">
+          {message.threadParentId ? (
+            <div
+              className="chat-reply-preview"
+              title={replyTargetMessage
+                ? `${replyTargetMessage.sender.username}: ${replyPreviewText}`
+                : 'Original message is outside the loaded chat snapshot.'}
+            >
+              <span className="chat-reply-label">
+                {replyTargetMessage ? `Reply to ${replyTargetMessage.sender.username}` : 'Reply to earlier message'}
+              </span>
+              <span className="chat-reply-text">
+                {replyTargetMessage ? replyPreviewText : 'Original message is outside the loaded chat snapshot.'}
+              </span>
+            </div>
+          ) : null}
           <div className="chat-message-header">
             <div className="chat-sender-group">
               {renderedSenderBadges.length > 0 ? <span className="chat-badge-list">{renderedSenderBadges}</span> : null}
@@ -2792,8 +2904,9 @@ export default function App() {
               </strong>
               {message.type !== 'message' ? <span className="chat-type-pill">{message.type}</span> : null}
             </div>
+            <span className="chat-message-separator">:</span>
+            <span className="chat-message-inline-body">{renderedMessageContent}</span>
           </div>
-          <p className="chat-message-body">{renderedMessageContent}</p>
         </div>
       </article>
     );
@@ -3342,6 +3455,7 @@ export default function App() {
 
                       setChatDraftForChannel(selectedChannelSlug, event.target.value);
                     }}
+                    onKeyDown={handleChatComposerKeyDown}
                     placeholder={selectedChannel.isLive
                       ? hasChatWriteScope
                         ? `Write to ${selectedChannel.displayName}...`
@@ -3352,7 +3466,10 @@ export default function App() {
                   />
 
                   <div className="chat-composer-button-row">
-                    <span className="chat-composer-help">{chatDraft.trim().length}/500</span>
+                    <div className="chat-composer-hints">
+                      <span className="chat-composer-help">Enter to send, Shift+Enter for newline</span>
+                      <span className="chat-composer-help">{chatDraft.trim().length}/500</span>
+                    </div>
 
                     {!hasChatWriteScope ? (
                       <button className="primary-button" type="button" onClick={handleReconnectOAuth}>
