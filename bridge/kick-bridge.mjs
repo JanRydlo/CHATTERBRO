@@ -25,6 +25,7 @@ const BROWSER_FETCH_TIMEOUT_MS = 10_000;
 const BACKGROUND_FETCH_WARMUP_MS = 1_500;
 const CHANNEL_CHAT_DOM_WARMUP_MS = 2_500;
 const MAX_FOLLOWED_CURSOR_PAGES = 25;
+const RECENT_CHANNELS_LIMIT = 25;
 const CHANNEL_HTML_FETCH_TIMEOUT_SECONDS = 20;
 const BROWSER_RECONNECT_REQUIRED_MESSAGE = 'Reconnect Kick browser and keep that window open to restore website-only reads.';
 
@@ -458,6 +459,41 @@ async function handleServiceRequest(line, state) {
       return;
     }
 
+    if (request?.command === 'fetch-recent-channel-slugs') {
+      const storedSession = await readKickSession(state.sessionFile);
+      if (!hasValidKickSession(storedSession)) {
+        await invalidateSavedSession(state.sessionFile, state.cookieFile);
+        await safeUpdateStatus(state.statusFile, 'IDLE', 'Kick session is missing or expired. Sign in again.', null);
+        throw new Error('Kick session is missing or expired. Sign in again.');
+      }
+
+      const session = await openServiceBridge(state, storedSession);
+      const { browser, context, page, browserProcess, ownsBrowserProcess } = session;
+
+      try {
+        const recentChannelSlugs = await fetchRecentChannelSlugsFromBrowser(page);
+        await persistServiceCookies(context, state.cookieFile);
+
+        writeProtocolLine({
+          id: requestId,
+          ok: true,
+          result: recentChannelSlugs
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Kick bridge failed to load recent browser channels.';
+
+        if (message.toLowerCase().includes('sign in again')) {
+          await invalidateSavedSession(state.sessionFile, state.cookieFile);
+          await safeUpdateStatus(state.statusFile, 'IDLE', message, null);
+        }
+
+        throw error;
+      } finally {
+        await closeBrowserBridge(page, browser, browserProcess, ownsBrowserProcess, session.ownsPage);
+      }
+      return;
+    }
+
     if (request?.command === 'fetch-channel-chat') {
       const chatRequest = normalizeChannelChatRequest({
         channelSlug: request.channelSlug,
@@ -795,6 +831,60 @@ async function fetchFollowedChannelsFromBrowser(page) {
   }
 
   return dedupeChannels(normalizeFollowedChannels(result.channels));
+}
+
+async function fetchRecentChannelSlugsFromBrowser(page) {
+  await ensureKickHomePage(page);
+  await dismissKickConsent(page);
+
+  return await page.evaluate(({ limit }) => {
+    const slugPattern = /^[a-z0-9](?:[a-z0-9_-]{1,63})$/i;
+    const recentChannels = new Map();
+
+    for (let index = 0; index < localStorage.length; index += 1) {
+      const key = localStorage.key(index);
+      if (!key || !key.startsWith('viewer_engagement:')) {
+        continue;
+      }
+
+      let payload = null;
+      try {
+        payload = JSON.parse(localStorage.getItem(key) || 'null');
+      } catch {
+        continue;
+      }
+
+      const channels = payload?.channels;
+      if (!channels || typeof channels !== 'object' || Array.isArray(channels)) {
+        continue;
+      }
+
+      for (const [rawSlug, entry] of Object.entries(channels)) {
+        const channelSlug = String(rawSlug || '').trim().toLowerCase();
+        if (!slugPattern.test(channelSlug)) {
+          continue;
+        }
+
+        const parsedLastSeenAt = Number(entry?.lastSeenAt);
+        const lastSeenAt = Number.isFinite(parsedLastSeenAt) ? parsedLastSeenAt : 0;
+        const existing = recentChannels.get(channelSlug);
+
+        if (!existing || lastSeenAt > existing.lastSeenAt) {
+          recentChannels.set(channelSlug, {
+            channelSlug,
+            lastSeenAt
+          });
+        }
+      }
+    }
+
+    return Array.from(recentChannels.values())
+      .sort((left, right) => (right.lastSeenAt - left.lastSeenAt) || left.channelSlug.localeCompare(right.channelSlug))
+      .slice(0, limit)
+      .map((entry) => entry.channelSlug);
+  }, {
+    limit: RECENT_CHANNELS_LIMIT
+  }).catch(() => []);
 }
 
 async function fetchFollowedChannelsFromDom(page) {

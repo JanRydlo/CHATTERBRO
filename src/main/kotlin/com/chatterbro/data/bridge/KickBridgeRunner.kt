@@ -5,6 +5,7 @@ import com.chatterbro.domain.model.ChannelChatRequest
 import com.chatterbro.domain.model.FollowedChannel
 import kotlinx.serialization.DeserializationStrategy
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -135,27 +136,19 @@ class KickBridgeRunner(
     }
 
     fun fetchLiveFollowedChannels(): List<FollowedChannel> {
-        return try {
-            invokeServiceCommand(
-                command = "fetch-live-following",
-                payload = emptyMap(),
-                deserializer = ListSerializer(FollowedChannel.serializer()),
-            )
-        } catch (exception: IllegalStateException) {
-            val cachedChannels = readCachedFollowedChannels()
-            if (cachedChannels.isEmpty() || !isRecoverableFollowingsFailure(exception.message)) {
-                throw exception
-            }
+        return invokeServiceCommand(
+            command = "fetch-live-following",
+            payload = emptyMap(),
+            deserializer = ListSerializer(FollowedChannel.serializer()),
+        )
+    }
 
-            statusStore.writeStatus(
-                statusStore.readStatus().copy(
-                    state = BridgeState.READY,
-                    message = "Kick blocked the latest followings refresh. Using the last cached live followings until the next successful sync.",
-                ),
-            )
-
-            cachedChannels
-        }
+    fun fetchRecentChannelSlugs(): List<String> {
+        return invokeServiceCommand(
+            command = "fetch-recent-channel-slugs",
+            payload = emptyMap(),
+            deserializer = ListSerializer(String.serializer()),
+        )
     }
 
     fun fetchChannelChat(request: ChannelChatRequest): ChannelChat {
@@ -364,26 +357,6 @@ class KickBridgeRunner(
                 exception,
             )
         }
-    }
-
-    private fun readCachedFollowedChannels(): List<FollowedChannel> {
-        if (!paths.outputFile.exists()) {
-            return emptyList()
-        }
-
-        return runCatching {
-            json.decodeFromString(
-                ListSerializer(FollowedChannel.serializer()),
-                paths.outputFile.readText(),
-            )
-        }.getOrDefault(emptyList())
-    }
-
-    private fun isRecoverableFollowingsFailure(message: String?): Boolean {
-        val normalizedMessage = message?.lowercase().orEmpty()
-        return normalizedMessage.contains("security policy")
-            || normalizedMessage.contains("timed out")
-            || normalizedMessage.contains("failed while loading followings")
     }
 
     private fun persistCachedChannelChat(chat: ChannelChat) {

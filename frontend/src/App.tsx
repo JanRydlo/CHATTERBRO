@@ -1,6 +1,6 @@
 import Pusher, { type Options as PusherOptions } from 'pusher-js';
 import { Fragment, type ReactNode, startTransition, useEffect, useEffectEvent, useRef, useState } from 'react';
-import { fetchChannelChat, fetchChannelChatEmotes, fetchGlobalChatEmotes, fetchLiveFollowedChannels, fetchTrackedChannels, getBridgeStatus, getOAuthLoginUrl, sendChannelChatMessage, startBridge } from './api';
+import { fetchChannelChat, fetchChannelChatEmotes, fetchGlobalChatEmotes, fetchLiveFollowedChannels, fetchRecentChannelSlugs, fetchTrackedChannels, getBridgeStatus, getOAuthLoginUrl, sendChannelChatMessage, startBridge } from './api';
 import { KNOWN_KICK_BADGE_IMAGE_URLS_BY_KIND, KNOWN_KICK_CHANNEL_BADGE_IMAGE_URLS_BY_SLUG } from './knownKickBadgeAssets';
 import type { ChannelChat, ChannelChatBadge, ChannelChatEmote, ChannelChatEmoteCatalog, ChannelChatMessage, ChannelChatSender, FollowedChannel, KickBridgeStatus } from './types';
 
@@ -42,7 +42,7 @@ const INVISIBLE_EXTERNAL_EMOTE_PATTERN = /[\u200B-\u200D\uFEFF\u00AD\u{E0000}-\u
 const KICK_PLACEHOLDER_PATTERN = /\[emote:(\d+):([^\]]+)\]/g;
 const KICK_PLACEHOLDER_DETECTION_PATTERN = /\[emote:\d+:[^\]]+\]/;
 const SECURITY_POLICY_BLOCKED_PATTERN = /security policy|request blocked by security policy/i;
-const BROWSER_RECONNECT_REQUIRED_PATTERN = /reconnect kick browser|browser sync is not running|sign in again|rejected the saved session|security policy/i;
+const BROWSER_RECONNECT_REQUIRED_PATTERN = /reconnect kick browser|browser sync is not running|sign in again|rejected the saved session/i;
 const TOKEN_ONLY_ACTIVITY_MESSAGE = 'Kick OAuth is connected. Token-only mode is active. No Kick browser will be kept running in the background.';
 const TOKEN_ONLY_FOLLOWINGS_MESSAGE = 'Live followings are not available through Kick Public API in OAuth-only mode.';
 const TOKEN_ONLY_CHAT_MESSAGE = 'Chat history is not available through Kick Public API in OAuth-only mode.';
@@ -80,6 +80,14 @@ function isSecurityPolicyBlockedMessage(value: string | null | undefined) {
   return Boolean(value && SECURITY_POLICY_BLOCKED_PATTERN.test(value));
 }
 
+function isFollowingsSecurityPolicyStatusMessage(value: string | null | undefined) {
+  return Boolean(
+    value
+      && /failed while loading followings/i.test(value)
+      && SECURITY_POLICY_BLOCKED_PATTERN.test(value)
+  );
+}
+
 function parseTrackedChannelSlugs(value: string) {
   return [...new Set(
     value
@@ -89,8 +97,93 @@ function parseTrackedChannelSlugs(value: string) {
   )];
 }
 
+function mergeTrackedChannelSlugLists(...channelSlugLists: string[][]) {
+  return [...new Set(
+    channelSlugLists
+      .flatMap((channelSlugs) => channelSlugs)
+      .map((entry) => entry.trim().toLowerCase())
+      .filter((entry) => entry.length > 0)
+  )];
+}
+
 function serializeTrackedChannelSlugs(channelSlugs: string[]) {
   return channelSlugs.join(', ');
+}
+
+function formatFollowingsSecurityPolicyFallbackActivity(trackedChannelCount: number, liveTrackedChannelsCount: number) {
+  if (trackedChannelCount === 0) {
+    return 'Kick blocked live followings in the current website session. Chatterbro could not seed the local watchlist from recent Kick browser channels, so add channel slugs below or reconnect the Kick browser to retry followings.';
+  }
+
+  if (liveTrackedChannelsCount === 0) {
+    return 'Kick blocked live followings in the current website session. Your local watchlist loaded successfully, but none of its channels are live right now.';
+  }
+
+  return `Kick blocked live followings in the current website session. Loaded ${liveTrackedChannelsCount} live tracked channel${liveTrackedChannelsCount === 1 ? '' : 's'} from your local watchlist.`;
+}
+
+function formatRecentChannelsImportActivity(importedChannelCount: number, liveTrackedChannelsCount: number) {
+  if (liveTrackedChannelsCount === 0) {
+    return `Kick blocked live followings in the current website session. Imported ${importedChannelCount} recent channel${importedChannelCount === 1 ? '' : 's'} from your Kick browser profile into the local watchlist, but none are live right now.`;
+  }
+
+  return `Kick blocked live followings in the current website session. Imported ${importedChannelCount} recent channel${importedChannelCount === 1 ? '' : 's'} from your Kick browser profile into the local watchlist and loaded ${liveTrackedChannelsCount} live channel${liveTrackedChannelsCount === 1 ? '' : 's'}.`;
+}
+
+function formatFollowingsSecurityPolicySessionStatus(trackedChannelCount: number) {
+  return trackedChannelCount === 0
+    ? 'Kick browser sync is connected, but Kick blocked the latest live followings read for this website session. Chatterbro will try to seed the local watchlist from recent browser channels, or you can add tracked channel slugs and retry.'
+    : 'Kick browser sync is connected, but Kick blocked the latest live followings read for this website session. Chatterbro is using your local watchlist for channel discovery until you refresh channels or reconnect the Kick browser.';
+}
+
+function getTokenOnlyLiveCountLabel({
+  isAuthenticated,
+  profile,
+  hasChannelDiscoverySource,
+  browserChatEnabled,
+  followingsBlockedBySecurityPolicy,
+  trackedChannelCount,
+  liveTrackedChannelsCount,
+}: {
+  isAuthenticated: boolean;
+  profile: KickBridgeStatus['profile'];
+  hasChannelDiscoverySource: boolean;
+  browserChatEnabled: boolean;
+  followingsBlockedBySecurityPolicy: boolean;
+  trackedChannelCount: number;
+  liveTrackedChannelsCount: number;
+}) {
+  if (!isAuthenticated || !profile) {
+    return 'Sign in to activate Kick token-only mode.';
+  }
+
+  if (!hasChannelDiscoverySource) {
+    return 'Enable the Kick browser sync once or add tracked channel slugs to start loading channels.';
+  }
+
+  if (followingsBlockedBySecurityPolicy) {
+    if (trackedChannelCount === 0) {
+      return 'Kick blocked live followings in the current website session. Chatterbro will try to seed tracked channels from your Kick browser profile, or you can reconnect the browser and retry.';
+    }
+
+    return liveTrackedChannelsCount === 0
+      ? `Kick followings are temporarily blocked. None of your ${trackedChannelCount} tracked channel${trackedChannelCount === 1 ? '' : 's'} are live right now.`
+      : `Kick followings are temporarily blocked. ${liveTrackedChannelsCount} tracked channel${liveTrackedChannelsCount === 1 ? '' : 's'} from your local watchlist are live right now.`;
+  }
+
+  if (liveTrackedChannelsCount === 0) {
+    return browserChatEnabled
+      ? trackedChannelCount === 0
+        ? `No live followings are online for ${profile.username} right now.`
+        : 'No live followed or tracked channels are online right now.'
+      : `No tracked channels are live right now across ${trackedChannelCount} saved slug${trackedChannelCount === 1 ? '' : 's'}.`;
+  }
+
+  return browserChatEnabled
+    ? trackedChannelCount === 0
+      ? `${liveTrackedChannelsCount} live following channel${liveTrackedChannelsCount === 1 ? '' : 's'} are live right now.`
+      : `${liveTrackedChannelsCount} live channel${liveTrackedChannelsCount === 1 ? '' : 's'} are live right now across your followings and watchlist.`
+    : `${liveTrackedChannelsCount} tracked channel${liveTrackedChannelsCount === 1 ? '' : 's'} are live right now.`;
 }
 
 function buildTokenOnlyChatShell(channel: FollowedChannel): ChannelChat {
@@ -1215,7 +1308,7 @@ function mergeOpenChatTabChannel(currentChannel: FollowedChannel, nextChannel: F
   return {
     channelSlug: nextChannel.channelSlug || currentChannel.channelSlug,
     displayName: nextChannel.displayName || currentChannel.displayName,
-    isLive: currentChannel.isLive || nextChannel.isLive,
+    isLive: nextChannel.isLive,
     channelUrl: nextChannel.channelUrl || currentChannel.channelUrl,
     chatUrl: nextChannel.chatUrl || currentChannel.chatUrl,
     thumbnailUrl: nextChannel.thumbnailUrl ?? currentChannel.thumbnailUrl,
@@ -1352,6 +1445,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [activity, setActivity] = useState('Kick token mode is idle. Connect Kick once and the app will keep using the saved token until it expires.');
   const [requiresBrowserReconnect, setRequiresBrowserReconnect] = useState(false);
+  const [followingsBlockedBySecurityPolicy, setFollowingsBlockedBySecurityPolicy] = useState(false);
   const [lastLoadedUsername, setLastLoadedUsername] = useState('');
   const openChatTabsRef = useRef<OpenChatTabStateRecord>({});
   const openChatRefreshInFlightRef = useRef(new Set<string>());
@@ -1405,6 +1499,12 @@ export default function App() {
 
     window.localStorage.setItem(TRACKED_CHANNELS_STORAGE_KEY, serializeTrackedChannelSlugs(trackedChannelSlugs));
   }, [trackedChannelSlugs]);
+
+  useEffect(() => {
+    if (!bridgeStatus.hasBrowserSession) {
+      setFollowingsBlockedBySecurityPolicy(false);
+    }
+  }, [bridgeStatus.hasBrowserSession]);
 
   async function preloadGlobalEmotes() {
     try {
@@ -1616,22 +1716,17 @@ export default function App() {
   const chatDraft = activeChatTab?.draft ?? '';
   const liveTrackedChannelsCount = channels.filter((channel) => channel.isLive).length;
   const hasChannelDiscoverySource = browserChatEnabled || trackedChannelSlugs.length > 0;
+  const followingsSecurityPolicyActive = followingsBlockedBySecurityPolicy || isFollowingsSecurityPolicyStatusMessage(bridgeStatus.message);
   const liveCountLabel = tokenOnlyMode
-    ? !isAuthenticated || !profile
-      ? 'Sign in to activate Kick token-only mode.'
-      : !hasChannelDiscoverySource
-        ? 'Enable the Kick browser sync once or add tracked channel slugs to start loading channels.'
-        : liveTrackedChannelsCount === 0
-          ? bridgeStatus.hasBrowserSession
-            ? trackedChannelSlugs.length === 0
-              ? `No live followings are online for ${profile.username} right now.`
-              : 'No live followed or tracked channels are online right now.'
-            : `No tracked channels are live right now across ${trackedChannelSlugs.length} saved slug${trackedChannelSlugs.length === 1 ? '' : 's'}.`
-          : bridgeStatus.hasBrowserSession
-            ? trackedChannelSlugs.length === 0
-              ? `${liveTrackedChannelsCount} live following channel${liveTrackedChannelsCount === 1 ? '' : 's'} are live right now.`
-              : `${liveTrackedChannelsCount} live channel${liveTrackedChannelsCount === 1 ? '' : 's'} are live right now across your followings and watchlist.`
-            : `${liveTrackedChannelsCount} tracked channel${liveTrackedChannelsCount === 1 ? '' : 's'} are live right now.`
+    ? getTokenOnlyLiveCountLabel({
+        isAuthenticated,
+        profile,
+        hasChannelDiscoverySource,
+        browserChatEnabled,
+        followingsBlockedBySecurityPolicy: followingsSecurityPolicyActive,
+        trackedChannelCount: trackedChannelSlugs.length,
+        liveTrackedChannelsCount,
+      })
     : !lastLoadedUsername
       ? isAuthenticated && profile
         ? `No live followings loaded for ${profile.username} yet.`
@@ -1644,6 +1739,10 @@ export default function App() {
     : 'No Kick token stored';
   const needsBrowserSync = bridgeStatus.oauthEnabled && isAuthenticated && !browserChatEnabled;
   const showReconnectBrowserAction = isAuthenticated && requiresBrowserReconnect;
+  const showFollowingsRecoveryAction = isAuthenticated && followingsSecurityPolicyActive && !showReconnectBrowserAction;
+  const sessionStatusMessage = followingsSecurityPolicyActive
+    ? formatFollowingsSecurityPolicySessionStatus(trackedChannelSlugs.length)
+    : bridgeStatus.message;
   const activeEmoteCacheKey = channelChat
     ? getChannelEmoteCacheKey(channelChat.channelSlug, channelChat.channelUserId)
     : null;
@@ -2170,6 +2269,7 @@ export default function App() {
       startTransition(() => {
         setBridgeStatus(nextStatus);
         setRequiresBrowserReconnect(false);
+        setFollowingsBlockedBySecurityPolicy(false);
         setActivity(
           forceReconnect
             ? nextStatus.state === 'READY'
@@ -2204,6 +2304,7 @@ export default function App() {
       startTransition(() => {
         setBridgeStatus(nextStatus);
         setRequiresBrowserReconnect(false);
+        setFollowingsBlockedBySecurityPolicy(false);
       });
     } catch (caughtError) {
       setError(caughtError instanceof Error ? caughtError.message : 'Failed to start the Kick website session sync.');
@@ -2241,8 +2342,8 @@ export default function App() {
     }
   }
 
-  async function loadAvailableChannels(options: { silent?: boolean } = {}) {
-    const { silent = false } = options;
+  async function loadAvailableChannels(options: { silent?: boolean; forceFollowingsRetry?: boolean } = {}) {
+    const { silent = false, forceFollowingsRetry = false } = options;
 
     if (!isAuthenticated || !profile) {
       if (!silent) {
@@ -2268,8 +2369,9 @@ export default function App() {
     }
 
     try {
+      const shouldLoadLiveFollowings = browserChatEnabled && (!followingsBlockedBySecurityPolicy || forceFollowingsRetry);
       const [followedChannelsResult, trackedChannelsResult] = await Promise.allSettled([
-        browserChatEnabled
+        shouldLoadLiveFollowings
           ? fetchLiveFollowedChannels()
           : Promise.resolve<FollowedChannel[]>([]),
         trackedChannelSlugs.length > 0
@@ -2280,9 +2382,10 @@ export default function App() {
       const followedChannels = followedChannelsResult.status === 'fulfilled'
         ? followedChannelsResult.value
         : [];
-      const trackedChannels = trackedChannelsResult.status === 'fulfilled'
+      let trackedChannels = trackedChannelsResult.status === 'fulfilled'
         ? trackedChannelsResult.value
         : [];
+      let effectiveTrackedChannelSlugs = trackedChannelSlugs;
 
       if (followedChannelsResult.status === 'rejected' && trackedChannelsResult.status === 'rejected') {
         throw followedChannelsResult.reason instanceof Error
@@ -2292,16 +2395,50 @@ export default function App() {
             : new Error('Failed to load Kick channels.');
       }
 
-      const loadedChannels = mergeDiscoveredChannels(followedChannels, trackedChannels, trackedChannelSlugs);
-      const nextLiveTrackedChannelsCount = loadedChannels.filter((channel) => channel.isLive).length;
       const hasFollowedChannelsFailure = followedChannelsResult.status === 'rejected';
-      const hasTrackedChannelsFailure = trackedChannelsResult.status === 'rejected';
-      const followedChannelsErrorMessage = hasFollowedChannelsFailure && followedChannelsResult.reason instanceof Error
+      const followedChannelsErrorMessage = followedChannelsResult.status === 'rejected' && followedChannelsResult.reason instanceof Error
         ? followedChannelsResult.reason.message
         : null;
-      const trackedChannelsErrorMessage = hasTrackedChannelsFailure && trackedChannelsResult.reason instanceof Error
+      let hasTrackedChannelsFailure = trackedChannelsResult.status === 'rejected';
+      let trackedChannelsErrorMessage = trackedChannelsResult.status === 'rejected' && trackedChannelsResult.reason instanceof Error
         ? trackedChannelsResult.reason.message
         : null;
+      const followedChannelsSecurityPolicyBlocked = isSecurityPolicyBlockedMessage(followedChannelsErrorMessage);
+      let autoImportedRecentChannelSlugs: string[] = [];
+
+      if (browserChatEnabled && followedChannelsSecurityPolicyBlocked && trackedChannelSlugs.length === 0) {
+        try {
+          const recentChannelSlugs = mergeTrackedChannelSlugLists(await fetchRecentChannelSlugs());
+          if (recentChannelSlugs.length > 0) {
+            autoImportedRecentChannelSlugs = recentChannelSlugs;
+            effectiveTrackedChannelSlugs = recentChannelSlugs;
+            trackedChannels = await fetchTrackedChannels(recentChannelSlugs);
+            hasTrackedChannelsFailure = false;
+            trackedChannelsErrorMessage = null;
+
+            startTransition(() => {
+              setTrackedChannelSlugs((currentTrackedChannelSlugs) => currentTrackedChannelSlugs.length > 0
+                ? currentTrackedChannelSlugs
+                : recentChannelSlugs);
+            });
+          }
+        } catch (caughtError) {
+          if (!hasTrackedChannelsFailure) {
+            hasTrackedChannelsFailure = true;
+            trackedChannelsErrorMessage = caughtError instanceof Error
+              ? caughtError.message
+              : 'Failed to load recent Kick browser channels.';
+          }
+        }
+      }
+
+      const loadedChannels = mergeDiscoveredChannels(followedChannels, trackedChannels, effectiveTrackedChannelSlugs);
+      const nextLiveTrackedChannelsCount = loadedChannels.filter((channel) => channel.isLive).length;
+      const watchlistFallbackMode = browserChatEnabled && (followingsBlockedBySecurityPolicy || followedChannelsSecurityPolicyBlocked) && followedChannels.length === 0;
+
+      if (shouldLoadLiveFollowings) {
+        setFollowingsBlockedBySecurityPolicy(followedChannelsSecurityPolicyBlocked);
+      }
 
       if (followedChannelsErrorMessage && isBrowserReconnectRequiredMessage(followedChannelsErrorMessage)) {
         setRequiresBrowserReconnect(true);
@@ -2314,17 +2451,21 @@ export default function App() {
 
         if (!silent) {
           setActivity(
-            hasFollowedChannelsFailure && followedChannels.length === 0 && trackedChannels.length > 0
-              ? `Loaded your local watchlist, but live followings were unavailable: ${followedChannelsErrorMessage}`
+            autoImportedRecentChannelSlugs.length > 0
+              ? formatRecentChannelsImportActivity(autoImportedRecentChannelSlugs.length, nextLiveTrackedChannelsCount)
+              : watchlistFallbackMode
+                ? formatFollowingsSecurityPolicyFallbackActivity(effectiveTrackedChannelSlugs.length, nextLiveTrackedChannelsCount)
+              : hasFollowedChannelsFailure && followedChannels.length === 0 && trackedChannels.length > 0
+                ? `Loaded your local watchlist, but live followings were unavailable: ${followedChannelsErrorMessage}`
               : hasTrackedChannelsFailure && followedChannels.length > 0
                 ? `Loaded ${followedChannels.length} live following channel${followedChannels.length === 1 ? '' : 's'}. Extra watchlist entries were unavailable: ${trackedChannelsErrorMessage}`
                 : nextLiveTrackedChannelsCount === 0
                   ? browserChatEnabled
-                    ? trackedChannelSlugs.length > 0
+                    ? effectiveTrackedChannelSlugs.length > 0
                       ? 'No live followed or tracked channels are online right now.'
                       : `No live followings found for ${profile.username}.`
-                    : `None of your ${trackedChannelSlugs.length} tracked channels are live right now.`
-                  : browserChatEnabled && trackedChannelSlugs.length > 0
+                    : `None of your ${effectiveTrackedChannelSlugs.length} tracked channels are live right now.`
+                  : browserChatEnabled && effectiveTrackedChannelSlugs.length > 0
                     ? `Loaded ${nextLiveTrackedChannelsCount} live channel${nextLiveTrackedChannelsCount === 1 ? '' : 's'} across your followings and watchlist.`
                     : browserChatEnabled
                       ? `Loaded ${nextLiveTrackedChannelsCount} live following channel${nextLiveTrackedChannelsCount === 1 ? '' : 's'} for ${profile.username}.`
@@ -2359,7 +2500,7 @@ export default function App() {
     }
 
     if (tokenOnlyMode) {
-      await loadAvailableChannels();
+      await loadAvailableChannels({ forceFollowingsRetry: true });
       return;
     }
 
@@ -2805,6 +2946,14 @@ export default function App() {
                     ? 'Waiting for Kick browser reconnect...'
                     : 'Reconnect Kick browser'}
               </button>
+            ) : showFollowingsRecoveryAction ? (
+              <button className="primary-button" onClick={() => void handleStartBridge(true)} disabled={isStartingBridge || bridgeStatus.state === 'RUNNING'}>
+                {isStartingBridge
+                  ? 'Opening Kick browser reconnect...'
+                  : bridgeStatus.state === 'RUNNING'
+                    ? 'Waiting for Kick browser reconnect...'
+                    : 'Reconnect Kick browser'}
+              </button>
             ) : null}
             <button className="secondary-button" onClick={handleLoadChannels} disabled={isLoadingChannels || !isAuthenticated || (tokenOnlyMode && !hasChannelDiscoverySource && !needsBrowserSync)}>
               {tokenOnlyMode
@@ -2830,7 +2979,7 @@ export default function App() {
 
           <div className="message-strip subtle-strip">
             <strong>{tokenOnlyMode ? 'Session status' : 'Bridge status'}</strong>
-            <p>{bridgeStatus.message}</p>
+            <p>{sessionStatusMessage}</p>
           </div>
 
           {isAuthenticated ? (
@@ -2847,10 +2996,17 @@ export default function App() {
             </div>
           ) : null}
 
+          {tokenOnlyMode && isAuthenticated && followingsSecurityPolicyActive ? (
+            <div className="message-strip subtle-strip">
+              <strong>Followings fallback</strong>
+              <p>Kick blocked the current website followings read for the saved browser session. Chatterbro will first try to seed your local watchlist from recent channels saved in the Kick browser profile, then use that watchlist for channel discovery. Press Refresh channels to retry followings, or reconnect the Kick browser for a clean website session.</p>
+            </div>
+          ) : null}
+
           {tokenOnlyMode && isAuthenticated ? (
             <div className="message-strip subtle-strip">
               <strong>Live chat sync</strong>
-              <p>{browserChatEnabled ? 'Browser sync is connected. Live followings can refresh automatically, and opening any live channel will load a chat snapshot before switching into realtime updates.' : 'Click Enable followings and live chat sync once, finish the Kick website login there, keep that browser open, then open chat on any live channel.'}</p>
+              <p>{followingsSecurityPolicyActive ? 'Browser sync is still connected for chat reads, but Kick is currently blocking live followings in that website session. Reconnect the Kick browser to retry followings, or keep using tracked channels from the local watchlist.' : browserChatEnabled ? 'Browser sync is connected. Live followings can refresh automatically, and opening any live channel will load a chat snapshot before switching into realtime updates.' : 'Click Enable followings and live chat sync once, finish the Kick website login there, keep that browser open, then open chat on any live channel.'}</p>
             </div>
           ) : null}
 
@@ -2914,8 +3070,8 @@ export default function App() {
 
         {channels.length === 0 ? (
           <div className="empty-state">
-            <p>{tokenOnlyMode ? 'No followed or tracked channels are loaded yet.' : 'No tracked channels are loaded yet.'}</p>
-            <span>{tokenOnlyMode ? 'Enable the browser sync to load your live followings, or add one or more channel slugs above to extend the local watchlist.' : 'Once your Kick session is connected, this panel will list every live followed channel returned by the backend.'}</span>
+            <p>{tokenOnlyMode ? followingsSecurityPolicyActive ? trackedChannelSlugs.length === 0 ? 'Live followings are temporarily unavailable.' : 'No live tracked channels are loaded right now.' : 'No followed or tracked channels are loaded yet.' : 'No tracked channels are loaded yet.'}</p>
+            <span>{tokenOnlyMode ? followingsSecurityPolicyActive ? trackedChannelSlugs.length === 0 ? 'Kick blocked the website followings read for the current browser session. Chatterbro will try to seed the local watchlist from recent channels saved in your Kick browser profile. If nothing appears, add one or more channel slugs above or reconnect the Kick browser and retry followings.' : 'Kick blocked the website followings read for the current browser session. Chatterbro is using your local watchlist instead, but none of those channels are live right now.' : 'Enable the browser sync to load your live followings, or add one or more channel slugs above to extend the local watchlist.' : 'Once your Kick session is connected, this panel will list every live followed channel returned by the backend.'}</span>
           </div>
         ) : (
           <div className="channel-grid">
