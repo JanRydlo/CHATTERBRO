@@ -2,7 +2,8 @@ import Pusher, { type Options as PusherOptions } from 'pusher-js';
 import { Fragment, type KeyboardEvent, type ReactNode, startTransition, useEffect, useEffectEvent, useRef, useState } from 'react';
 import { fetchChannelChat, fetchChannelChatEmotes, fetchGlobalChatEmotes, fetchLiveFollowedChannels, fetchRecentChannelSlugs, fetchTrackedChannels, getBridgeStatus, getOAuthLoginUrl, sendChannelChatMessage, startBridge } from './api';
 import { KNOWN_KICK_BADGE_IMAGE_URLS_BY_KIND, KNOWN_KICK_CHANNEL_BADGE_IMAGE_URLS_BY_SLUG } from './knownKickBadgeAssets';
-import type { ChannelChat, ChannelChatBadge, ChannelChatEmote, ChannelChatEmoteCatalog, ChannelChatMessage, ChannelChatSender, FollowedChannel, KickBridgeStatus } from './types';
+import { TwitchPanel } from './TwitchPanel';
+import type { ChannelChat, ChannelChatBadge, ChannelChatEmote, ChannelChatEmoteCatalog, ChannelChatMessage, ChannelChatSender, ChatProvider, FollowedChannel, KickBridgeStatus } from './types';
 
 const FALLBACK_STATUS: KickBridgeStatus = {
   state: 'IDLE',
@@ -213,6 +214,7 @@ function getTokenOnlyLiveCountLabel({
 
 function buildTokenOnlyChatShell(channel: FollowedChannel): ChannelChat {
   return {
+    provider: channel.provider,
     channelSlug: channel.channelSlug,
     channelId: channel.channelId,
     channelUserId: channel.broadcasterUserId,
@@ -296,6 +298,7 @@ function mergeDiscoveredChannel(currentChannel: FollowedChannel | undefined, nex
   }
 
   return {
+    provider: nextChannel.provider,
     channelSlug: nextChannel.channelSlug || currentChannel.channelSlug,
     displayName: nextChannel.displayName || currentChannel.displayName,
     isLive: currentChannel.isLive || nextChannel.isLive,
@@ -1483,6 +1486,7 @@ function createOpenChatTabState(channel: FollowedChannel): OpenChatTabState {
 
 function mergeOpenChatTabChannel(currentChannel: FollowedChannel, nextChannel: FollowedChannel): FollowedChannel {
   return {
+    provider: nextChannel.provider,
     channelSlug: nextChannel.channelSlug || currentChannel.channelSlug,
     displayName: nextChannel.displayName || currentChannel.displayName,
     isLive: nextChannel.isLive,
@@ -1608,6 +1612,10 @@ function appendRealtimeChatMessageToTabs(
 }
 
 export default function App() {
+  const [activeProvider, setActiveProvider] = useState<ChatProvider>(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('provider') === 'twitch' ? 'twitch' : 'kick';
+  });
   const [bridgeStatus, setBridgeStatus] = useState<KickBridgeStatus>(FALLBACK_STATUS);
   const [channels, setChannels] = useState<FollowedChannel[]>([]);
   const [trackedChannelSlugs, setTrackedChannelSlugs] = useState<string[]>([]);
@@ -1636,10 +1644,8 @@ export default function App() {
   const [emotePickerQuery, setEmotePickerQuery] = useState('');
 
   useEffect(() => {
-    void refreshBridgeStatus();
-    void preloadGlobalEmotes();
-
     const params = new URLSearchParams(window.location.search);
+    const authProvider = params.get('provider');
     const authResult = params.get('auth');
     const authMessage = params.get('message');
     const storedTrackedChannels = window.localStorage.getItem(TRACKED_CHANNELS_STORAGE_KEY);
@@ -1647,14 +1653,25 @@ export default function App() {
       setTrackedChannelSlugs(parseTrackedChannelSlugs(storedTrackedChannels));
     }
 
-    if (authResult === 'success') {
+    if (authProvider === 'twitch') {
+      setActiveProvider('twitch');
+    }
+
+    if (activeProvider !== 'kick') {
+      return;
+    }
+
+    void refreshBridgeStatus();
+    void preloadGlobalEmotes();
+
+    if (authProvider !== 'twitch' && authResult === 'success') {
       setActivity(authMessage || TOKEN_ONLY_ACTIVITY_MESSAGE);
       params.delete('auth');
       params.delete('message');
       const nextQuery = params.toString();
       window.history.replaceState({}, document.title, `${window.location.pathname}${nextQuery ? `?${nextQuery}` : ''}`);
       void refreshBridgeStatus();
-    } else if (authResult === 'error') {
+    } else if (authProvider !== 'twitch' && authResult === 'error') {
       setError(authMessage || 'Kick OAuth sign-in failed.');
       params.delete('auth');
       params.delete('message');
@@ -1669,7 +1686,7 @@ export default function App() {
     return () => {
       window.clearInterval(intervalId);
     };
-  }, []);
+  }, [activeProvider]);
 
   useEffect(() => {
     if (trackedChannelSlugs.length === 0) {
@@ -2020,15 +2037,15 @@ export default function App() {
   }).join('|');
 
   useEffect(() => {
-    if (!tokenOnlyMode || !isAuthenticated || !hasChannelDiscoverySource) {
+    if (activeProvider !== 'kick' || !tokenOnlyMode || !isAuthenticated || !hasChannelDiscoverySource) {
       return;
     }
 
     void loadAvailableChannels({ silent: channels.length > 0 });
-  }, [browserChatEnabled, channels.length, hasChannelDiscoverySource, isAuthenticated, tokenOnlyMode, trackedChannelSlugs]);
+  }, [activeProvider, browserChatEnabled, channels.length, hasChannelDiscoverySource, isAuthenticated, tokenOnlyMode, trackedChannelSlugs]);
 
   useEffect(() => {
-    if (!tokenOnlyMode || !isAuthenticated || !hasChannelDiscoverySource) {
+    if (activeProvider !== 'kick' || !tokenOnlyMode || !isAuthenticated || !hasChannelDiscoverySource) {
       return;
     }
 
@@ -2039,7 +2056,7 @@ export default function App() {
     return () => {
       window.clearInterval(intervalId);
     };
-  }, [browserChatEnabled, hasChannelDiscoverySource, isAuthenticated, tokenOnlyMode, trackedChannelSlugs]);
+  }, [activeProvider, browserChatEnabled, hasChannelDiscoverySource, isAuthenticated, tokenOnlyMode, trackedChannelSlugs]);
 
   useEffect(() => {
     if (!isAuthenticated) {
@@ -2117,7 +2134,7 @@ export default function App() {
   }, [channels, openChatTabSlugs]);
 
   useEffect(() => {
-    if (!isAuthenticated || openChatTabSlugs.length === 0) {
+    if (activeProvider !== 'kick' || !isAuthenticated || openChatTabSlugs.length === 0) {
       return;
     }
 
@@ -2346,10 +2363,10 @@ export default function App() {
       pusher.connection.unbind('error', handleConnectionError);
       pusher.disconnect();
     };
-  }, [activeChatTabSlug, browserChatEnabled, isAuthenticated, openChatTabSlugs, realtimeSubscriptionsKey]);
+  }, [activeChatTabSlug, activeProvider, browserChatEnabled, isAuthenticated, openChatTabSlugs, realtimeSubscriptionsKey]);
 
   useEffect(() => {
-    if (!channelChat?.channelSlug) {
+    if (activeProvider !== 'kick' || !channelChat?.channelSlug) {
       return;
     }
 
@@ -2382,7 +2399,7 @@ export default function App() {
         emoteRequestsInFlightRef.current.delete(cacheKey);
       }
     })();
-  }, [channelChat?.channelSlug, channelChat?.channelUserId, channelEmoteCache]);
+  }, [activeProvider, channelChat?.channelSlug, channelChat?.channelUserId, channelEmoteCache]);
 
   const refreshOpenChat = useEffectEvent(async (channelSlug: string, options: { forceFull?: boolean } = {}) => {
     if (!browserChatEnabled || !isAuthenticated) {
@@ -2445,7 +2462,7 @@ export default function App() {
   });
 
   useEffect(() => {
-    if (!browserChatEnabled || !isAuthenticated || !selectedChannelSlug || !activeChatTab?.chat || activeChatTab.isLoadingChat) {
+    if (activeProvider !== 'kick' || !browserChatEnabled || !isAuthenticated || !selectedChannelSlug || !activeChatTab?.chat || activeChatTab.isLoadingChat) {
       return;
     }
 
@@ -2461,7 +2478,7 @@ export default function App() {
 
     lastSnapshotEnrichmentAtRef.current.set(selectedChannelSlug, now);
     void refreshOpenChat(selectedChannelSlug, { forceFull: true });
-  }, [activeChatTab?.chat, activeChatTab?.isLoadingChat, browserChatEnabled, isAuthenticated, selectedChannelSlug]);
+  }, [activeChatTab?.chat, activeChatTab?.isLoadingChat, activeProvider, browserChatEnabled, isAuthenticated, selectedChannelSlug]);
 
   useEffect(() => {
     const feedElement = chatFeedRef.current;
@@ -3099,8 +3116,21 @@ export default function App() {
     );
   }
 
+  if (activeProvider === 'twitch') {
+    return <TwitchPanel onSelectProvider={setActiveProvider} />;
+  }
+
   return (
     <main className="page-shell">
+      <div className="provider-switcher">
+        <button className="primary-button" type="button" disabled>
+          Kick
+        </button>
+        <button className="secondary-button" type="button" onClick={() => setActiveProvider('twitch')}>
+          Twitch
+        </button>
+      </div>
+
       <section className="hero-panel">
         <div className="hero-copy">
           <p className="eyebrow">Chatterbro</p>

@@ -11,6 +11,10 @@ import com.chatterbro.data.remote.ChannelChatEmoteService
 import com.chatterbro.data.remote.KickPublicChannelMetadataResolver
 import com.chatterbro.data.remote.PlaywrightKickBridgeDataSource
 import com.chatterbro.data.repository.BridgeBackedKickRepository
+import com.chatterbro.data.twitch.TwitchApiService
+import com.chatterbro.data.twitch.TwitchOAuthConfig
+import com.chatterbro.data.twitch.TwitchOAuthService
+import com.chatterbro.data.twitch.TwitchPaths
 import com.chatterbro.domain.model.ChannelChat
 import com.chatterbro.domain.model.ChannelChatRequest
 import com.chatterbro.domain.model.FollowedChannel
@@ -52,6 +56,10 @@ fun Application.chatterbroModule() {
     val oauthConfig = KickOAuthConfig.fromEnvironment()
     val bridgeStatusStore = KickBridgeStatusStore(bridgePaths, oauthEnabled = oauthConfig != null)
     val oauthService = oauthConfig?.let { KickOAuthService(it, bridgePaths, bridgeStatusStore) }
+    val twitchPaths = TwitchPaths(rootDirectory)
+    val twitchOAuthConfig = TwitchOAuthConfig.fromEnvironment()
+    val twitchOAuthService = twitchOAuthConfig?.let { TwitchOAuthService(it, twitchPaths) }
+    val twitchApiService = twitchOAuthService?.let(::TwitchApiService)
     val bridgeRunner = KickBridgeRunner(bridgePaths, bridgeStatusStore)
     val remoteDataSource = PlaywrightKickBridgeDataSource(bridgeRunner, bridgeStatusStore, oauthService)
     val repository = BridgeBackedKickRepository(remoteDataSource)
@@ -89,6 +97,310 @@ fun Application.chatterbroModule() {
 
             get("/chat/emotes/global") {
                 call.respond(channelChatEmoteService.getGlobalEmotes())
+            }
+
+            route("/twitch") {
+                get("/auth/status") {
+                    call.respond(twitchOAuthService?.readStatus() ?: TwitchOAuthService.unconfiguredStatus())
+                }
+
+                get("/auth/login") {
+                    val service = twitchOAuthService
+                    if (service == null) {
+                        call.respondRedirect("/?provider=twitch&auth=error&message=Twitch%20OAuth%20is%20not%20configured.")
+                        return@get
+                    }
+
+                    call.respondRedirect(service.beginAuthorization())
+                }
+
+                get("/auth/callback") {
+                    val service = twitchOAuthService
+                    if (service == null) {
+                        call.respondRedirect("/?provider=twitch&auth=error&message=Twitch%20OAuth%20is%20not%20configured.")
+                        return@get
+                    }
+
+                    val error = call.parameters["error"]?.trim()
+                    if (!error.isNullOrBlank()) {
+                        val description = call.parameters["error_description"]?.trim().orEmpty().ifBlank { error }
+                        call.respondRedirect(service.buildFrontendRedirect(success = false, message = description))
+                        return@get
+                    }
+
+                    val code = call.parameters["code"]?.trim().orEmpty()
+                    val state = call.parameters["state"]?.trim().orEmpty()
+                    if (code.isBlank() || state.isBlank()) {
+                        call.respondRedirect(service.buildFrontendRedirect(success = false, message = "Twitch OAuth callback is missing code or state."))
+                        return@get
+                    }
+
+                    try {
+                        service.handleCallback(code, state)
+                        call.respondRedirect(service.buildFrontendRedirect(success = true, message = "Twitch OAuth connected successfully."))
+                    } catch (exception: IllegalStateException) {
+                        call.respondRedirect(service.buildFrontendRedirect(success = false, message = exception.message ?: "Twitch OAuth callback failed."))
+                    }
+                }
+
+                get("/following/live") {
+                    val service = twitchApiService
+                    if (service == null) {
+                        call.respond(HttpStatusCode.NotImplemented, ErrorResponse("Twitch OAuth is not configured."))
+                        return@get
+                    }
+
+                    try {
+                        call.respond(service.fetchLiveFollowedChannels())
+                    } catch (exception: IllegalStateException) {
+                        val message = exception.message ?: "Twitch failed to load followed channels."
+                        val statusCode = when {
+                            message.contains("scope", ignoreCase = true) -> HttpStatusCode.Forbidden
+                            message.contains("sign in", ignoreCase = true) ||
+                                message.contains("expired", ignoreCase = true) ||
+                                message.contains("token", ignoreCase = true) -> HttpStatusCode.Unauthorized
+                            else -> HttpStatusCode.BadGateway
+                        }
+
+                        call.respond(statusCode, ErrorResponse(message))
+                    }
+                }
+
+                get("/channels/live") {
+                    val service = twitchApiService
+                    if (service == null) {
+                        call.respond(HttpStatusCode.NotImplemented, ErrorResponse("Twitch OAuth is not configured."))
+                        return@get
+                    }
+
+                    val slugs = call.request.queryParameters
+                        .getAll("slug")
+                        .orEmpty()
+                        .flatMap { value -> value.split(',') }
+                        .map(String::trim)
+                        .filter(String::isNotBlank)
+                        .distinct()
+
+                    if (slugs.isEmpty()) {
+                        call.respond(HttpStatusCode.BadRequest, ErrorResponse("Add at least one channel slug."))
+                        return@get
+                    }
+
+                    try {
+                        call.respond(service.fetchTrackedChannelsBySlugs(slugs, liveOnly = true))
+                    } catch (exception: IllegalStateException) {
+                        val message = exception.message ?: "Twitch failed to load tracked live channels."
+                        val statusCode = when {
+                            message.contains("scope", ignoreCase = true) -> HttpStatusCode.Forbidden
+                            message.contains("sign in", ignoreCase = true) ||
+                                message.contains("expired", ignoreCase = true) ||
+                                message.contains("token", ignoreCase = true) -> HttpStatusCode.Unauthorized
+                            else -> HttpStatusCode.BadGateway
+                        }
+
+                        call.respond(statusCode, ErrorResponse(message))
+                    }
+                }
+
+                get("/channels/tracked") {
+                    val service = twitchApiService
+                    if (service == null) {
+                        call.respond(HttpStatusCode.NotImplemented, ErrorResponse("Twitch OAuth is not configured."))
+                        return@get
+                    }
+
+                    val slugs = call.request.queryParameters
+                        .getAll("slug")
+                        .orEmpty()
+                        .flatMap { value -> value.split(',') }
+                        .map(String::trim)
+                        .filter(String::isNotBlank)
+                        .distinct()
+
+                    if (slugs.isEmpty()) {
+                        call.respond(HttpStatusCode.BadRequest, ErrorResponse("Add at least one channel slug."))
+                        return@get
+                    }
+
+                    try {
+                        call.respond(service.fetchTrackedChannelsBySlugs(slugs))
+                    } catch (exception: IllegalStateException) {
+                        val message = exception.message ?: "Twitch failed to load tracked channels."
+                        val statusCode = when {
+                            message.contains("scope", ignoreCase = true) -> HttpStatusCode.Forbidden
+                            message.contains("sign in", ignoreCase = true) ||
+                                message.contains("expired", ignoreCase = true) ||
+                                message.contains("token", ignoreCase = true) -> HttpStatusCode.Unauthorized
+                            else -> HttpStatusCode.BadGateway
+                        }
+
+                        call.respond(statusCode, ErrorResponse(message))
+                    }
+                }
+
+                get("/chat/emotes/global") {
+                    val service = twitchApiService
+                    if (service == null) {
+                        call.respond(HttpStatusCode.NotImplemented, ErrorResponse("Twitch OAuth is not configured."))
+                        return@get
+                    }
+
+                    try {
+                        call.respond(service.getGlobalEmotes())
+                    } catch (exception: IllegalStateException) {
+                        val message = exception.message ?: "Twitch failed to load global emotes."
+                        val statusCode = when {
+                            message.contains("scope", ignoreCase = true) -> HttpStatusCode.Forbidden
+                            message.contains("sign in", ignoreCase = true) ||
+                                message.contains("expired", ignoreCase = true) ||
+                                message.contains("token", ignoreCase = true) -> HttpStatusCode.Unauthorized
+                            else -> HttpStatusCode.BadGateway
+                        }
+
+                        call.respond(statusCode, ErrorResponse(message))
+                    }
+                }
+
+                get("/chat/{channelSlug}/emotes") {
+                    val service = twitchApiService
+                    if (service == null) {
+                        call.respond(HttpStatusCode.NotImplemented, ErrorResponse("Twitch OAuth is not configured."))
+                        return@get
+                    }
+
+                    val channelSlug = call.parameters["channelSlug"]?.trim().orEmpty()
+                    if (channelSlug.isBlank()) {
+                        call.respond(HttpStatusCode.BadRequest, ErrorResponse("Channel slug is required."))
+                        return@get
+                    }
+
+                    val rawChannelUserId = call.request.queryParameters["channelUserId"]?.trim()
+                    val channelUserId = rawChannelUserId
+                        ?.takeIf { it.isNotBlank() }
+                        ?.toLongOrNull()
+
+                    if (!rawChannelUserId.isNullOrBlank() && channelUserId == null) {
+                        call.respond(HttpStatusCode.BadRequest, ErrorResponse("Channel user id must be a number."))
+                        return@get
+                    }
+
+                    try {
+                        call.respond(service.getChannelEmotes(channelSlug, channelUserId))
+                    } catch (exception: IllegalStateException) {
+                        val message = exception.message ?: "Twitch failed to load channel emotes."
+                        val statusCode = when {
+                            message.contains("scope", ignoreCase = true) -> HttpStatusCode.Forbidden
+                            message.contains("sign in", ignoreCase = true) ||
+                                message.contains("expired", ignoreCase = true) ||
+                                message.contains("token", ignoreCase = true) -> HttpStatusCode.Unauthorized
+                            else -> HttpStatusCode.BadGateway
+                        }
+
+                        call.respond(statusCode, ErrorResponse(message))
+                    }
+                }
+
+                get("/chat/{channelSlug}") {
+                    val service = twitchApiService
+                    if (service == null) {
+                        call.respond(HttpStatusCode.NotImplemented, ErrorResponse("Twitch OAuth is not configured."))
+                        return@get
+                    }
+
+                    val channelSlug = call.parameters["channelSlug"]?.trim().orEmpty()
+                    if (channelSlug.isBlank()) {
+                        call.respond(HttpStatusCode.BadRequest, ErrorResponse("Channel slug is required."))
+                        return@get
+                    }
+
+                    val rawChannelId = call.request.queryParameters["channelId"]?.trim()
+                    val channelId = rawChannelId
+                        ?.takeIf { it.isNotBlank() }
+                        ?.toLongOrNull()
+
+                    if (!rawChannelId.isNullOrBlank() && channelId == null) {
+                        call.respond(HttpStatusCode.BadRequest, ErrorResponse("Channel id must be a number."))
+                        return@get
+                    }
+
+                    val rawChannelUserId = call.request.queryParameters["channelUserId"]?.trim()
+                    val channelUserId = rawChannelUserId
+                        ?.takeIf { it.isNotBlank() }
+                        ?.toLongOrNull()
+
+                    if (!rawChannelUserId.isNullOrBlank() && channelUserId == null) {
+                        call.respond(HttpStatusCode.BadRequest, ErrorResponse("Channel user id must be a number."))
+                        return@get
+                    }
+
+                    val chatRequest = ChannelChatRequest(
+                        channelSlug = channelSlug,
+                        channelId = channelId,
+                        channelUserId = channelUserId,
+                        displayName = call.request.queryParameters["displayName"]?.trim()?.takeIf(String::isNotBlank),
+                        avatarUrl = call.request.queryParameters["avatarUrl"]?.trim()?.takeIf(String::isNotBlank),
+                        fast = call.request.queryParameters["fast"]?.trim()?.equals("true", ignoreCase = true) == true,
+                    )
+
+                    try {
+                        call.respond(service.loadChannelChat(chatRequest))
+                    } catch (exception: IllegalStateException) {
+                        val message = exception.message ?: "Twitch failed to load channel chat."
+                        val statusCode = when {
+                            message.contains("scope", ignoreCase = true) -> HttpStatusCode.Forbidden
+                            message.contains("sign in", ignoreCase = true) ||
+                                message.contains("expired", ignoreCase = true) ||
+                                message.contains("token", ignoreCase = true) -> HttpStatusCode.Unauthorized
+                            else -> HttpStatusCode.BadGateway
+                        }
+
+                        call.respond(statusCode, ErrorResponse(message))
+                    }
+                }
+
+                post("/chat/{channelSlug}/messages") {
+                    val service = twitchApiService
+                    if (service == null) {
+                        call.respond(HttpStatusCode.NotImplemented, ErrorResponse("Twitch OAuth is not configured."))
+                        return@post
+                    }
+
+                    val channelSlug = call.parameters["channelSlug"]?.trim().orEmpty()
+                    if (channelSlug.isBlank()) {
+                        call.respond(HttpStatusCode.BadRequest, ErrorResponse("Channel slug is required."))
+                        return@post
+                    }
+
+                    val request = try {
+                        call.receive<SendChannelChatMessageRequest>()
+                    } catch (_: Exception) {
+                        call.respond(HttpStatusCode.BadRequest, ErrorResponse("Chat message request body is invalid."))
+                        return@post
+                    }
+
+                    try {
+                        call.respond(
+                            service.sendChatMessage(
+                                channelSlug = channelSlug,
+                                broadcasterUserId = request.broadcasterUserId,
+                                content = request.content,
+                                replyToMessageId = request.replyToMessageId,
+                            ),
+                        )
+                    } catch (exception: IllegalStateException) {
+                        val message = exception.message ?: "Twitch failed to send the chat message."
+                        val statusCode = when {
+                            message.contains("scope", ignoreCase = true) -> HttpStatusCode.Forbidden
+                            message.contains("sign in", ignoreCase = true) ||
+                                message.contains("expired", ignoreCase = true) ||
+                                message.contains("token", ignoreCase = true) -> HttpStatusCode.Unauthorized
+                            message.contains("Enter a chat message", ignoreCase = true) -> HttpStatusCode.BadRequest
+                            else -> HttpStatusCode.BadGateway
+                        }
+
+                        call.respond(statusCode, ErrorResponse(message))
+                    }
+                }
             }
 
             get("/bridge/status") {

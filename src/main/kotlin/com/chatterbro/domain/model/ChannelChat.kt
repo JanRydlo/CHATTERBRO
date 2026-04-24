@@ -4,6 +4,7 @@ import kotlinx.serialization.Serializable
 
 @Serializable
 data class ChannelChat(
+	val provider: String = "kick",
 	val channelSlug: String,
 	val channelId: Long? = null,
 	val channelUserId: Long? = null,

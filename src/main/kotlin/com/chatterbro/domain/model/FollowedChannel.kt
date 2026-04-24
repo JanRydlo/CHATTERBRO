@@ -4,6 +4,7 @@ import kotlinx.serialization.Serializable
 
 @Serializable
 data class FollowedChannel(
+    val provider: String = "kick",
     val channelSlug: String,
     val displayName: String,
     val isLive: Boolean = true,
