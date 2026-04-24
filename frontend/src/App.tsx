@@ -26,6 +26,7 @@ const BRIDGE_STATE_LABELS: Record<KickBridgeStatus['state'], string> = {
 };
 
 type LiveChatState = 'idle' | 'connecting' | 'live' | 'error';
+type EmotePickerProvider = 'kick' | '7tv';
 
 const KICK_PUSHER_KEY = '32cbd69e4b950bf97679';
 const KICK_PUSHER_OPTIONS: PusherOptions = {
@@ -62,6 +63,15 @@ interface MatchedInlineEmoteToken {
   leadingText: string;
   trailingText: string;
   emote: ChannelChatEmote;
+}
+
+interface ComposerEmoteOption {
+  key: string;
+  code: string;
+  imageUrl: string;
+  provider: EmotePickerProvider;
+  providerLabel: string;
+  insertionText: string;
 }
 
 function getChannelEmoteCacheKey(channelSlug: string, channelUserId: number | null) {
@@ -939,6 +949,90 @@ function getKickPlaceholderEmoteUrl(emoteId: string) {
   return `https://files.kick.com/emotes/${emoteId}/fullsize`;
 }
 
+function buildSevenTvComposerEmotes(emoteIndex: Record<string, ChannelChatEmote>) {
+  const uniqueEmotes = new Map<string, ComposerEmoteOption>();
+
+  for (const emote of Object.values(emoteIndex)) {
+    if (emote.provider !== '7TV') {
+      continue;
+    }
+
+    const key = `7tv:${emote.code.toLowerCase()}`;
+    if (uniqueEmotes.has(key)) {
+      continue;
+    }
+
+    uniqueEmotes.set(key, {
+      key,
+      code: emote.code,
+      imageUrl: emote.imageUrl,
+      provider: '7tv',
+      providerLabel: '7TV',
+      insertionText: emote.code,
+    });
+  }
+
+  return [...uniqueEmotes.values()].sort((left, right) => left.code.localeCompare(right.code));
+}
+
+function extractKickComposerEmotes(messages: ChannelChatMessage[], pinnedMessage: ChannelChatMessage | null) {
+  const uniqueEmotes = new Map<string, ComposerEmoteOption>();
+
+  for (const message of [...messages, ...(pinnedMessage ? [pinnedMessage] : [])]) {
+    let match = KICK_PLACEHOLDER_PATTERN.exec(message.content);
+
+    while (match) {
+      const [rawMatch, emoteId, emoteCode] = match;
+      const key = `kick:${emoteId}:${emoteCode.toLowerCase()}`;
+
+      if (!uniqueEmotes.has(key)) {
+        uniqueEmotes.set(key, {
+          key,
+          code: emoteCode,
+          imageUrl: getKickPlaceholderEmoteUrl(emoteId),
+          provider: 'kick',
+          providerLabel: 'Kick',
+          insertionText: rawMatch,
+        });
+      }
+
+      match = KICK_PLACEHOLDER_PATTERN.exec(message.content);
+    }
+
+    KICK_PLACEHOLDER_PATTERN.lastIndex = 0;
+  }
+
+  return [...uniqueEmotes.values()];
+}
+
+function filterComposerEmotes(emotes: ComposerEmoteOption[], query: string) {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (normalizedQuery.length === 0) {
+    return emotes;
+  }
+
+  return emotes.filter((emote) => emote.code.toLowerCase().includes(normalizedQuery));
+}
+
+function insertComposerTokenAtSelection(
+  currentDraft: string,
+  insertionText: string,
+  selectionStart: number,
+  selectionEnd: number,
+) {
+  const beforeSelection = currentDraft.slice(0, selectionStart);
+  const afterSelection = currentDraft.slice(selectionEnd);
+  const prefix = beforeSelection.length > 0 && !/\s$/.test(beforeSelection) ? ' ' : '';
+  const suffix = afterSelection.length === 0 || !/^\s/.test(afterSelection) ? ' ' : '';
+  const nextDraft = `${beforeSelection}${prefix}${insertionText}${suffix}${afterSelection}`;
+  const nextCaretPosition = beforeSelection.length + prefix.length + insertionText.length + suffix.length;
+
+  return {
+    nextDraft,
+    nextCaretPosition,
+  };
+}
+
 const CHAT_MENTION_PATTERN = /(^|[^0-9A-Za-z_])(@[0-9A-Za-z_]{2,})(?=$|[^0-9A-Za-z_])/g;
 
 function renderTextTokenWithMentions(
@@ -1530,6 +1624,9 @@ export default function App() {
   const lastSnapshotEnrichmentAtRef = useRef(new Map<string, number>());
   const emoteRequestsInFlightRef = useRef(new Set<string>());
   const chatFeedRef = useRef<HTMLDivElement | null>(null);
+  const chatComposerTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const [activeEmotePicker, setActiveEmotePicker] = useState<EmotePickerProvider | null>(null);
+  const [emotePickerQuery, setEmotePickerQuery] = useState('');
 
   useEffect(() => {
     void refreshBridgeStatus();
@@ -1581,6 +1678,27 @@ export default function App() {
       setFollowingsBlockedBySecurityPolicy(false);
     }
   }, [bridgeStatus.hasBrowserSession]);
+
+  useEffect(() => {
+    if (!activeEmotePicker) {
+      return;
+    }
+
+    const handleWindowKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== 'Escape') {
+        return;
+      }
+
+      setActiveEmotePicker(null);
+      setEmotePickerQuery('');
+    };
+
+    window.addEventListener('keydown', handleWindowKeyDown);
+
+    return () => {
+      window.removeEventListener('keydown', handleWindowKeyDown);
+    };
+  }, [activeEmotePicker]);
 
   async function preloadGlobalEmotes() {
     try {
@@ -1844,6 +1962,22 @@ export default function App() {
     selectedChannel?.isLive &&
     selectedChannel.channelSlug === channelChat?.channelSlug &&
     channelChat?.channelUserId !== null,
+  );
+  const canUseComposerEmotePicker = Boolean(
+    selectedChannel?.isLive &&
+    hasChatWriteScope &&
+    canSendSelectedChannelChat &&
+    !isSendingChat,
+  );
+  useEffect(() => {
+    setActiveEmotePicker(null);
+    setEmotePickerQuery('');
+  }, [selectedChannelSlug]);
+  const kickComposerEmotes = extractKickComposerEmotes(displayedChatMessages, channelChat?.pinnedMessage ?? null);
+  const sevenTvComposerEmotes = buildSevenTvComposerEmotes(activeEmoteIndex);
+  const visibleEmotePickerOptions = filterComposerEmotes(
+    activeEmotePicker === 'kick' ? kickComposerEmotes : sevenTvComposerEmotes,
+    emotePickerQuery,
   );
   const liveChatStatusLabel = liveChatState === 'live'
     ? 'Live'
@@ -2818,6 +2952,39 @@ export default function App() {
     }
   }
 
+  function handleOpenEmotePicker(provider: EmotePickerProvider) {
+    setActiveEmotePicker(provider);
+    setEmotePickerQuery('');
+  }
+
+  function closeEmotePicker() {
+    setActiveEmotePicker(null);
+    setEmotePickerQuery('');
+  }
+
+  function handleInsertComposerEmote(emote: ComposerEmoteOption) {
+    if (!selectedChannelSlug) {
+      return;
+    }
+
+    const selectionStart = chatComposerTextareaRef.current?.selectionStart ?? chatDraft.length;
+    const selectionEnd = chatComposerTextareaRef.current?.selectionEnd ?? chatDraft.length;
+    const { nextDraft, nextCaretPosition } = insertComposerTokenAtSelection(
+      chatDraft,
+      emote.insertionText,
+      selectionStart,
+      selectionEnd,
+    );
+
+    setChatDraftForChannel(selectedChannelSlug, nextDraft);
+    closeEmotePicker();
+
+    window.requestAnimationFrame(() => {
+      chatComposerTextareaRef.current?.focus();
+      chatComposerTextareaRef.current?.setSelectionRange(nextCaretPosition, nextCaretPosition);
+    });
+  }
+
   function handleChatComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) {
       return;
@@ -3446,6 +3613,7 @@ export default function App() {
               {tokenOnlyMode ? (
                 <div className="chat-composer-form">
                   <textarea
+                    ref={chatComposerTextareaRef}
                     className="chat-composer-textarea"
                     value={chatDraft}
                     onChange={(event) => {
@@ -3470,6 +3638,32 @@ export default function App() {
                       <span className="chat-composer-help">Enter to send, Shift+Enter for newline</span>
                       <span className="chat-composer-help">{chatDraft.trim().length}/500</span>
                     </div>
+
+                    <button
+                      className="chat-emote-picker-button chat-emote-picker-button-kick"
+                      type="button"
+                      onClick={() => handleOpenEmotePicker('kick')}
+                      disabled={!canUseComposerEmotePicker}
+                      title={kickComposerEmotes.length === 0
+                        ? 'Kick picker currently shows native emotes found in the loaded chat snapshot.'
+                        : `Open ${kickComposerEmotes.length} Kick emotes from the current chat snapshot.`}
+                    >
+                      <span className="chat-emote-picker-icon chat-emote-picker-icon-kick" aria-hidden>K</span>
+                      <span>Kick</span>
+                    </button>
+
+                    <button
+                      className="chat-emote-picker-button chat-emote-picker-button-7tv"
+                      type="button"
+                      onClick={() => handleOpenEmotePicker('7tv')}
+                      disabled={!canUseComposerEmotePicker}
+                      title={sevenTvComposerEmotes.length === 0
+                        ? 'No 7TV emotes are cached for this chat yet.'
+                        : `Open ${sevenTvComposerEmotes.length} cached 7TV emotes.`}
+                    >
+                      <span className="chat-emote-picker-icon chat-emote-picker-icon-7tv" aria-hidden>7</span>
+                      <span>7TV</span>
+                    </button>
 
                     {!hasChatWriteScope ? (
                       <button className="primary-button" type="button" onClick={handleReconnectOAuth}>
@@ -3504,6 +3698,84 @@ export default function App() {
             <span>{tokenOnlyMode ? 'After your followings or watchlist load, enable live chat sync once and then open chat on any live channel to render recent messages and keep them updating in realtime.' : 'After loading your live followings, click Open chat on any online channel to render its recent Kick chat here and keep it updating in real time.'}</span>
           </div>
         )}
+
+        {activeEmotePicker ? (
+          <div className="chat-emote-modal-backdrop" role="presentation" onClick={closeEmotePicker}>
+            <div
+              className="chat-emote-modal"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="chat-emote-modal-title"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="chat-emote-modal-header">
+                <div className="chat-emote-modal-copy">
+                  <div className="chat-emote-modal-title-row">
+                    <span className={`chat-emote-picker-icon ${activeEmotePicker === 'kick' ? 'chat-emote-picker-icon-kick' : 'chat-emote-picker-icon-7tv'}`} aria-hidden>
+                      {activeEmotePicker === 'kick' ? 'K' : '7'}
+                    </span>
+                    <div>
+                      <h3 id="chat-emote-modal-title">{activeEmotePicker === 'kick' ? 'Kick emotes' : '7TV emotes'}</h3>
+                      <p>
+                        {activeEmotePicker === 'kick'
+                          ? 'Native Kick emotes discovered from the currently loaded chat snapshot.'
+                          : '7TV emotes cached for the active chat, including global and channel-specific sets.'}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                <button className="chat-emote-modal-close" type="button" onClick={closeEmotePicker} aria-label="Close emote picker">
+                  ×
+                </button>
+              </div>
+
+              <div className="chat-emote-modal-controls">
+                <input
+                  className="chat-emote-search-input"
+                  type="text"
+                  value={emotePickerQuery}
+                  onChange={(event) => setEmotePickerQuery(event.target.value)}
+                  placeholder={`Filter ${activeEmotePicker === 'kick' ? 'Kick' : '7TV'} emotes...`}
+                  autoFocus
+                />
+                <div className="chat-emote-modal-meta">
+                  <span>{visibleEmotePickerOptions.length} emote{visibleEmotePickerOptions.length === 1 ? '' : 's'}</span>
+                  <span>{activeEmotePicker === 'kick' ? 'Source: current snapshot' : 'Source: cached 7TV catalog'}</span>
+                </div>
+              </div>
+
+              {visibleEmotePickerOptions.length === 0 ? (
+                <div className="chat-emote-empty-state">
+                  <strong>{activeEmotePicker === 'kick' ? 'No Kick emotes available yet.' : 'No 7TV emotes matched.'}</strong>
+                  <p>
+                    {activeEmotePicker === 'kick'
+                      ? 'Kick picker currently lists native emotes that already appeared in the loaded chat snapshot. Refresh chat or wait for more messages to populate it.'
+                      : emotePickerQuery.trim().length > 0
+                        ? 'Try a shorter filter term or clear the search box.'
+                        : 'The 7TV catalog has not finished loading for this channel yet.'}
+                  </p>
+                </div>
+              ) : (
+                <div className="chat-emote-grid">
+                  {visibleEmotePickerOptions.map((emote) => (
+                    <button
+                      className="chat-emote-grid-button"
+                      key={emote.key}
+                      type="button"
+                      onClick={() => handleInsertComposerEmote(emote)}
+                      title={`${emote.code} · ${emote.providerLabel}`}
+                    >
+                      <img className="chat-emote-grid-image" src={emote.imageUrl} alt={emote.code} loading="lazy" decoding="async" draggable={false} />
+                      <span className="chat-emote-grid-code">{emote.code}</span>
+                      <span className="chat-emote-grid-provider">{emote.providerLabel}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        ) : null}
       </section>
     </main>
   );
