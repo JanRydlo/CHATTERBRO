@@ -1,5 +1,6 @@
 export type BridgeState = 'IDLE' | 'RUNNING' | 'READY' | 'ERROR';
 export type KickAuthMode = 'NONE' | 'OAUTH' | 'BROWSER_SESSION';
+export type ChatProvider = 'kick' | 'twitch';
 
 export interface KickProfile {
   username: string;
@@ -23,6 +24,7 @@ export interface KickBridgeStatus {
 }
 
 export interface FollowedChannel {
+  provider: ChatProvider;
   channelSlug: string;
   displayName: string;
   isLive: boolean;
@@ -69,6 +71,7 @@ export interface ChannelChatMessage {
 }
 
 export interface ChannelChat {
+  provider: ChatProvider;
   channelSlug: string;
   channelId: number | null;
   channelUserId: number | null;

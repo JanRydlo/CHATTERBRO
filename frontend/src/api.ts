@@ -44,6 +44,10 @@ export function getBridgeStatus(): Promise<KickBridgeStatus> {
   return request<KickBridgeStatus>('/api/bridge/status');
 }
 
+export function getTwitchAuthStatus(): Promise<KickBridgeStatus> {
+  return request<KickBridgeStatus>('/api/twitch/auth/status');
+}
+
 export function startBridge(forceReconnect = false): Promise<KickBridgeStatus> {
   const query = forceReconnect ? '?forceReconnect=true' : '';
 
@@ -54,6 +58,10 @@ export function startBridge(forceReconnect = false): Promise<KickBridgeStatus> {
 
 export function fetchLiveFollowedChannels(): Promise<FollowedChannel[]> {
   return request<FollowedChannel[]>('/api/following/live');
+}
+
+export function fetchTwitchLiveFollowedChannels(): Promise<FollowedChannel[]> {
+  return request<FollowedChannel[]>('/api/twitch/following/live');
 }
 
 export function fetchTrackedLiveChannels(channelSlugs: string[]): Promise<FollowedChannel[]> {
@@ -72,6 +80,15 @@ export function fetchTrackedChannels(channelSlugs: string[]): Promise<FollowedCh
   }
 
   return request<FollowedChannel[]>(`/api/channels/tracked?${query.toString()}`);
+}
+
+export function fetchTwitchTrackedChannels(channelSlugs: string[]): Promise<FollowedChannel[]> {
+  const query = new URLSearchParams();
+  for (const channelSlug of channelSlugs) {
+    query.append('slug', channelSlug);
+  }
+
+  return request<FollowedChannel[]>(`/api/twitch/channels/tracked?${query.toString()}`);
 }
 
 export function fetchRecentChannelSlugs(): Promise<string[]> {
@@ -119,6 +136,47 @@ export function fetchChannelChat({
   return request<ChannelChat>(`/api/chat/${channelSlug}${queryString ? `?${queryString}` : ''}`);
 }
 
+export function fetchTwitchChannelChat({
+  channelSlug,
+  channelId,
+  channelUserId,
+  displayName,
+  avatarUrl,
+  fast = false,
+}: {
+  channelSlug: string;
+  channelId?: number | null;
+  channelUserId?: number | null;
+  displayName?: string | null;
+  avatarUrl?: string | null;
+  fast?: boolean;
+}): Promise<ChannelChat> {
+  const query = new URLSearchParams();
+
+  if (channelId !== undefined && channelId !== null) {
+    query.set('channelId', String(channelId));
+  }
+
+  if (channelUserId !== undefined && channelUserId !== null) {
+    query.set('channelUserId', String(channelUserId));
+  }
+
+  if (displayName) {
+    query.set('displayName', displayName);
+  }
+
+  if (avatarUrl) {
+    query.set('avatarUrl', avatarUrl);
+  }
+
+  if (fast) {
+    query.set('fast', 'true');
+  }
+
+  const queryString = query.toString();
+  return request<ChannelChat>(`/api/twitch/chat/${channelSlug}${queryString ? `?${queryString}` : ''}`);
+}
+
 export function sendChannelChatMessage(
   channelSlug: string,
   payload: {
@@ -128,6 +186,20 @@ export function sendChannelChatMessage(
   }
 ): Promise<PostedChatMessage> {
   return request<PostedChatMessage>(`/api/chat/${channelSlug}/messages`, {
+    method: 'POST',
+    body: JSON.stringify(payload)
+  });
+}
+
+export function sendTwitchChannelChatMessage(
+  channelSlug: string,
+  payload: {
+    content: string;
+    broadcasterUserId?: number | null;
+    replyToMessageId?: string | null;
+  }
+): Promise<PostedChatMessage> {
+  return request<PostedChatMessage>(`/api/twitch/chat/${channelSlug}/messages`, {
     method: 'POST',
     body: JSON.stringify(payload)
   });
@@ -147,6 +219,20 @@ export function fetchChannelChatEmotes(channelSlug: string, channelUserId: numbe
   return request<ChannelChatEmoteCatalog>(`/api/chat/${channelSlug}/emotes${queryString ? `?${queryString}` : ''}`);
 }
 
+export function fetchTwitchChannelChatEmotes(channelSlug: string, channelUserId: number | null): Promise<ChannelChatEmoteCatalog> {
+  const query = new URLSearchParams();
+  if (channelUserId !== null) {
+    query.set('channelUserId', String(channelUserId));
+  }
+
+  const queryString = query.toString();
+  return request<ChannelChatEmoteCatalog>(`/api/twitch/chat/${channelSlug}/emotes${queryString ? `?${queryString}` : ''}`);
+}
+
 export function getOAuthLoginUrl(): string {
   return `${API_BASE_URL}/api/auth/login`;
+}
+
+export function getTwitchOAuthLoginUrl(): string {
+  return `${API_BASE_URL}/api/twitch/auth/login`;
 }

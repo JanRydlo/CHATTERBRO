@@ -66,12 +66,17 @@ Backend čte tyto hodnoty:
 - `KICK_CLIENT_ID`
 - `KICK_CLIENT_SECRET`
 - `KICK_REDIRECT_URI`
+- `TWITCH_CLIENT_ID`
+- `TWITCH_CLIENT_SECRET`
+- `TWITCH_REDIRECT_URI`
 - `CHATTERBRO_FRONTEND_URL` optional, defaults to `http://localhost:8080`
 - `KICK_OAUTH_SCOPES` optional, defaults to `user:read channel:read chat:write`
+- `TWITCH_OAUTH_SCOPES` optional, defaults to `user:read:follows chat:read chat:edit user:read:emotes`
 
 Doporučené lokální hodnoty:
 
 - `KICK_REDIRECT_URI=http://localhost:8080/api/auth/callback`
+- `TWITCH_REDIRECT_URI=http://localhost:8080/api/twitch/auth/callback`
 - `CHATTERBRO_FRONTEND_URL=http://localhost:8080` when Ktor serves the built frontend
 - `CHATTERBRO_FRONTEND_URL=http://localhost:5173` when you run the Vite dev server
 
@@ -116,6 +121,18 @@ OAuth session artifacts are kept under `bridge/session/` and are intentionally i
 - `GET /api/channels/tracked` returns tracked channels with live/offline status, viewer count, tags, and available stream metadata.
 - `GET /api/chat/{channelSlug}` currently returns `501` because Kick Public API does not expose chat-history reads.
 - `POST /api/chat/{channelSlug}/messages` sends a chat message through Kick's official chat endpoint when the token has `chat:write`.
+
+## Twitch Mode
+
+- The provider switcher in the React UI now opens a separate Twitch dashboard without changing the existing Kick flow.
+- `GET /api/twitch/auth/status` returns the local Twitch OAuth status using the same status shape as the Kick status endpoint.
+- `GET /api/twitch/auth/login` starts the Twitch OAuth flow.
+- `GET /api/twitch/auth/callback` completes the Twitch OAuth callback and persists the local Twitch session.
+- `GET /api/twitch/following/live` loads live followed Twitch channels through Helix.
+- `GET /api/twitch/channels/tracked` resolves tracked Twitch logins through Helix and merges them into the local watchlist.
+- `GET /api/twitch/chat/{channelSlug}` returns the local Twitch IRC chat buffer for the opened channel.
+- `GET /api/twitch/chat/{channelSlug}/emotes` returns merged Twitch global, channel, and user emotes when scopes allow it.
+- `POST /api/twitch/chat/{channelSlug}/messages` sends a message through the authenticated Twitch chat session when the token has `chat:edit`.
 
 ## Notes
 
