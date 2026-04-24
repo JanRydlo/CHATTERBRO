@@ -11,6 +11,8 @@ import io.ktor.http.HttpStatusCode
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.encodeToString
 import java.net.URI
 import java.net.URLEncoder
@@ -285,12 +287,10 @@ class KickOAuthService(
             url = "https://api.kick.com/public/v1/chat",
             accessToken = session.accessToken,
             method = "POST",
-            requestBody = json.encodeToString(
-                KickPostChatRequest(
-                    broadcasterUserId = resolvedBroadcasterUserId,
-                    content = normalizedContent,
-                    replyToMessageId = replyToMessageId?.trim()?.ifBlank { null },
-                ),
+            requestBody = buildPostChatRequestBody(
+                broadcasterUserId = resolvedBroadcasterUserId,
+                content = normalizedContent,
+                replyToMessageId = replyToMessageId,
             ),
         )
         val response = json.decodeFromString<KickResponse<KickChatResponse>>(responseBody)
@@ -305,6 +305,22 @@ class KickOAuthService(
             isSent = true,
             messageId = data.messageId,
         )
+    }
+
+    internal fun buildPostChatRequestBody(
+        broadcasterUserId: Long,
+        content: String,
+        replyToMessageId: String? = null,
+    ): String {
+        return buildJsonObject {
+            put("broadcaster_user_id", JsonPrimitive(broadcasterUserId))
+            put("content", JsonPrimitive(content))
+            put("type", JsonPrimitive("user"))
+            replyToMessageId
+                ?.trim()
+                ?.ifBlank { null }
+                ?.let { put("reply_to_message_id", JsonPrimitive(it)) }
+        }.toString()
     }
 
     fun buildFrontendRedirect(success: Boolean, message: String? = null): String {
