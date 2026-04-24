@@ -1214,12 +1214,14 @@ input {
   width: min(920px, calc(100vw - 32px));
   max-height: min(82vh, 860px);
   display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
   gap: 16px;
   padding: 20px;
   border-radius: 24px;
   background: linear-gradient(180deg, rgba(24, 32, 44, 0.98) 0%, rgba(16, 21, 30, 0.98) 100%);
   border: 1px solid rgba(255, 255, 255, 0.08);
   box-shadow: 0 28px 80px rgba(2, 6, 12, 0.45);
+  overflow: hidden;
 }
 
 .chat-emote-modal-header,
@@ -1298,8 +1300,10 @@ input {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
   gap: 12px;
+  min-height: 0;
   overflow-y: auto;
   padding-right: 4px;
+  align-content: start;
 }
 
 .chat-emote-grid-button {
@@ -1347,6 +1351,7 @@ input {
 .chat-emote-empty-state {
   display: grid;
   gap: 8px;
+  min-height: 0;
   padding: 18px;
   border-radius: 18px;
   background: rgba(255, 255, 255, 0.04);
