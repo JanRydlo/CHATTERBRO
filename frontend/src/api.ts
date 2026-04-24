@@ -74,6 +74,10 @@ export function fetchTrackedChannels(channelSlugs: string[]): Promise<FollowedCh
   return request<FollowedChannel[]>(`/api/channels/tracked?${query.toString()}`);
 }
 
+export function fetchRecentChannelSlugs(): Promise<string[]> {
+  return request<string[]>('/api/channels/recent');
+}
+
 export function fetchChannelChat({
   channelSlug,
   channelId,

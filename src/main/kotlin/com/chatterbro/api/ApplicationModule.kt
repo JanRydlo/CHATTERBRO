@@ -241,6 +241,30 @@ fun Application.chatterbroModule() {
                 }
             }
 
+            get("/channels/recent") {
+                try {
+                    call.respond(bridgeRunner.fetchRecentChannelSlugs())
+                } catch (exception: IllegalStateException) {
+                    val message = exception.message ?: "Kick browser sync failed to load recent channels."
+                    val statusCode = if (
+                        message.contains("sign in", ignoreCase = true) ||
+                        message.contains("expired", ignoreCase = true) ||
+                        message.contains("missing", ignoreCase = true)
+                    ) {
+                        HttpStatusCode.Unauthorized
+                    } else if (
+                        message.contains("Reconnect Kick browser", ignoreCase = true) ||
+                        message.contains("browser sync is not running", ignoreCase = true)
+                    ) {
+                        HttpStatusCode.Conflict
+                    } else {
+                        HttpStatusCode.BadGateway
+                    }
+
+                    call.respond(statusCode, ErrorResponse(message))
+                }
+            }
+
             get("/channels/tracked") {
                 val service = oauthService
                 if (service == null) {
