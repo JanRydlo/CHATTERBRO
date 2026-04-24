@@ -228,6 +228,11 @@ function buildTokenOnlyChatShell(channel: FollowedChannel): ChannelChat {
   };
 }
 
+function buildKickStreamEmbedUrl(channelSlug: string) {
+  const normalizedChannelSlug = channelSlug.trim().replace(/^\/+|\/+$/g, '');
+  return `https://player.kick.com/${encodeURIComponent(normalizedChannelSlug)}`;
+}
+
 function AvatarMedia({ imageUrl, label }: { imageUrl: string | null | undefined; label: string }) {
   const [imageFailed, setImageFailed] = useState(false);
 
@@ -1451,6 +1456,7 @@ interface OpenChatTabState {
   chat: ChannelChat | null;
   isLoadingChat: boolean;
   isSendingChat: boolean;
+  isStreamVisible: boolean;
   chatError: string | null;
   sendChatError: string | null;
   liveChatState: LiveChatState;
@@ -1466,6 +1472,7 @@ function createOpenChatTabState(channel: FollowedChannel): OpenChatTabState {
     chat: null,
     isLoadingChat: false,
     isSendingChat: false,
+    isStreamVisible: false,
     chatError: null,
     sendChatError: null,
     liveChatState: 'idle',
@@ -1750,6 +1757,15 @@ export default function App() {
     });
   }
 
+  function setStreamVisibilityForChannel(channelSlug: string, nextIsStreamVisible: boolean) {
+    startTransition(() => {
+      setOpenChatTabs((currentTabs) => updateOpenChatTabState(currentTabs, channelSlug, (currentTab) => ({
+        ...currentTab,
+        isStreamVisible: nextIsStreamVisible
+      })));
+    });
+  }
+
   function setChatErrorForChannel(channelSlug: string, nextChatError: string | null) {
     startTransition(() => {
       setOpenChatTabs((currentTabs) => updateOpenChatTabState(currentTabs, channelSlug, (currentTab) => ({
@@ -1958,6 +1974,10 @@ export default function App() {
   const hasActiveRealtimeTarget = activeChatroomId !== null;
   const selectedChannelSupportsRealtime = Boolean(selectedChannel?.isLive && selectedChannel.chatroomId !== null);
   const selectedChannelRealtimeOnly = tokenOnlyMode && !browserChatEnabled && selectedChannelSupportsRealtime;
+  const canShowSelectedStream = Boolean(selectedChannel?.isLive);
+  const isSelectedStreamVisible = activeChatTab?.isStreamVisible ?? false;
+  const selectedStreamEmbedUrl = selectedChannel ? buildKickStreamEmbedUrl(selectedChannel.channelSlug) : null;
+  const showSelectedStream = Boolean(canShowSelectedStream && isSelectedStreamVisible && selectedStreamEmbedUrl);
   const canSendSelectedChannelChat = Boolean(
     selectedChannel?.isLive &&
     selectedChannel.channelSlug === channelChat?.channelSlug &&
@@ -3486,6 +3506,45 @@ export default function App() {
 
         {selectedChannel ? (
           <div className="chat-shell">
+            {showSelectedStream ? (
+              <div className="chat-stream-panel">
+                <div className="chat-stream-panel-header">
+                  <div className="chat-stream-panel-copy">
+                    <span className="mono-label">Live stream</span>
+                    <h3>{selectedChannel.streamTitle || `Watching ${channelChat?.displayName || selectedChannel.displayName}`}</h3>
+                    <p>
+                      {[
+                        selectedChannel.categoryName,
+                        selectedChannel.viewerCount === null
+                          ? 'Kick embedded player for the active chat tab.'
+                          : `${selectedChannel.viewerCount} viewer${selectedChannel.viewerCount === 1 ? '' : 's'} live now.`
+                      ].filter(Boolean).join(' • ')}
+                    </p>
+                  </div>
+
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => setStreamVisibilityForChannel(selectedChannel.channelSlug, false)}
+                  >
+                    Hide stream
+                  </button>
+                </div>
+
+                <div className="chat-stream-frame-shell">
+                  <iframe
+                    className="chat-stream-frame"
+                    src={selectedStreamEmbedUrl ?? undefined}
+                    title={`${selectedChannel.displayName} stream`}
+                    allow="autoplay; fullscreen; picture-in-picture; encrypted-media"
+                    allowFullScreen
+                    loading="lazy"
+                    referrerPolicy="origin-when-cross-origin"
+                  />
+                </div>
+              </div>
+            ) : null}
+
             <div className="chat-summary-card">
               <div className="chat-summary-topline">
                 <span className="chat-kick-mark">{tokenOnlyMode ? (browserChatEnabled ? 'Kick live chat' : 'Kick chat tools') : 'Kick chat mirror'}</span>
@@ -3525,29 +3584,41 @@ export default function App() {
               </div>
 
               <div className="channel-actions compact-actions chat-toolbar">
-                <button className="secondary-button" onClick={() => window.open(selectedChannel.channelUrl, '_blank', 'noopener,noreferrer')}>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  onClick={() => setStreamVisibilityForChannel(selectedChannel.channelSlug, !isSelectedStreamVisible)}
+                  disabled={!canShowSelectedStream}
+                >
+                  {canShowSelectedStream
+                    ? isSelectedStreamVisible
+                      ? 'Hide stream'
+                      : 'Show stream'
+                    : 'Stream offline'}
+                </button>
+                <button className="secondary-button" type="button" onClick={() => window.open(selectedChannel.channelUrl, '_blank', 'noopener,noreferrer')}>
                   Open channel
                 </button>
                 {tokenOnlyMode ? (
                   browserChatEnabled ? (
-                    <button className="primary-button" onClick={() => {
+                    <button className="primary-button" type="button" onClick={() => {
                       void loadChannelChat(selectedChannel, { forceFull: true });
                     }} disabled={isLoadingChat}>
                       {isLoadingChat ? 'Refreshing chat...' : 'Refresh chat'}
                     </button>
                   ) : hasActiveRealtimeTarget && selectedChannel.isLive ? (
-                    <button className="primary-button" onClick={() => {
+                    <button className="primary-button" type="button" onClick={() => {
                       void loadChannelChat(selectedChannel);
                     }} disabled={isLoadingChat}>
                       {isLoadingChat ? 'Connecting chat...' : 'Reconnect realtime'}
                     </button>
                   ) : (
-                    <button className="primary-button" onClick={startBrowserSessionSync} disabled={isStartingBridge || bridgeStatus.state === 'RUNNING'}>
+                    <button className="primary-button" type="button" onClick={startBrowserSessionSync} disabled={isStartingBridge || bridgeStatus.state === 'RUNNING'}>
                       {isStartingBridge ? 'Opening live chat sync...' : bridgeStatus.state === 'RUNNING' ? 'Waiting for live chat sync...' : 'Enable live chat sync'}
                     </button>
                   )
                 ) : (
-                  <button className="primary-button" onClick={() => {
+                  <button className="primary-button" type="button" onClick={() => {
                     void loadChannelChat(selectedChannel, { forceFull: true });
                   }} disabled={isLoadingChat}>
                     {isLoadingChat ? 'Refreshing chat...' : 'Refresh chat'}
