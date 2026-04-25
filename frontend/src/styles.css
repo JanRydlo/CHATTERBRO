@@ -224,6 +224,9 @@ input {
   height: 28px;
   padding: 0 10px;
   border-radius: 999px;
+  border: 1px solid rgba(21, 34, 23, 0.08);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28);
+  backdrop-filter: blur(10px);
   font-family: 'IBM Plex Mono', monospace;
   font-size: 0.68rem;
   letter-spacing: 0.08em;
@@ -249,12 +252,14 @@ input {
 }
 
 .provider-badge-kick {
-  background: rgba(10, 143, 100, 0.14);
+  background: linear-gradient(180deg, rgba(10, 143, 100, 0.16), rgba(10, 143, 100, 0.09));
+  border-color: rgba(10, 143, 100, 0.16);
   color: var(--accent-deep);
 }
 
 .provider-badge-twitch {
-  background: rgba(126, 87, 255, 0.16);
+  background: linear-gradient(180deg, rgba(126, 87, 255, 0.18), rgba(126, 87, 255, 0.09));
+  border-color: rgba(126, 87, 255, 0.18);
   color: #5c36d1;
 }
 
@@ -707,27 +712,48 @@ input {
 
 .channel-card {
   display: grid;
-  grid-template-rows: auto auto minmax(4.2rem, auto) minmax(0, auto) auto;
+  grid-template-rows: auto auto minmax(3rem, auto) minmax(0, auto) auto;
   align-content: start;
-  gap: 16px;
+  gap: 12px;
   height: 100%;
-  padding: 18px;
+  padding: 16px;
   border-radius: 22px;
-  background: rgba(255, 255, 255, 0.72);
-  border: 1px solid rgba(21, 34, 23, 0.08);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(246, 249, 247, 0.84));
+  border: 1px solid rgba(21, 34, 23, 0.1);
+  box-shadow: 0 18px 40px rgba(18, 29, 22, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.55);
+  overflow: hidden;
+}
+
+.channel-card-kick {
+  background:
+    radial-gradient(circle at top right, rgba(10, 143, 100, 0.14), transparent 34%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.9), rgba(245, 250, 247, 0.86));
+}
+
+.channel-card-twitch {
+  background:
+    radial-gradient(circle at top right, rgba(126, 87, 255, 0.16), transparent 38%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.91), rgba(246, 247, 252, 0.86));
 }
 
 .channel-card-topline {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
 }
 
 .channel-identity {
   display: flex;
-  gap: 14px;
-  align-items: center;
+  gap: 12px;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.channel-copy {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
 }
 
 .channel-status-pill,
@@ -738,13 +764,13 @@ input {
   justify-content: center;
   border-radius: 999px;
   font-family: 'IBM Plex Mono', monospace;
-  font-size: 0.74rem;
-  letter-spacing: 0.06em;
+  font-size: 0.62rem;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
 .channel-status-pill {
-  padding: 6px 10px;
+  padding: 4px 8px;
 }
 
 .channel-status-live {
@@ -760,50 +786,113 @@ input {
 .channel-meta-list {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 6px;
   align-content: flex-start;
-  min-height: 32px;
+  min-height: 0;
 }
 
 .channel-meta-list span,
 .channel-tag {
-  padding: 5px 9px;
-  background: rgba(21, 34, 23, 0.05);
-  color: var(--muted);
+  padding: 4px 8px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(236, 241, 238, 0.82));
+  border: 1px solid rgba(21, 34, 23, 0.08);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.42);
+  color: #4f5d53;
+  font-size: 0.6rem;
 }
 
 .channel-title {
   margin: 0;
-  color: var(--text);
-  line-height: 1.45;
-  min-height: 4.2rem;
+  color: rgba(15, 23, 17, 0.86);
+  line-height: 1.5;
+  font-size: 0.93rem;
+  min-height: 3rem;
   overflow: hidden;
   display: -webkit-box;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 3;
+  -webkit-line-clamp: 2;
 }
 
 .channel-tag-list {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 6px;
   align-content: flex-start;
-  min-height: 32px;
+  min-height: 0;
 }
 
 .channel-card .channel-actions {
   margin-top: auto;
+  gap: 10px;
+}
+
+.channel-card .channel-actions > * {
+  flex: 1 1 132px;
+}
+
+.channel-card .primary-button,
+.channel-card .secondary-button {
+  padding: 10px 14px;
+  font-size: 0.82rem;
+  line-height: 1.2;
 }
 
 .channel-avatar {
-  width: 56px;
-  height: 56px;
-  border-radius: 18px;
-  overflow: hidden;
-  display: grid;
-  place-items: center;
+  width: 52px;
+  height: 52px;
+  border-radius: 16px;
   background: linear-gradient(135deg, rgba(10, 143, 100, 0.18), rgba(224, 154, 75, 0.22));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.4);
   font-weight: 700;
+}
+
+.channel-heading-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: nowrap;
+  min-width: 0;
+}
+
+.channel-heading-row h3 {
+  margin: 0;
+  min-width: 0;
+  font-size: 0.94rem;
+  line-height: 1.24;
+  letter-spacing: -0.01em;
+  color: #152217;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.channel-card .provider-badge {
+  min-width: unset;
+  height: 22px;
+  padding: 0 8px;
+  flex: 0 0 auto;
+  font-size: 0.56rem;
+}
+
+.channel-card .provider-badge-icon-only {
+  width: 24px;
+  min-width: 24px;
+  padding: 0;
+}
+
+.channel-card .provider-badge-icon {
+  width: 10px;
+  height: 10px;
+}
+
+.channel-status-pill {
+  padding: 4px 8px;
+  font-size: 0.6rem;
+  letter-spacing: 0.08em;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28);
 }
 
 .channel-avatar img {
@@ -825,6 +914,13 @@ input {
 .channel-card p {
   margin: 0;
   color: var(--muted);
+}
+
+.channel-card .channel-slug {
+  color: rgba(67, 79, 69, 0.88);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.74rem;
+  letter-spacing: 0.05em;
 }
 
 .chat-viewer-panel {
@@ -1192,37 +1288,79 @@ input {
 .chat-badge-list {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 6px;
 }
 
 .chat-sender-name {
-  font-size: 0.96rem;
+  font-size: 0.93rem;
   font-weight: 700;
+  text-shadow: 0 0 14px rgba(2, 6, 12, 0.46), 0 1px 0 rgba(2, 6, 12, 0.42);
+  -webkit-text-stroke: 0.35px rgba(2, 6, 12, 0.26);
 }
 
 .chat-badge-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 1.4rem;
-  height: 1.4rem;
+  min-width: 1.6rem;
+  height: 1.6rem;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.08);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.05));
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 6px 16px rgba(0, 0, 0, 0.16);
   color: var(--chat-text);
   font-family: 'IBM Plex Mono', monospace;
-  font-size: 0.62rem;
+  font-size: 0.58rem;
   font-weight: 700;
   line-height: 1;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.chat-badge-token {
+  min-width: 2rem;
+  padding: 0 0.5rem;
 }
 
 .chat-badge-image {
-  width: 1.4rem;
-  min-width: 1.4rem;
+  width: 1.6rem;
+  min-width: 1.6rem;
   padding: 0;
+  border-radius: 999px;
   object-fit: contain;
-  background: transparent;
+  background: rgba(255, 255, 255, 0.08);
   border: 0;
+}
+
+.chat-badge-moderator {
+  background: linear-gradient(180deg, rgba(83, 242, 166, 0.28), rgba(36, 125, 81, 0.34));
+  border-color: rgba(83, 242, 166, 0.34);
+  color: #dbffed;
+}
+
+.chat-badge-vip {
+  background: linear-gradient(180deg, rgba(255, 102, 173, 0.24), rgba(167, 55, 110, 0.34));
+  border-color: rgba(255, 102, 173, 0.3);
+  color: #ffe2f1;
+}
+
+.chat-badge-subscriber {
+  background: linear-gradient(180deg, rgba(255, 201, 87, 0.24), rgba(158, 111, 31, 0.34));
+  border-color: rgba(255, 201, 87, 0.28);
+  color: #fff0c4;
+}
+
+.chat-badge-broadcaster {
+  background: linear-gradient(180deg, rgba(153, 102, 255, 0.28), rgba(88, 48, 176, 0.36));
+  border-color: rgba(153, 102, 255, 0.34);
+  color: #efe4ff;
+}
+
+.chat-badge-founder,
+.chat-badge-staff {
+  background: linear-gradient(180deg, rgba(99, 169, 255, 0.24), rgba(47, 90, 164, 0.34));
+  border-color: rgba(99, 169, 255, 0.28);
+  color: #deefff;
 }
 
 .chat-badge,
