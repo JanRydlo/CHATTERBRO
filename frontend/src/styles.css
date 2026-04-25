@@ -150,9 +150,167 @@ input {
   margin-top: 18px;
 }
 
+.auth-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+  margin-top: 18px;
+}
+
 .panel {
   padding: 22px;
   border-radius: 24px;
+}
+
+.auth-card {
+  display: grid;
+  gap: 14px;
+}
+
+.auth-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.auth-card-title-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.auth-card-title-row h2 {
+  margin: 0;
+}
+
+.auth-card-title-row p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.auth-card-details {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  line-height: 1.45;
+  font-size: 0.95rem;
+}
+
+.auth-card-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+}
+
+.auth-card-note {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.auth-card-note-error {
+  color: var(--danger);
+}
+
+.provider-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-width: 28px;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 500;
+}
+
+.provider-badge-icon-only {
+  min-width: 34px;
+  width: 34px;
+  padding: 0;
+}
+
+.provider-badge-icon {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  display: block;
+}
+
+.provider-badge-label {
+  line-height: 1;
+}
+
+.provider-badge-kick {
+  background: rgba(10, 143, 100, 0.14);
+  color: var(--accent-deep);
+}
+
+.provider-badge-twitch {
+  background: rgba(126, 87, 255, 0.16);
+  color: #5c36d1;
+}
+
+.watchlist-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.watchlist-toolbar .text-input {
+  flex: 1 1 260px;
+}
+
+.watchlist-provider-select {
+  min-width: 120px;
+  border: 1px solid rgba(21, 34, 23, 0.14);
+  border-radius: 16px;
+  padding: 0 14px;
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--text);
+}
+
+.channel-heading-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.tracked-chip-list-unified {
+  margin-bottom: 16px;
+}
+
+.tracked-chip-unified .provider-badge {
+  min-width: 26px;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+}
+
+.tracked-chip-unified .provider-badge-icon {
+  width: 12px;
+  height: 12px;
+}
+
+.auth-card-title-row .provider-badge {
+  min-width: 40px;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+}
+
+.auth-card-title-row .provider-badge-icon {
+  width: 18px;
+  height: 18px;
 }
 
 .panel-header {
@@ -549,7 +707,10 @@ input {
 
 .channel-card {
   display: grid;
+  grid-template-rows: auto auto minmax(4.2rem, auto) minmax(0, auto) auto;
+  align-content: start;
   gap: 16px;
+  height: 100%;
   padding: 18px;
   border-radius: 22px;
   background: rgba(255, 255, 255, 0.72);
@@ -600,6 +761,8 @@ input {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+  align-content: flex-start;
+  min-height: 32px;
 }
 
 .channel-meta-list span,
@@ -613,12 +776,23 @@ input {
   margin: 0;
   color: var(--text);
   line-height: 1.45;
+  min-height: 4.2rem;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
 }
 
 .channel-tag-list {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+  align-content: flex-start;
+  min-height: 32px;
+}
+
+.channel-card .channel-actions {
+  margin-top: auto;
 }
 
 .channel-avatar {
@@ -1427,7 +1601,8 @@ input {
 
 @media (max-width: 980px) {
   .hero-panel,
-  .content-grid {
+  .content-grid,
+  .auth-grid {
     grid-template-columns: 1fr;
   }
 }
@@ -1472,9 +1647,19 @@ input {
   }
 
   .tracked-channel-input-row,
+  .watchlist-toolbar,
   .chat-composer-button-row,
   .channel-card-topline {
     align-items: stretch;
+  }
+
+  .auth-card-header {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .watchlist-provider-select {
+    min-height: 50px;
   }
 
   .chat-tab {
