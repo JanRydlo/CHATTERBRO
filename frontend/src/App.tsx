@@ -373,6 +373,336 @@ function ProviderBadge({ provider, label, title }: { provider: ChatProvider; lab
     </span>
   );
 }
+
+type RgbColor = {
+  red: number;
+  green: number;
+  blue: number;
+};
+
+type HslColor = {
+  hue: number;
+  saturation: number;
+  lightness: number;
+};
+
+const CHAT_SURFACE_COLOR: RgbColor = { red: 16, green: 21, blue: 30 };
+const LIGHT_RGB_COLOR: RgbColor = { red: 255, green: 255, blue: 255 };
+const SAFE_CHAT_SENDER_COLOR = 'rgb(214 228 246)';
+const MIN_CHAT_SENDER_CONTRAST_RATIO = 6.4;
+const MIN_CHAT_SENDER_BRIGHTNESS = 138;
+const DEFAULT_CHAT_SENDER_COLORS = [
+  '#0000FF',
+  '#1E90FF',
+  '#00FF7F',
+  '#9ACD32',
+  '#FF4500',
+  '#FF69B4',
+  '#2E8B57',
+  '#DAA520',
+  '#FF7F50',
+  '#8A2BE2',
+  '#5F9EA0',
+  '#B22222',
+  '#00B5AD',
+  '#E67E22',
+  '#7F8CFF',
+] as const;
+const parsedCssColorCache = new Map<string, RgbColor | null>();
+
+function clampColorChannel(value: number) {
+  return Math.max(0, Math.min(255, Math.round(value)));
+}
+
+function parseLiteralCssColor(value: string): RgbColor | null {
+  const normalizedValue = value.trim();
+
+  const shortHexMatch = normalizedValue.match(/^#([\da-f]{3})$/i);
+  if (shortHexMatch) {
+    const [redHex, greenHex, blueHex] = shortHexMatch[1].split('');
+    return {
+      red: Number.parseInt(`${redHex}${redHex}`, 16),
+      green: Number.parseInt(`${greenHex}${greenHex}`, 16),
+      blue: Number.parseInt(`${blueHex}${blueHex}`, 16),
+    };
+  }
+
+  const hexMatch = normalizedValue.match(/^#([\da-f]{6})$/i);
+  if (hexMatch) {
+    return {
+      red: Number.parseInt(hexMatch[1].slice(0, 2), 16),
+      green: Number.parseInt(hexMatch[1].slice(2, 4), 16),
+      blue: Number.parseInt(hexMatch[1].slice(4, 6), 16),
+    };
+  }
+
+  const rgbMatch = normalizedValue.match(/^rgba?\(([^)]+)\)$/i);
+  if (!rgbMatch) {
+    return null;
+  }
+
+  const rgbParts = rgbMatch[1].split(',').map((part) => part.trim());
+  if (rgbParts.length < 3) {
+    return null;
+  }
+
+  return {
+    red: clampColorChannel(Number(rgbParts[0])),
+    green: clampColorChannel(Number(rgbParts[1])),
+    blue: clampColorChannel(Number(rgbParts[2])),
+  };
+}
+
+function parseCssColor(value: string): RgbColor | null {
+  const normalizedValue = value.trim();
+  if (!normalizedValue) {
+    return null;
+  }
+
+  if (parsedCssColorCache.has(normalizedValue)) {
+    return parsedCssColorCache.get(normalizedValue) ?? null;
+  }
+
+  let parsedColor = parseLiteralCssColor(normalizedValue);
+
+  if (!parsedColor && typeof window !== 'undefined' && typeof document !== 'undefined' && document.body) {
+    const probe = document.createElement('span');
+    probe.style.color = normalizedValue;
+
+    if (probe.style.color) {
+      probe.style.position = 'absolute';
+      probe.style.opacity = '0';
+      probe.style.pointerEvents = 'none';
+      probe.style.inset = '0 auto auto 0';
+      document.body.append(probe);
+      const computedColor = window.getComputedStyle(probe).color;
+      probe.remove();
+      parsedColor = parseLiteralCssColor(computedColor);
+    }
+  }
+
+  parsedCssColorCache.set(normalizedValue, parsedColor);
+  return parsedColor;
+}
+
+function toLinearColorChannel(value: number) {
+  const normalizedValue = value / 255;
+  return normalizedValue <= 0.04045
+    ? normalizedValue / 12.92
+    : ((normalizedValue + 0.055) / 1.055) ** 2.4;
+}
+
+function getRelativeLuminance(color: RgbColor) {
+  return 0.2126 * toLinearColorChannel(color.red)
+    + 0.7152 * toLinearColorChannel(color.green)
+    + 0.0722 * toLinearColorChannel(color.blue);
+}
+
+function getContrastRatio(firstColor: RgbColor, secondColor: RgbColor) {
+  const lighterLuminance = Math.max(getRelativeLuminance(firstColor), getRelativeLuminance(secondColor));
+  const darkerLuminance = Math.min(getRelativeLuminance(firstColor), getRelativeLuminance(secondColor));
+  return (lighterLuminance + 0.05) / (darkerLuminance + 0.05);
+}
+
+function getPerceivedBrightness(color: RgbColor) {
+  return (color.red * 299 + color.green * 587 + color.blue * 114) / 1000;
+}
+
+function rgbToHsl(color: RgbColor): HslColor {
+  const red = color.red / 255;
+  const green = color.green / 255;
+  const blue = color.blue / 255;
+  const maxChannel = Math.max(red, green, blue);
+  const minChannel = Math.min(red, green, blue);
+  const delta = maxChannel - minChannel;
+  const lightness = (maxChannel + minChannel) / 2;
+
+  if (delta === 0) {
+    return {
+      hue: 0,
+      saturation: 0,
+      lightness,
+    };
+  }
+
+  const saturation = lightness > 0.5
+    ? delta / (2 - maxChannel - minChannel)
+    : delta / (maxChannel + minChannel);
+
+  let hue = 0;
+  switch (maxChannel) {
+    case red:
+      hue = ((green - blue) / delta + (green < blue ? 6 : 0)) * 60;
+      break;
+    case green:
+      hue = ((blue - red) / delta + 2) * 60;
+      break;
+    default:
+      hue = ((red - green) / delta + 4) * 60;
+      break;
+  }
+
+  return {
+    hue,
+    saturation,
+    lightness,
+  };
+}
+
+function convertHueToRgb(firstChannel: number, secondChannel: number, hue: number) {
+  let normalizedHue = hue;
+  if (normalizedHue < 0) {
+    normalizedHue += 1;
+  }
+
+  if (normalizedHue > 1) {
+    normalizedHue -= 1;
+  }
+
+  if (normalizedHue < 1 / 6) {
+    return firstChannel + (secondChannel - firstChannel) * 6 * normalizedHue;
+  }
+
+  if (normalizedHue < 1 / 2) {
+    return secondChannel;
+  }
+
+  if (normalizedHue < 2 / 3) {
+    return firstChannel + (secondChannel - firstChannel) * (2 / 3 - normalizedHue) * 6;
+  }
+
+  return firstChannel;
+}
+
+function hslToRgb(color: HslColor): RgbColor {
+  if (color.saturation === 0) {
+    const grayscaleChannel = clampColorChannel(color.lightness * 255);
+    return {
+      red: grayscaleChannel,
+      green: grayscaleChannel,
+      blue: grayscaleChannel,
+    };
+  }
+
+  const normalizedHue = color.hue / 360;
+  const secondChannel = color.lightness < 0.5
+    ? color.lightness * (1 + color.saturation)
+    : color.lightness + color.saturation - color.lightness * color.saturation;
+  const firstChannel = 2 * color.lightness - secondChannel;
+
+  return {
+    red: clampColorChannel(convertHueToRgb(firstChannel, secondChannel, normalizedHue + 1 / 3) * 255),
+    green: clampColorChannel(convertHueToRgb(firstChannel, secondChannel, normalizedHue) * 255),
+    blue: clampColorChannel(convertHueToRgb(firstChannel, secondChannel, normalizedHue - 1 / 3) * 255),
+  };
+}
+
+function mixRgbColors(baseColor: RgbColor, targetColor: RgbColor, targetWeight: number): RgbColor {
+  return {
+    red: clampColorChannel(baseColor.red + (targetColor.red - baseColor.red) * targetWeight),
+    green: clampColorChannel(baseColor.green + (targetColor.green - baseColor.green) * targetWeight),
+    blue: clampColorChannel(baseColor.blue + (targetColor.blue - baseColor.blue) * targetWeight),
+  };
+}
+
+function formatRgbColor(color: RgbColor) {
+  return `rgb(${color.red} ${color.green} ${color.blue})`;
+}
+
+function hashString(value: string) {
+  let hash = 0;
+
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) | 0;
+  }
+
+  return Math.abs(hash);
+}
+
+function getDeterministicSenderColor(senderIdentity: string | null | undefined) {
+  const normalizedIdentity = senderIdentity?.trim().toLowerCase();
+  if (!normalizedIdentity) {
+    return SAFE_CHAT_SENDER_COLOR;
+  }
+
+  return DEFAULT_CHAT_SENDER_COLORS[hashString(normalizedIdentity) % DEFAULT_CHAT_SENDER_COLORS.length];
+}
+
+function resolveReadableChatSenderColor(color: string | null | undefined, senderIdentity?: string | null) {
+  const normalizedColor = color?.trim();
+  const sourceColor = normalizedColor || getDeterministicSenderColor(senderIdentity);
+  const parsedColor = parseCssColor(sourceColor);
+
+  if (!parsedColor) {
+    return SAFE_CHAT_SENDER_COLOR;
+  }
+
+  if (
+    getContrastRatio(parsedColor, CHAT_SURFACE_COLOR) >= MIN_CHAT_SENDER_CONTRAST_RATIO
+    && getPerceivedBrightness(parsedColor) >= MIN_CHAT_SENDER_BRIGHTNESS
+  ) {
+    return formatRgbColor(parsedColor);
+  }
+
+  const hslColor = rgbToHsl(parsedColor);
+
+  for (let step = 0; step <= 4; step += 1) {
+    const adjustedColor = hslToRgb({
+      hue: hslColor.hue,
+      saturation: hslColor.saturation,
+      lightness: Math.min(0.9, Math.max(hslColor.lightness, 0.72 + step * 0.045)),
+    });
+
+    if (
+      getContrastRatio(adjustedColor, CHAT_SURFACE_COLOR) >= MIN_CHAT_SENDER_CONTRAST_RATIO
+      && getPerceivedBrightness(adjustedColor) >= MIN_CHAT_SENDER_BRIGHTNESS
+    ) {
+      return formatRgbColor(adjustedColor);
+    }
+  }
+
+  const fallbackReadableColor = formatRgbColor(mixRgbColors(parsedColor, LIGHT_RGB_COLOR, 0.96));
+  return fallbackReadableColor;
+}
+
+function getChatSenderNameStyle(color: string | null | undefined, senderIdentity?: string | null) {
+  const readableColor = resolveReadableChatSenderColor(color, senderIdentity);
+  return readableColor ? { color: readableColor } : undefined;
+}
+
+function getCompactChatBadgeVariant(type: string) {
+  const normalizedType = type.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  return normalizedType || 'default';
+}
+
+function getCompactChatBadgeLabel(badge: ChannelChatBadge) {
+  if (badge.type === 'subscriber') {
+    return badge.count ? `${Math.min(badge.count, 99)}m` : 'SUB';
+  }
+
+  if (badge.type === 'moderator') {
+    return 'MOD';
+  }
+
+  if (badge.type === 'vip') {
+    return 'VIP';
+  }
+
+  if (badge.type === 'broadcaster') {
+    return 'LIVE';
+  }
+
+  if (badge.type === 'staff') {
+    return 'STA';
+  }
+
+  if (badge.type === 'founder') {
+    return 'FND';
+  }
+
+  return badge.text.replace(/\s+/g, '').slice(0, 3).toUpperCase() || 'BAD';
+}
+
 function AvatarMedia({ imageUrl, label }: { imageUrl: string | null | undefined; label: string }) {
   const [imageFailed, setImageFailed] = useState(false);
 
@@ -389,12 +719,13 @@ function AvatarMedia({ imageUrl, label }: { imageUrl: string | null | undefined;
 
 function renderCompactChatBadge(badge: ChannelChatBadge) {
   const title = badge.count ? `${badge.text} ${badge.count}` : badge.text;
+  const badgeVariant = getCompactChatBadgeVariant(badge.type);
 
   if (badge.imageUrl) {
     return <img className="chat-badge-icon chat-badge-image" key={`${badge.type}-${badge.count ?? 'none'}-${badge.imageUrl}`} src={badge.imageUrl} alt={title} title={title} />;
   }
 
-  return <span className="chat-badge-icon" key={`${badge.type}-${badge.count ?? 'none'}`} title={title}>{badge.text.slice(0, 1).toUpperCase()}</span>;
+  return <span className={`chat-badge-icon chat-badge-token chat-badge-${badgeVariant}`} key={`${badge.type}-${badge.count ?? 'none'}`} title={title}>{getCompactChatBadgeLabel(badge)}</span>;
 }
 
 function renderTwitchMessageBody(content: string, emoteIndex: Record<string, ChannelChatEmote>) {
@@ -3904,7 +4235,7 @@ export default function App() {
           <div className="chat-message-header">
             <div className="chat-sender-group">
               {renderedSenderBadges.length > 0 ? <span className="chat-badge-list">{renderedSenderBadges}</span> : null}
-              <strong className="chat-sender-name" style={message.sender.color ? { color: message.sender.color } : undefined}>
+              <strong className="chat-sender-name" style={getChatSenderNameStyle(message.sender.color, message.sender.slug || message.sender.username)}>
                 {message.sender.username}
               </strong>
               {message.type !== 'message' ? <span className="chat-type-pill">{message.type}</span> : null}
@@ -4104,18 +4435,18 @@ export default function App() {
                 : isAuthenticated && (channel.isLive || !tokenOnlyMode);
 
               return (
-              <article className="channel-card" key={buildUnifiedChannelKey(channel)}>
+              <article className={`channel-card channel-card-${channel.provider}`} key={buildUnifiedChannelKey(channel)}>
                 <div className="channel-card-topline">
                   <div className="channel-identity">
                     <div className="channel-avatar">
                       <AvatarMedia imageUrl={channel.thumbnailUrl} label={channel.displayName} />
                     </div>
-                    <div>
+                    <div className="channel-copy">
                       <div className="channel-heading-row">
-                        <h3>{channel.displayName}</h3>
+                        <h3 title={channel.displayName}>{channel.displayName}</h3>
                         <ProviderBadge provider={channel.provider} title={providerLabel} />
                       </div>
-                      <p>{channel.channelSlug}</p>
+                      <p className="channel-slug">{channel.channelSlug}</p>
                     </div>
                   </div>
                   <span className={`channel-status-pill ${channel.isLive ? 'channel-status-live' : 'channel-status-offline'}`}>
@@ -4365,7 +4696,7 @@ export default function App() {
                           <div className="chat-message-header">
                             <div className="chat-sender-group">
                               {message.sender.badges.length > 0 ? <span className="chat-badge-list">{message.sender.badges.map(renderCompactChatBadge)}</span> : null}
-                              <strong className="chat-sender-name" style={message.sender.color ? { color: message.sender.color } : undefined}>
+                              <strong className="chat-sender-name" style={getChatSenderNameStyle(message.sender.color, message.sender.slug || message.sender.username)}>
                                 {message.sender.username}
                               </strong>
                               {message.type !== 'message' ? <span className="chat-type-pill">{message.type}</span> : null}
