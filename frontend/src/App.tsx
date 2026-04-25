@@ -373,7 +373,6 @@ function ProviderBadge({ provider, label, title }: { provider: ChatProvider; lab
     </span>
   );
 }
-
 function AvatarMedia({ imageUrl, label }: { imageUrl: string | null | undefined; label: string }) {
   const [imageFailed, setImageFailed] = useState(false);
 
@@ -1932,7 +1931,6 @@ export default function App() {
     if (storedTrackedChannels) {
       setTrackedChannelSlugs(parseTrackedChannelSlugs(storedTrackedChannels));
     }
-
     void refreshBridgeStatus();
     void preloadGlobalEmotes();
 
